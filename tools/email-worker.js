@@ -15,6 +15,7 @@
 const API_KEY = "asw_RLdO-4xPUeZ8Z2oG";           // 取码口令（自己保管）
 const TTL = 86400;                                 // 邮件保留 1 天
 const EMAIL_DOMAIN = "szpuedu.dpdns.org";          // ← 你的域名
+const NC = { "Cache-Control": "no-store" };        // 禁止浏览器缓存取码结果
 
 // ---------- 轻量 MIME 解码 ----------
 function b64ToText(b64) {
@@ -118,12 +119,12 @@ export default {
     const keyOk = key === API_KEY;
 
     if (url.pathname === "/ping") {
-      return Response.json({ ok: true, domain: EMAIL_DOMAIN });
+      return Response.json({ ok: true, domain: EMAIL_DOMAIN }, { headers: NC });
     }
 
     // ---- JSON：邮件列表 ----
     if (url.pathname === "/api/mails") {
-      if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403 });
+      if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403, headers: NC });
       const mails = [];
       const d2 = await env.MAILCODE.list({ prefix: "m:" });
       const seen = new Set();
@@ -137,32 +138,32 @@ export default {
         } catch {}
       }
       mails.sort((a, b) => (b.ts || 0) - (a.ts || 0));
-      return Response.json({ ok: true, mails });
+      return Response.json({ ok: true, mails }, { headers: NC });
     }
 
     // ---- JSON：取码（自动化） ----
     if (url.pathname === "/api/getcode") {
-      if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403 });
+      if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403, headers: NC });
       const addr = (url.searchParams.get("addr") || "").toLowerCase();
       if (!addr || !addr.endsWith("@" + EMAIL_DOMAIN)) {
-        return Response.json({ ok: false, error: "addr must end with @" + EMAIL_DOMAIN }, { status: 400 });
+        return Response.json({ ok: false, error: "addr must end with @" + EMAIL_DOMAIN }, { status: 400, headers: NC });
       }
       let recRaw = await env.MAILCODE.get("m:" + addr);
       if (!recRaw) recRaw = await env.MAILCODE.get("m:" + addr.split("@")[0]);
       if (!recRaw) {
         return Response.json({ ok: false, error: "no mail yet", addr,
-                               hint: "GET /api/list 查看信封形状；/viewer 网页查看" });
+                               hint: "GET /api/list 查看信封形状；/viewer 网页查看" }, { headers: NC });
       }
       const rec = JSON.parse(recRaw);
       return Response.json({ ok: true, addr, code: rec.code, codes: rec.codes,
                              subject: rec.subject, from: rec.from, ts: rec.ts,
                              html: (rec.html || "").slice(0, 2000),
-                             text: (rec.text || "").slice(0, 800) });
+                             text: (rec.text || "").slice(0, 800) }, { headers: NC });
     }
 
     // ---- 调试：信封形状 ----
     if (url.pathname === "/api/list") {
-      if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403 });
+      if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403, headers: NC });
       const dbg = [], mailKeys = [];
       const d1 = await env.MAILCODE.list({ prefix: "dbg:" });
       for (const k of (d1.keys || []).slice(0, 5)) {
@@ -171,7 +172,7 @@ export default {
       }
       const d2 = await env.MAILCODE.list({ prefix: "m:" });
       for (const k of (d2.keys || []).slice(0, 20)) mailKeys.push(k.name);
-      return Response.json({ ok: true, dbg, mailKeys });
+      return Response.json({ ok: true, dbg, mailKeys }, { headers: NC });
     }
 
     // ---- 网页查看器 ----
@@ -232,6 +233,17 @@ async function show(i){
     + esc(d.html || ("<pre>"+esc(d.text||"(无正文)")+"</pre>")) + '"></iframe>';
 }
 loadList();
+setInterval(function(){
+  if(document.hidden) return;
+  var on = document.querySelector(".item.on");
+  var idx = on ? (on.dataset.i|0) : -1;
+  var scroll = document.getElementById("list").scrollTop;
+  loadList().then(function(){
+    var box = document.getElementById("list");
+    box.scrollTop = scroll;
+    if(idx>=0){ var els=box.querySelectorAll(".item"); if(els[idx]) els[idx].classList.add("on"); }
+  });
+}, 5000);
 </script></body></html>`;
       return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
