@@ -61,8 +61,7 @@ function mimeToTextAndHtml(raw) {
     const cte = (/content-transfer-encoding:\s*([^\r\n;]+)/i.exec(head) || [])[1] || "";
     const ct = (/content-type:\s*([^;\r\n]+)/i.exec(head) || [])[1] || "";
     let decoded = body;
-    if (/base64/i.test(cte)) decoded = b64ToText(body.split(/\r?\n\r?\n/)[0] || body);
-    else if (/quoted-printable/i.test(cte)) decoded = decodeQP(body);
+    if (/base64/i.test(cte)) decoded = b64ToText(body);    else if (/quoted-printable/i.test(cte)) decoded = decodeQP(body);
     if (/html/i.test(ct) || /<html|<body|<div|<table/i.test(decoded)) html += decoded;
     else text += decoded + "\n";
   }
@@ -124,7 +123,7 @@ export default {
     }
     const record = { from, subject, codes, code: codes[0] || "",
                      text: (text || raw || "").replace(/\s+/g, " ").slice(0, 4000),
-                     html: (html || "").slice(0, 120000), ts,
+                     html: (html || "").slice(0, 300000), ts,
                      parseErr: parseErr || undefined };
     const v = JSON.stringify(record);
     // 存储逐键独立 try：某个键失败不影响其余；失败记录进 err:（/api/list 可见）
@@ -198,6 +197,18 @@ export default {
                              html: (rec.html || "").slice(0, 2000),
                              text: (rec.text || "").slice(0, 800),
                              parseErr: rec.parseErr }, { headers: NC });
+    }
+
+    // ---- HTML 正文（完整，供 viewer iframe 加载） ----
+    if (url.pathname === "/api/html") {
+      if (!keyOk) return new Response("bad key", { status: 403 });
+      const addr = (url.searchParams.get("addr") || "").toLowerCase();
+      let recRaw = await env.MAILCODE.get("m:" + addr);
+      if (!recRaw) recRaw = await env.MAILCODE.get("m:" + addr.split("@")[0]);
+      if (!recRaw) return new Response("(no mail)", { status: 404 });
+      const rec = JSON.parse(recRaw);
+      return new Response(rec.html || ("<pre>" + (rec.text || "(无正文)") + "</pre>"),
+                          { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
     // ---- 调试：信封形状 + 错误 ----
@@ -278,8 +289,8 @@ async function show(i){
     + (d.code ? '验证码/码: <span class="code">'+esc(d.code)+'</span>' : '')
     + (d.parseErr ? '<div class="mut" style="color:#c60">解析降级: '+esc(d.parseErr)+'</div>' : '')
     + '<div class="mut">主题: '+esc(d.subject)+' · 来自: '+esc(d.from)+' · '+esc(fmtTs(d.ts))+'</div></div>'
-    + '<iframe sandbox="allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation" srcdoc="'
-    + esc(d.html || ("<pre>"+esc(d.text||"(无正文)")+"</pre>")) + '"></iframe>';
+    + '<iframe sandbox="allow-popups allow-popups-to-escape-sandbox" src="/api/html?addr='+encodeURIComponent(d.addr)+'&key='+encodeURIComponent(KEY)+'"></iframe>'
+    + '<div class="mut" style="margin-top:6px">按钮看不到？<a href="/api/html?addr='+encodeURIComponent(d.addr)+'&key='+encodeURIComponent(KEY)+'" target="_blank">在新标签打开完整邮件</a></div>';
 }
 loadList();
 setInterval(function(){
