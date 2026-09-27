@@ -69,6 +69,31 @@ function mimeToTextAndHtml(raw) {
   text = text.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
   return { text, html };
 }
+// RFC2047 编码头解码：=?charset?B/Q?data?=（可多段相邻；B=base64，Q=下划线转空格的QP）
+function decodeRFC2047(s) {
+  if (!s || s.indexOf("=?") === -1) return s || "";
+  let out = "";
+  var re = /=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g;
+  var m, last = 0;
+  while ((m = re.exec(s)) !== null) {
+    out += s.slice(last, m.index);
+    var cs = m[1].toLowerCase(), enc = m[2], data = m[3];
+    try {
+      if (enc === "b") {
+        var bin = atob(data);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        out += new TextDecoder(cs, { fatal: false }).decode(bytes);
+      } else {
+        out += decodeQP(data.replace(/_/g, " "));
+      }
+    } catch (e) { out += m[0]; }
+    last = m.index + m[0].length;
+  }
+  out += s.slice(last);
+  return out;
+}
+
 function extractCodes(text) {
   const codes = [];
   const six = text.match(/(?<!\d)(\d{6})(?!\d)/g);
@@ -88,7 +113,7 @@ export default {
     const local = to.split("@")[0];
     const from = message.from || "";
     let subject = "";
-    try { subject = decodeQP(message.headers.get("subject") || ""); } catch {}
+    try { subject = decodeRFC2047(message.headers.get("subject") || ""); } catch {}
     let raw = "", text = "", html = "", codes = [], parseErr = "";
     try { raw = await new Response(message.raw).text(); }
     catch (e) { parseErr = "raw read: " + e; }
@@ -133,12 +158,16 @@ export default {
     // ---- JSON：邮件列表 ----
     if (url.pathname === "/api/mails") {
       if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403, headers: NC });
-      const mails = [];
       const d2 = await env.MAILCODE.list({ prefix: "m:" });
-      const seen = new Set();
-      for (const k of (d2.keys || []).slice(0, 40)) {
+      const byLocal = new Map();   // 本地部分去重：同邮件的"全地址键/短键"只留最新一条
+      for (const k of (d2.keys || []).slice(0, 60)) {
         const addr = k.name.slice(2);
-        if (seen.has(addr)) continue; seen.add(addr);
+        const lp = addr.split("@")[0].toLowerCase();
+        const prev = byLocal.get(lp);
+        if (!prev || prev.k.length < k.name.length) byLocal.set(lp, { k, addr });
+      }
+      const mails = [];
+      for (const { k, addr } of byLocal.values()) {
         try {
           const rec = JSON.parse(await env.MAILCODE.get(k.name) || "{}");
           mails.push({ addr, subject: rec.subject, from: rec.from, code: rec.code,
@@ -153,11 +182,12 @@ export default {
     if (url.pathname === "/api/getcode") {
       if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403, headers: NC });
       const addr = (url.searchParams.get("addr") || "").toLowerCase();
-      if (!addr || !addr.endsWith("@" + EMAIL_DOMAIN)) {
-        return Response.json({ ok: false, error: "addr must end with @" + EMAIL_DOMAIN }, { status: 400, headers: NC });
+      if (!addr) {
+        return Response.json({ ok: false, error: "addr required" }, { status: 400, headers: NC });
       }
-      let recRaw = await env.MAILCODE.get("m:" + addr);
-      if (!recRaw) recRaw = await env.MAILCODE.get("m:" + addr.split("@")[0]);
+      // 含 @ 时必须是本域名；不含 @ 时按本地部分查（兼容短键别名）
+      let recRaw = await env.MAILCODE.get("m:" + addr.toLowerCase());
+      if (!recRaw) recRaw = await env.MAILCODE.get("m:" + addr.toLowerCase().split("@")[0]);
       if (!recRaw) {
         return Response.json({ ok: false, error: "no mail yet", addr,
                                hint: "已收到但查不到时，GET /api/list 看信封形状与错误" }, { headers: NC });
@@ -206,7 +236,7 @@ export default {
  .item .m{font-size:11.5px;color:#888}
  .view{background:#fff;border:1px solid #e3e5e8;border-radius:8px;padding:14px}
  .code{font-size:28px;font-weight:700;background:#eef;padding:6px 14px;border-radius:6px;display:inline-block;margin:6px 0}
- iframe{width:100%;height:560px;border:1px solid #e3e5e8;border-radius:6px;background:#fff}
+ iframe{width:100%;height:1100px;border:1px solid #e3e5e8;border-radius:6px;background:#fff}
  .empty{color:#999;padding:40px;text-align:center}
  @media (max-width:760px){.grid{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
@@ -230,10 +260,15 @@ async function loadList(){
   box.querySelectorAll(".item").forEach(function(el){
     el.onclick = function(){ show(el.dataset.i|0); };
   });
-  show(0);
+  if(window._curAddr){
+    var idx = window._mails.findIndex(function(m){return m.addr===window._curAddr;});
+    if(idx>=0) show(idx); else show(0);
+  } else show(0);
 }
+async function showByAddr(addr){ show(window._mails.findIndex(function(m){return m.addr===addr;})); }
 async function show(i){
   var m = window._mails[i]; if(!m) return;
+  window._curAddr = m.addr;
   document.querySelectorAll(".item").forEach(function(el,idx){ el.classList.toggle("on", idx===i); });
   var r = await fetch("/api/getcode?addr="+encodeURIComponent(m.addr)+"&key="+encodeURIComponent(KEY));
   var d = await r.json();
@@ -249,13 +284,9 @@ async function show(i){
 loadList();
 setInterval(function(){
   if(document.hidden) return;
-  var on = document.querySelector(".item.on");
-  var idx = on ? (on.dataset.i|0) : -1;
   var scroll = document.getElementById("list").scrollTop;
   loadList().then(function(){
-    var box = document.getElementById("list");
-    box.scrollTop = scroll;
-    if(idx>=0){ var els=box.querySelectorAll(".item"); if(els[idx]) els[idx].classList.add("on"); }
+    document.getElementById("list").scrollTop = scroll;
   });
 }, 5000);
 </script></body></html>`;
