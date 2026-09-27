@@ -4,13 +4,13 @@
 //   1. email 事件：接收任意 *@szpuedu.dpdns.org 的邮件，解码 MIME，存 KV（含 HTML 正文）
 //   2. GET /viewer?key=...        网页版邮件查看器（列表 + 渲染 HTML 正文，链接可点）
 //   3. GET /api/getcode?addr=...&key=...   JSON 取码（自动化用）
-//      返回 {"ok":true,"code":"123456","codes":[...],"subject":"...","html":"..."}
 //   4. GET /api/mails?key=...     JSON 邮件列表
-//   5. GET /api/list              调试：信封形状
+//   5. GET /api/list              调试：信封形状 + 错误记录
 //   6. GET /ping
 //
 // 无第三方依赖；内置轻量 MIME 解码（multipart/base64/quoted-printable）。
-// 安全：API_KEY 是查看器和 API 的口令；Worker 只读邮件、不回信。
+// v4：收信全程分段容错——解析/存储任何一步失败都降级保存原始内容，错误进 /api/list，
+//     并 console.log 到 Worker Observability（Events 流可见）。
 
 const API_KEY = "asw_RLdO-4xPUeZ8Z2oG";           // 取码口令（自己保管）
 const TTL = 86400;                                 // 邮件保留 1 天
@@ -40,7 +40,7 @@ function decodeQP(s) {
 }
 function mimeToParts(raw, depth) {
   depth = depth || 0;
-  if (depth > 4) return [];
+  if (depth > 4) return [{ head: raw, body: "" }];
   const boundary = /boundary="?([^";\r\n]+)"?/i.exec(raw);
   if (boundary) {
     const b = "--" + boundary[1];
@@ -50,7 +50,7 @@ function mimeToParts(raw, depth) {
     return all;
   }
   const sep = raw.match(/\r?\n\r?\n/);
-  if (!sep) return [{ head: raw, body: raw }];
+  if (!sep) return [{ head: raw, body: "" }];
   const head = raw.slice(0, sep.index);
   const body = raw.slice(sep.index + sep[0].length);
   return [{ head, body }];
@@ -81,35 +81,43 @@ function extractCodes(text) {
 }
 
 export default {
-  // ---- 收信 ----
+  // ---- 收信（分段容错：任何一步失败都降级保存，绝不让邮件凭空消失） ----
   async email(message, env, ctx) {
-    try {
-      const to = (message.to || "").toLowerCase();
-      const local = to.split("@")[0];
-      const from = message.from || "";
-      const subject = decodeQP(message.headers.get("subject") || "");
-      const raw = await new Response(message.raw).text();
-      const { text, html } = mimeToTextAndHtml(raw);
-      const codes = extractCodes(text + " " + subject);
-      const record = { from, subject, codes, code: codes[0] || "",
-                       text: text.replace(/\s+/g, " ").slice(0, 4000),
-                       html: html.slice(0, 120000), ts: Date.now() };
-      const v = JSON.stringify(record);
-      await env.MAILCODE.put("m:" + to, v, { expirationTtl: TTL });
-      await env.MAILCODE.put("m:" + local, v, { expirationTtl: TTL });
-      try {
-        const rawTo = message.to;
-        if (rawTo && rawTo.toLowerCase() !== to) {
-          await env.MAILCODE.put("m:" + rawTo, v, { expirationTtl: TTL });
-        }
-      } catch {}
-      await env.MAILCODE.put("dbg:" + Date.now(), JSON.stringify({
-        to: message.to, local, from, subject: subject.slice(0, 60),
-        codes, hasText: text.length > 0,
-      }), { expirationTtl: 86400 });
-    } catch (e) {
-      await env.MAILCODE.put("err:" + Date.now(), String(e).slice(0, 500), { expirationTtl: 86400 });
+    const ts = Date.now();
+    const to = (message.to || "").toLowerCase();
+    const local = to.split("@")[0];
+    const from = message.from || "";
+    let subject = "";
+    try { subject = decodeQP(message.headers.get("subject") || ""); } catch {}
+    let raw = "", text = "", html = "", codes = [], parseErr = "";
+    try { raw = await new Response(message.raw).text(); }
+    catch (e) { parseErr = "raw read: " + e; }
+    if (raw) {
+      try { ({ text, html } = mimeToTextAndHtml(raw)); }
+      catch (e) { parseErr = "mime: " + e; text = raw.slice(0, 4000); }
+      try { codes = extractCodes(text + " " + subject); } catch {}
     }
+    const record = { from, subject, codes, code: codes[0] || "",
+                     text: (text || raw || "").replace(/\s+/g, " ").slice(0, 4000),
+                     html: (html || "").slice(0, 120000), ts,
+                     parseErr: parseErr || undefined };
+    const v = JSON.stringify(record);
+    // 存储逐键独立 try：某个键失败不影响其余；失败记录进 err:（/api/list 可见）
+    for (const k of ["m:" + to, "m:" + local, "dbg:v4 " + ts]) {
+      try { await env.MAILCODE.put(k, v, { expirationTtl: TTL }); } catch (e) {
+        try { await env.MAILCODE.put("err:" + ts + ":put", "put " + k + ": " + e, { expirationTtl: 86400 }); } catch {}
+      }
+    }
+    try {
+      const rawTo = message.to;
+      if (rawTo && rawTo.toLowerCase() !== to) {
+        await env.MAILCODE.put("m:" + rawTo, v, { expirationTtl: TTL });
+      }
+    } catch {}
+    // console.log 进 Worker Observability（Events 流可见）
+    console.log("email handled: to=" + to + " local=" + local + " from=" + from
+      + " codes=" + JSON.stringify(codes) + " rawLen=" + raw.length
+      + (parseErr ? " parseErr=" + parseErr : ""));
   },
 
   // ---- HTTP：查看器 + API ----
@@ -134,7 +142,7 @@ export default {
         try {
           const rec = JSON.parse(await env.MAILCODE.get(k.name) || "{}");
           mails.push({ addr, subject: rec.subject, from: rec.from, code: rec.code,
-                       codes: rec.codes, ts: rec.ts });
+                       codes: rec.codes, ts: rec.ts, parseErr: rec.parseErr });
         } catch {}
       }
       mails.sort((a, b) => (b.ts || 0) - (a.ts || 0));
@@ -152,27 +160,32 @@ export default {
       if (!recRaw) recRaw = await env.MAILCODE.get("m:" + addr.split("@")[0]);
       if (!recRaw) {
         return Response.json({ ok: false, error: "no mail yet", addr,
-                               hint: "GET /api/list 查看信封形状；/viewer 网页查看" }, { headers: NC });
+                               hint: "已收到但查不到时，GET /api/list 看信封形状与错误" }, { headers: NC });
       }
       const rec = JSON.parse(recRaw);
       return Response.json({ ok: true, addr, code: rec.code, codes: rec.codes,
                              subject: rec.subject, from: rec.from, ts: rec.ts,
                              html: (rec.html || "").slice(0, 2000),
-                             text: (rec.text || "").slice(0, 800) }, { headers: NC });
+                             text: (rec.text || "").slice(0, 800),
+                             parseErr: rec.parseErr }, { headers: NC });
     }
 
-    // ---- 调试：信封形状 ----
+    // ---- 调试：信封形状 + 错误 ----
     if (url.pathname === "/api/list") {
       if (!keyOk) return Response.json({ ok: false, error: "bad key" }, { status: 403, headers: NC });
-      const dbg = [], mailKeys = [];
+      const dbg = [], errs = [], mailKeys = [];
       const d1 = await env.MAILCODE.list({ prefix: "dbg:" });
       for (const k of (d1.keys || []).slice(0, 5)) {
         const v = await env.MAILCODE.get(k.name);
         try { dbg.push(JSON.parse(v || "{}")); } catch { dbg.push(v); }
       }
+      const d0 = await env.MAILCODE.list({ prefix: "err:" });
+      for (const k of (d0.keys || []).slice(0, 10)) {
+        errs.push({ key: k.name, msg: (await env.MAILCODE.get(k.name) || "").slice(0, 200) });
+      }
       const d2 = await env.MAILCODE.list({ prefix: "m:" });
       for (const k of (d2.keys || []).slice(0, 20)) mailKeys.push(k.name);
-      return Response.json({ ok: true, dbg, mailKeys }, { headers: NC });
+      return Response.json({ ok: true, dbg, errs, mailKeys }, { headers: NC });
     }
 
     // ---- 网页查看器 ----
@@ -211,7 +224,7 @@ async function loadList(){
   if(!d.ok || !d.mails.length){ box.innerHTML = '<div class="empty">暂无邮件</div>'; return; }
   box.innerHTML = d.mails.map(function(m,i){
     return '<div class="item" data-i="'+i+'"><div class="t">'+esc(m.subject||"(无主题)")+'</div>'
-      + '<div class="m">'+esc(m.addr)+' · '+esc(fmtTs(m.ts))+(m.code?' · 码:'+esc(m.code):'')+'</div></div>';
+      + '<div class="m">'+esc(m.addr)+' · '+esc(fmtTs(m.ts))+(m.code?' · 码:'+esc(m.code):'')+(m.parseErr?' · 解析降级':'')+'</div></div>';
   }).join("");
   window._mails = d.mails;
   box.querySelectorAll(".item").forEach(function(el){
@@ -228,6 +241,7 @@ async function show(i){
   if(!d.ok){ v.innerHTML = '<div class="empty">'+esc(d.error||"读取失败")+'</div>'; return; }
   v.innerHTML = '<div style="margin-bottom:8px">'
     + (d.code ? '验证码/码: <span class="code">'+esc(d.code)+'</span>' : '')
+    + (d.parseErr ? '<div class="mut" style="color:#c60">解析降级: '+esc(d.parseErr)+'</div>' : '')
     + '<div class="mut">主题: '+esc(d.subject)+' · 来自: '+esc(d.from)+' · '+esc(fmtTs(d.ts))+'</div></div>'
     + '<iframe sandbox="allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation" srcdoc="'
     + esc(d.html || ("<pre>"+esc(d.text||"(无正文)")+"</pre>")) + '"></iframe>';
