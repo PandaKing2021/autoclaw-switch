@@ -858,8 +858,18 @@ class Account:
             else:
                 # link 型：外部参与/公告。窗内展示；未开始列预告；已结束不展示
                 if window:
+                    # 09-28 实证（Weekly_Token_Rush_0928_0929）：link 型里也有"Log in to
+                    # claim"的登录到账活动——隔离实例打卡一次，20,000 credits 当即进流水。
+                    # 文案里带 Log in / 登录的 link 型活动同样应触发自动打卡。
+                    if is_login_type:
+                        login_type_active = True
+                    claimed = "Claimed" in str(m.get("btnText") or "")
                     claimable.append({"kind": "promo_link", "id": str(mid), "title": name,
                                       "points": 0,
+                                      "claimed": claimed,
+                                      "title_text": (f"{name}（已领）" if claimed else
+                                                     (f"{name}（登录即领，去「活动打卡」）"
+                                                      if is_login_type else name)),
                                       "start_text": _fmt_ms(start) if start else "",
                                       "end_text": _fmt_ms(end) if end else ""})
                 elif start and now_ms < start:
@@ -2600,6 +2610,11 @@ def _token_identity(appdata_dir: Path) -> tuple | None:
         return None
 
 
+# 「桌面端登录添加」的取消开关：GUI 的「取消」按钮 set 它，_wait_for_login 每圈检查。
+# 用 Event 而不是布尔：跨线程可见 + 无竞态；login_and_add_account 进入时 clear 复位。
+LOGIN_CANCEL = threading.Event()
+
+
 def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
                     main_snap: dict | None = None) -> dict | None:
     """轮询**所有候选落点**，直到出现"非空且不是主账号"的 token。
@@ -2613,8 +2628,11 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
     main_uid, main_jti = _main_identity(main_snap or {})
     deadline = time.time() + timeout
     last_report = time.time()
+    cancelled = False
     while time.time() < deadline:
-        _inflight_beat(profile_dir)
+        if LOGIN_CANCEL.is_set():
+            cancelled = True
+            break
         for d in cands:
             auth_path = d / "auth.json"
             if not auth_path.is_file():
@@ -2642,6 +2660,10 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
             on_progress(f"等待登录中…（请在登录窗口完成登录，剩余 {int(deadline - now)}s）")
             last_report = now
         time.sleep(1.5)
+    if cancelled:
+        if on_progress:
+            on_progress("已取消：正在关闭登录窗口并重启桌面端…")
+        return None
     return None
 
 
@@ -3075,6 +3097,7 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
 
     tmp = (Path(os.environ.get("TEMP") or r"C:\Windows\Temp")
            / f"aswitch-login-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
+    LOGIN_CANCEL.clear()          # 新一次登录：复位上一次的取消标记
     try:
         tmp.mkdir(parents=True, exist_ok=True)
         # channel.json 决定连哪个 realm（zai/海外），跟随主 profile 免得登录到别的区
@@ -3090,13 +3113,17 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
         report("已打开登录窗口，请在窗口中完成登录")
 
         got = _wait_for_login(tmp, timeout=timeout, on_progress=report, main_snap=main_snap)
-        if not got:
+        if not got and not LOGIN_CANCEL.is_set():
             # 超时不等于没登录：用户可能刚在浏览器里填完验证码/人机码，凭证还在路上。
             # 必须在**销毁之前**（finally 会回滚主 profile + rmtree tmp）再复查一轮，
             # 否则就像 09-23 第三次加号那样：登录其实成功了，却被自己的清理逻辑销毁。
+            # 取消时不复查：用户就是要立即收摊，多等 60 秒违背取消的本意。
             report("等待超时，销毁前最后复查各落点（60 秒）…")
             got = _wait_for_login(tmp, timeout=60, main_snap=main_snap)
         if not got:
+            if LOGIN_CANCEL.is_set():
+                return {"ok": False, "uid": None, "name": None, "cancelled": True,
+                        "error": "已取消登录添加（登录窗口已关闭，桌面端正在重启）"}
             return {"ok": False, "uid": None, "name": None,
                     "error": "未检测到登录：请确认在**弹出的登录窗口**里完成登录（不是平时那个"
                              " AutoClaw 主窗口），且登录期间主 AutoClaw 保持完全退出"}

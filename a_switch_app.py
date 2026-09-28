@@ -791,6 +791,18 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "started": True}
 
+    def login_cancel(self):
+        """取消进行中的「桌面端登录添加」：set 取消事件，等待循环 1.5 秒内退出。
+
+        清理由 login_and_add_account 的 finally 统一做（关隔离窗口、回滚主 profile、
+        重启桌面端、回查反代），所以取消后马上就能再次点「桌面端登录添加」重试。
+        """
+        if not _login_state.get("active"):
+            return {"ok": False, "error": "当前没有进行中的登录添加"}
+        a_switch.LOGIN_CANCEL.set()
+        log("收到取消请求：正在打断登录等待…")
+        return {"ok": True, "cancelling": True}
+
     def login_status(self):
         """供 JS 轮询登录进度。"""
         st = dict(_login_state)
@@ -1265,7 +1277,7 @@ td.st{color:var(--ink-mute);font-size:11.5px;white-space:nowrap}
         <!-- 内置添加账号（手机号直连注册）已下线：非官方客户端调用、上游风控收紧后价值不大。
              桌面端登录添加是实测稳定路径，升为主按钮。手机号面板与 JS 保留休眠，需要时可恢复。 -->
         <button class="primary" id="btnLoginAdd" onclick="App.loginAdd()"
-                title="打开 AutoClaw 官方登录窗口；桌面端在跑时自动让位，登录结束自动重启">🖥 桌面端登录添加</button>
+                title="打开 AutoClaw 官方登录窗口；桌面端在跑时自动让位，登录结束自动重启。弹出的窗口是独立临时配置（非你常用的那个）：这是刻意隔离，防止登录回跳落进主配置把现有登录顶掉；登录态由本工具从该窗口抢救入库，不影响主配置">🖥 桌面端登录添加</button>
         <button class="sm ghost" onclick="App.addAcct()">导入账号</button>
         <button class="sm ghost" onclick="App.exportAccts()">导出备份</button>
       </div>
@@ -1322,6 +1334,10 @@ const I18N_EN = {
   "免桌面端：手机号验证码直接注册/登录并入档":"No desktop needed: register/login by SMS code and archive",
   "🖥 桌面端登录添加":"🖥 Add via desktop login",
   "打开 AutoClaw 官方登录窗口；桌面端在跑时自动让位，登录结束自动重启":"Opens the official login window; the running desktop steps aside and is restored afterwards",
+  "✕ 取消等待":"✕ Cancel wait", "取消中…":"Cancelling…",
+  "关闭登录窗口并立即重启桌面端，可马上重试":"Closes the login window and restarts the desktop app right away — you can retry immediately",
+  "已取消登录添加（登录窗口已关闭，桌面端正在重启）":"Login cancelled (window closed, desktop restarting)",
+  "已取消：":"Cancelled: ",
   "导入账号":"Import", "导出备份":"Export backup",
   "📱 手机号":"📱 Phone", "11 位手机号":"11-digit phone", "发送验证码":"Send code",
   "6 位码":"6-digit code", "登录并入档":"Login & archive", "收起":"Collapse",
@@ -1595,7 +1611,8 @@ const App={
             const pts=c.points?` +${c.points}分`:"";
             const win=(c.kind==="promo_link"||c.kind==="promo_soon")&&(c.start_text||c.end_text)
               ? ` <span class="muted">${esc(c.start_text||"")}~${esc(c.end_text||"")}</span>`:"";
-            return `<span class="pill ${cls}"><span class="dot"></span>${lab}·${esc(c.title)}${pts}${win}</span>`;}).join("")}
+            const disp=c.title_text||c.title;
+            return `<span class="pill ${cls}"><span class="dot"></span>${lab}·${esc(disp)}${pts}${win}</span>`;}).join("")}
           ${(a.blocked||[]).map(b=>`<span class="pill bad" title="${esc(b.reason||'')}"><span class="dot"></span>未放行·${esc(b.title)}</span>`).join("")}
           ${(a.upcoming||[]).map(u=>`<span class="pill"><span class="dot"></span>预告·${esc(u.name)} ${esc(u.start_text)}~${esc(u.end_text)}</span>`).join("")}
           ${!a.newbie_issued&&!a.auth_expired?`<span class="pill"><span class="dot"></span>新人·${esc(a.newbie_hint||"未下发")}</span>`:""}
@@ -1754,7 +1771,13 @@ const App={
     catch(e){ toast("启动登录失败："+e); return; }
     if(!r.ok){ toast(r.error||"启动登录失败"); return; }
     const old=btn.textContent;
-    btn.disabled=true; btn.textContent="等待登录中…";
+    btn.disabled=false; btn.textContent="✕ 取消等待"; btn.title="关闭登录窗口并立即重启桌面端，可马上重试";
+    let cancelled=false;
+    btn.onclick=async ()=>{
+      if(cancelled) return; cancelled=true;
+      try{ await window.pywebview.api.login_cancel(); }catch(e){}
+      btn.disabled=true; btn.textContent="取消中…";
+    };
     toast("桌面端先让位，登录完会自动重启并校验算力");
     const timer=setInterval(async ()=>{
       let st;
@@ -1762,9 +1785,11 @@ const App={
       if(st.log) setLog(st.log);
       if(st.done){
         clearInterval(timer);
-        btn.disabled=false; btn.textContent=old;
+        btn.disabled=false; btn.textContent=old; btn.title="";
+        btn.onclick=()=>this.loginAdd();
         const res=st.result||{};
-        toast(res.ok?("已添加账号 "+(res.name||res.uid)):("添加失败："+(res.error||"未知"))
+        toast(res.ok?("已添加账号 "+(res.name||res.uid))
+              :((res.cancelled?"已取消：":"添加失败：")+(res.error||"未知"))
               +(res.yield_note?("　|　"+res.yield_note):""));
         setTimeout(()=>this.refresh(), 600);
       } else if(st.msg){
