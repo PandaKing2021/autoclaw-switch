@@ -3148,6 +3148,7 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
             report("取消前快扫迟到凭证（5 秒）…")
             got = _wait_for_login(tmp, timeout=5, main_snap=main_snap, honor_cancel=False)
         if not got:
+            oauth_err = _extract_oauth_failure(tmp)
             if LOGIN_CANCEL.is_set():
                 return {"ok": False, "uid": None, "name": None, "cancelled": True,
                         "error": "已取消登录添加（登录窗口已关闭，桌面端正在重启）"}
@@ -3155,7 +3156,8 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
                     "error": "未检测到登录：请确认在**弹出的登录窗口**里完成登录（不是平时那个"
                              " AutoClaw 主窗口），且登录期间主 AutoClaw 保持完全退出。"
                              "注意：浏览器当前登录的是哪个账号，回跳交回的就是哪个——"
-                             "若那已是要添加的号本身，请先在浏览器退出登录换目标账号再重试"}
+                             "若那已是要添加的号本身，请先在浏览器退出登录换目标账号再重试"
+                             + (f"［客户端兑换失败：{oauth_err}］" if oauth_err else "")}
         # 凭证实际所在目录：隔离成功=tmp；隔离逃逸=主 profile（09-23 实测第三次加号踩中）。
         # 后续所有读取/拷贝都必须走 src，否则读的是空壳 tmp。
         src = Path(got.get("source_dir") or tmp)
@@ -3276,7 +3278,52 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
         # 主实例已在进入本流程前被 kill_autoclaw 关掉，所以此刻剩的都是登录实例，差集精准。
         _kill_stray_login_instances(before_all)
         _restore_main_session_if_switched(main_snap)
+        # 日志留底：隔离实例的 auth 日志是兑换失败的唯一证据，销毁前抢救
+        _preserve_login_logs(tmp)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _extract_oauth_failure(tmp: Path) -> str:
+    """从隔离实例的 auth 日志里捞出最后一次 OAuth 兑换失败的真实原因。
+
+    客户端兑换走后端（overseaZaiLogin），失败码（如 631001）只写在
+    tmp/_home/.openclaw-autoclaw/logs/autoclaw-auth.log —— 不捞出来，
+    "未检测到登录"就永远查不出为什么（日志随 tmp 销毁）。
+    """
+    logf = Path(tmp) / "_home" / ".openclaw-autoclaw" / "logs" / "autoclaw-auth.log"
+    try:
+        if not logf.is_file():
+            return ""
+        last_err = ""
+        for line in logf.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "failed" not in line.lower():
+                continue
+            try:
+                j = json.loads(line)
+                d = j.get("data") or {}
+                if d.get("code") or d.get("msg"):
+                    last_err = f"{d.get('code', '')} {str(d.get('msg', ''))[:120]}".strip()
+            except Exception:
+                last_err = line[-160:]
+        return last_err
+    except Exception:
+        return ""
+
+
+def _preserve_login_logs(tmp: Path) -> str:
+    """把隔离实例的日志留底到 accounts/_login_logs/（否则随 tmp 销毁，死无对证）。"""
+    try:
+        logdir = Path(tmp) / "_home" / ".openclaw-autoclaw" / "logs"
+        if not logdir.is_dir():
+            return ""
+        keep = ACCOUNTS_DIR / "_login_logs" / f"login-{time.strftime('%Y%m%d-%H%M%S')}"
+        keep.mkdir(parents=True, exist_ok=True)
+        for f in logdir.iterdir():
+            if f.is_file():
+                (keep / f.name).write_bytes(f.read_bytes())
+        return str(keep)
+    except Exception:
+        return ""
 
 
 def _late_salvage(say=None) -> dict | None:
