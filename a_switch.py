@@ -2615,30 +2615,6 @@ def _token_identity(appdata_dir: Path) -> tuple | None:
 LOGIN_CANCEL = threading.Event()
 
 
-def _guard_desktop_relaunch(launched_pids: set, stop: threading.Event, report) -> None:
-    """登录等待期间盯进程表：任何"父链不属于本次隔离实例"的新 AutoClaw 进程都是被
-    外部重新拉起的主实例（用户点了固定图标 / 自启任务 / 自愈脚本）。
-
-    它一出现就会抢官方回调端口、往主 profile 写自己的 token，直接干扰本次登录；
-    所以发现即杀（每 2 秒巡一圈），保证登录窗是唯一 AutoClaw 实例。
-    只杀根（父不在 launched_pids 里），避免误伤隔离实例自己晚生的子进程。
-    """
-    while not stop.wait(2.0):
-        try:
-            pids = _autoclaw_pids()
-            if not pids:
-                continue
-            ppids = _autoclaw_ppids()
-            strays = [p for p in pids
-                      if p not in launched_pids and ppids.get(p) not in launched_pids]
-            if strays:
-                _kill_pid_tree(strays)
-                report("⚠ 有 AutoClaw 在登录期间被重新拉起，已自动关闭"
-                       "（登录完成前请勿打开 AutoClaw）")
-        except Exception:
-            pass
-
-
 def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
                     main_snap: dict | None = None,
                     honor_cancel: bool = True) -> dict | None:
@@ -2651,6 +2627,9 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
     profile_dir = Path(profile_dir)
     cands = _login_candidates(profile_dir)
     main_uid, main_jti = _main_identity(main_snap or {})
+    main_auth = Path(DEFAULT_STATE_DIR) / "auth.json"
+    flow_start = time.time()
+    handover_reported = False
     deadline = time.time() + timeout
     last_report = time.time()
     cancelled = False
@@ -2658,6 +2637,25 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
         if honor_cancel and LOGIN_CANCEL.is_set():
             cancelled = True
             break
+        # 回跳自检：登录期间主 profile 的 auth.json 被改写 = z.ai 网页登录的深链
+        # （autoclaw:// → 系统拉起 D:\AutoClaw\AutoClaw.exe 接收）已把凭证落回主配置。
+        # 若身份仍是快照里那个号 = 浏览器交回的就是当前已登录账号（不是新号），
+        # 立刻点破并给出动作指引，别让用户傻等 300 秒超时。
+        if (not handover_reported and main_uid and main_auth.is_file()
+                and main_auth.stat().st_mtime >= flow_start):
+            try:
+                dd = json.loads(main_auth.read_text(encoding="utf-8", errors="replace"))
+                ui = dd.get("userInfo") or {}
+                uid_now = str(ui.get("user_id") or "")
+                if uid_now and uid_now == str(main_uid):
+                    handover_reported = True
+                    if on_progress:
+                        who = ui.get("email") or ui.get("user_name") or main_uid
+                        on_progress(f"⚠ 浏览器回跳交回的是当前已登录的账号（{who}）——不是新号。"
+                                    "请先在浏览器退出该账号、登录你想添加的账号，"
+                                    "然后在登录窗口重新点一次登录")
+            except Exception:
+                pass
         for d in cands:
             auth_path = d / "auth.json"
             if not auth_path.is_file():
@@ -3136,10 +3134,6 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
             return {"ok": False, "uid": None, "name": None,
                     "error": "登录窗口启动失败，请重试（若反复失败可能是权限问题）"}
         report("已打开登录窗口，请在窗口中完成登录")
-        # 守护：登录期间主实例被外部拉起（点图标/自启）会抢回调端口+污染检测，见函数注释
-        stop_guard = threading.Event()
-        threading.Thread(target=_guard_desktop_relaunch,
-                         args=(launched_pids, stop_guard, report), daemon=True).start()
 
         got = _wait_for_login(tmp, timeout=timeout, on_progress=report, main_snap=main_snap)
         if not got and not LOGIN_CANCEL.is_set():
@@ -3159,7 +3153,9 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
                         "error": "已取消登录添加（登录窗口已关闭，桌面端正在重启）"}
             return {"ok": False, "uid": None, "name": None,
                     "error": "未检测到登录：请确认在**弹出的登录窗口**里完成登录（不是平时那个"
-                             " AutoClaw 主窗口），且登录期间主 AutoClaw 保持完全退出"}
+                             " AutoClaw 主窗口），且登录期间主 AutoClaw 保持完全退出。"
+                             "注意：浏览器当前登录的是哪个账号，回跳交回的就是哪个——"
+                             "若那已是要添加的号本身，请先在浏览器退出登录换目标账号再重试"}
         # 凭证实际所在目录：隔离成功=tmp；隔离逃逸=主 profile（09-23 实测第三次加号踩中）。
         # 后续所有读取/拷贝都必须走 src，否则读的是空壳 tmp。
         src = Path(got.get("source_dir") or tmp)
@@ -3274,11 +3270,6 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
         return {"ok": False, "uid": None, "name": None,
                 "error": f"{type(e).__name__}: {e}"}
     finally:
-        # 先停守护线程（否则它会把 finally 里 launch_autoclaw 拉起的主实例当野进程杀掉）
-        try:
-            stop_guard.set()
-        except Exception:
-            pass
         # 无论成败都只关自己启动的那组实例，再清掉临时目录
         _kill_isolated(launched_pids)
         # 兜底：杀掉所有"本次登录前不存在"的 AutoClaw 进程（含 self-relaunch 的野进程）。
