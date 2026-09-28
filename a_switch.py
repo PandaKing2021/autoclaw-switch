@@ -2615,8 +2615,33 @@ def _token_identity(appdata_dir: Path) -> tuple | None:
 LOGIN_CANCEL = threading.Event()
 
 
+def _guard_desktop_relaunch(launched_pids: set, stop: threading.Event, report) -> None:
+    """登录等待期间盯进程表：任何"父链不属于本次隔离实例"的新 AutoClaw 进程都是被
+    外部重新拉起的主实例（用户点了固定图标 / 自启任务 / 自愈脚本）。
+
+    它一出现就会抢官方回调端口、往主 profile 写自己的 token，直接干扰本次登录；
+    所以发现即杀（每 2 秒巡一圈），保证登录窗是唯一 AutoClaw 实例。
+    只杀根（父不在 launched_pids 里），避免误伤隔离实例自己晚生的子进程。
+    """
+    while not stop.wait(2.0):
+        try:
+            pids = _autoclaw_pids()
+            if not pids:
+                continue
+            ppids = _autoclaw_ppids()
+            strays = [p for p in pids
+                      if p not in launched_pids and ppids.get(p) not in launched_pids]
+            if strays:
+                _kill_pid_tree(strays)
+                report("⚠ 有 AutoClaw 在登录期间被重新拉起，已自动关闭"
+                       "（登录完成前请勿打开 AutoClaw）")
+        except Exception:
+            pass
+
+
 def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
-                    main_snap: dict | None = None) -> dict | None:
+                    main_snap: dict | None = None,
+                    honor_cancel: bool = True) -> dict | None:
     """轮询**所有候选落点**，直到出现"非空且不是主账号"的 token。
 
     返回 {'auth_json', 'token', 'source_dir'}；source_dir 就是入库时要拷贝文件的来源目录。
@@ -2630,7 +2655,7 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
     last_report = time.time()
     cancelled = False
     while time.time() < deadline:
-        if LOGIN_CANCEL.is_set():
+        if honor_cancel and LOGIN_CANCEL.is_set():
             cancelled = True
             break
         for d in cands:
@@ -3111,15 +3136,23 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
             return {"ok": False, "uid": None, "name": None,
                     "error": "登录窗口启动失败，请重试（若反复失败可能是权限问题）"}
         report("已打开登录窗口，请在窗口中完成登录")
+        # 守护：登录期间主实例被外部拉起（点图标/自启）会抢回调端口+污染检测，见函数注释
+        stop_guard = threading.Event()
+        threading.Thread(target=_guard_desktop_relaunch,
+                         args=(launched_pids, stop_guard, report), daemon=True).start()
 
         got = _wait_for_login(tmp, timeout=timeout, on_progress=report, main_snap=main_snap)
         if not got and not LOGIN_CANCEL.is_set():
             # 超时不等于没登录：用户可能刚在浏览器里填完验证码/人机码，凭证还在路上。
             # 必须在**销毁之前**（finally 会回滚主 profile + rmtree tmp）再复查一轮，
             # 否则就像 09-23 第三次加号那样：登录其实成功了，却被自己的清理逻辑销毁。
-            # 取消时不复查：用户就是要立即收摊，多等 60 秒违背取消的本意。
             report("等待超时，销毁前最后复查各落点（60 秒）…")
             got = _wait_for_login(tmp, timeout=60, main_snap=main_snap)
+        if not got and LOGIN_CANCEL.is_set():
+            # 取消 ≠ 丢弃：用户可能点取消前刚在窗口里完成登录，凭证常晚到几秒才落盘。
+            # 销毁前快扫一遍（honor_cancel=False 才能真的扫），扫到就走正常入库，别烧掉一次成功的登录。
+            report("取消前快扫迟到凭证（5 秒）…")
+            got = _wait_for_login(tmp, timeout=5, main_snap=main_snap, honor_cancel=False)
         if not got:
             if LOGIN_CANCEL.is_set():
                 return {"ok": False, "uid": None, "name": None, "cancelled": True,
@@ -3241,6 +3274,11 @@ def login_and_add_account(timeout: int = 300, on_progress=None) -> dict:
         return {"ok": False, "uid": None, "name": None,
                 "error": f"{type(e).__name__}: {e}"}
     finally:
+        # 先停守护线程（否则它会把 finally 里 launch_autoclaw 拉起的主实例当野进程杀掉）
+        try:
+            stop_guard.set()
+        except Exception:
+            pass
         # 无论成败都只关自己启动的那组实例，再清掉临时目录
         _kill_isolated(launched_pids)
         # 兜底：杀掉所有"本次登录前不存在"的 AutoClaw 进程（含 self-relaunch 的野进程）。
