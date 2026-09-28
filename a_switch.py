@@ -3303,6 +3303,10 @@ def _extract_oauth_failure(tmp: Path) -> str:
                 d = j.get("data") or {}
                 if d.get("code") or d.get("msg"):
                     last_err = f"{d.get('code', '')} {str(d.get('msg', ''))[:120]}".strip()
+                    if str(d.get("code")) == "631001":
+                        last_err += ("（z.ai 后端拒绝此登录，与本地旧状态无关；"
+                                     "同日 unive.fun 邮箱号批量被封——换自有域名邮箱的账号，"
+                                     "如 szpuedu.dpdns.org）")
             except Exception:
                 last_err = line[-160:]
         return last_err
