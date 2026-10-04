@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'" />
+  <title>AutoClaw → ZCode 控制台</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">🦞 AutoClaw → ZCode <span class="sub">反代控制台</span></div>
+    <div id="overall" class="pill unknown">检测中…</div>
+  </header>
+
+  <main>
+    <section class="grid">
+      <!-- Relay -->
+      <div class="card" id="card-relay">
+        <div class="card-head"><h2>本地反代 Relay</h2><span id="relay-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>状态</label><span id="relay-status">-</span></div>
+          <div><label>上游通道</label><span id="relay-upstream">-</span></div>
+          <div><label>运行时长</label><span id="relay-uptime">-</span></div>
+        </div>
+        <div class="models" id="relay-models"></div>
+        <div class="btns">
+          <button id="btn-relay-start" class="btn ok">启动</button>
+          <button id="btn-relay-stop" class="btn danger">停止</button>
+          <button id="btn-smoke" class="btn">连通性测试</button>
+        </div>
+        <div id="smoke-result" class="note"></div>
+      </div>
+
+      <!-- 账号 -->
+      <div class="card">
+        <div class="card-head"><h2>AutoClaw 账号</h2><span id="token-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>账号</label><span id="acc-name">-</span></div>
+          <div><label>积分余额</label><span id="acc-points">-</span></div>
+          <div><label>即将过期</label><span id="acc-expiring">-</span></div>
+          <div><label>Token 到期</label><span id="token-exp">-</span></div>
+          <div><label>当前凭证</label><span id="credential">-</span></div>
+          <div><label>同步器</label><span id="watcher-status">-</span></div>
+        </div>
+        <div class="btns">
+          <button id="btn-points" class="btn">刷新余额</button>
+          <button id="btn-sync" class="btn">同步凭证</button>
+          <button id="btn-watcher" class="btn">启动/停止同步器</button>
+        </div>
+        <div id="points-note" class="note"></div>
+      </div>
+
+      <!-- ZCode -->
+      <div class="card">
+        <div class="card-head"><h2>ZCode 供应商</h2><span id="zcode-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>注册状态</label><span id="zcode-registered">-</span></div>
+          <div><label>接入地址</label><span id="zcode-baseurl">-</span></div>
+          <div><label>模型清单</label><span id="zcode-models">-</span></div>
+        </div>
+        <div class="note">在 ZCode 中：重启后模型选择器选择 <b>AutoClaw</b> 供应商即可使用。</div>
+        <div class="btns">
+          <button id="btn-register" class="btn">重新注册供应商</button>
+        </div>
+        <div id="register-note" class="note"></div>
+      </div>
+    </section>
+
+    <section class="card logcard">
+      <div class="card-head">
+        <h2>日志</h2>
+        <div class="tabs">
+          <button class="tab active" data-log="relay">relay</button>
+          <button class="tab" data-log="watch">同步器</button>
+          <button class="tab" data-log="console">控制台</button>
+          <label class="auto"><input type="checkbox" id="autorefresh" checked /> 自动刷新</label>
+        </div>
+      </div>
+      <pre id="logview">加载中…</pre>
+    </section>
+  </main>
+
+  <footer>仅供学习研究 · 逆向非官方接口有账号风险 · AutoClaw 是智谱/Z.ai 的产品，本项目与其无关</footer>
+
+  <script src="ui.js"></script>
+</body>
+</html>

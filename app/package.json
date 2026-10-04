@@ -1,0 +1,12 @@
+{
+  "name": "autoclaw-zcode-console",
+  "version": "1.0.0",
+  "description": "AutoClaw -> ZCode 反代控制台",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  }
+}

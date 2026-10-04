@@ -19,3 +19,9 @@ request-headers.json
 *.bak*
 _build.log
 _build.log
+
+# [2.x] 控制台依赖与测试产物
+app/node_modules/
+relay_outbound.json
+selftest-result.txt
+app/*.png
