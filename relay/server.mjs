@@ -23,6 +23,7 @@
  */
 import os from "node:os";
 import http from "node:http";
+import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -388,6 +389,22 @@ const CLOUD_VERSION = process.env.AUTOCLAW_CLIENT_VERSION || "1.18.5.851";
 // 不是 exe FileVersion 的四段（2.0.2.189）。网关只认它自己发出去的形状，所以对齐。
 const CLOUD_VERSION_3 = String(CLOUD_VERSION).split(".").slice(0, 3).join(".");
 
+// ---------------- 国内官方线（AutoClaw 2.x official channel，PR#4 PandaKing2021 逆向） ----------------
+// 账号宇宙与海外不互通：国内号 token 打海外网关 401，反之亦然。一个进程同时服务两条线：
+// 账号条目带 lane 字段（oversea=默认/aswitch_cloud_pool.json；cn=下方 auth-compat 凭证）。
+const CN_CLOUD_BASE = process.env.AUTOCLAW_CN_CLOUD_BASE
+  || "https://autoglm-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw";
+// 国内 2.x 网关 X-Version 要四段式（三段式报误导性 "Invalid token"，与海外 2.0.2 相反）
+const CN_VERSION = process.env.AUTOCLAW_CN_CLIENT_VERSION || CLOUD_VERSION;
+// 凭证源：bridge/watch_auth.py 把 2.x 客户端 DPAPI 凭证解密成 1.x 形状写到这，跟着客户端轮换自动刷新
+const CN_POOL_FILE = process.env.AUTOCLAW_CN_POOL_FILE
+  || path.join(os.homedir(), ".autoclaw-relay", "auth-compat", "auth.json");
+// 2.x 网关 system 闸门要求与应用 persona 完全一致（2026-10-04 W1/W2/T3 三方对照实锤：
+// persona 原样→200；persona 合并任何额外内容→406；无 system→406）
+const CN_PERSONA_FILE = process.env.AUTOCLAW_CN_PERSONA_FILE
+  || path.join(BASE_DIR, "..", "bridge", "persona.txt");
+let CN_PERSONA_CACHE = null;
+
 // 2026-09-29 23:06 起网关新启用了请求指纹校验：官方客户端（dist/main.cjs 的
 // createZworkManagedRequestHeaders）每个请求都带 appId+时间戳+md5 签名三元组，
 // 凭证放在 Authorization 而不是 X-Authorization，x_trace_id 发 "autoclaw-desktop"、
@@ -420,10 +437,144 @@ function cloudCredential() {
 // 全名（zai_glm-5.3-flash 等），body.model 与 X-Request-Model 同值。
 function cloudBodyModel(route) { return route; }
 
-function cloudHeaders(route, stream, auth) {
+// [asw-2x] 国内加速网关在 TLS/ALPN 层区分客户端：undici fetch 的 ClientHello 被 406，
+// 同机同时刻 raw https + 相同头/体则 200（2026-10-03 同分钟 A/B 实锤，PR#4）。
+// 国内线改走 node:https 原生请求，接口对齐 fetch（status/headers.get/text/json/body 流）。
+function httpsFetch(urlStr, init = {}) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(urlStr); } catch (e) { return reject(e); }
+    if (u.protocol !== "https:") return globalThis.fetch(urlStr, init).then(resolve, reject);
+    const headers = { ...(init.headers || {}) };
+    let body = init.body;
+    if (body != null && typeof body !== "string" && !(body instanceof Buffer) && !(body instanceof Uint8Array)) {
+      body = Buffer.from(String(body));
+    }
+    if (body != null) headers["content-length"] = String(Buffer.byteLength(body));
+    const req = https.request({
+      host: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method: init.method || "GET",
+      headers,
+      servername: u.hostname,
+    }, (res) => {
+      const hmap = new Map();
+      for (const [k, v] of Object.entries(res.headers)) hmap.set(k.toLowerCase(), Array.isArray(v) ? v.join(", ") : v);
+      let closed = false;
+      let textBuf = "";
+      let ended = false;
+      const stream = new ReadableStream({
+        start(ctrl) {
+          res.on("data", (c) => { textBuf += c.toString("utf8"); if (!closed) ctrl.enqueue(new Uint8Array(c)); });
+          res.on("end", () => { ended = true; if (!closed) { closed = true; ctrl.close(); } });
+          res.on("error", (e) => { if (!closed) { closed = true; ctrl.error(e); } });
+          res.pause();
+        },
+        pull() { res.resume(); },
+        cancel() { closed = true; res.destroy(); },
+      });
+      const resp = {
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        status: res.statusCode,
+        statusText: res.statusMessage || "",
+        headers: { get: (k) => hmap.get(String(k).toLowerCase()) ?? null },
+        body: stream,
+        text: () => new Promise((r2, j2) => {
+          if (ended) return r2(textBuf);
+          res.once("end", () => r2(textBuf));
+          res.once("error", j2);
+          res.resume();
+        }),
+      };
+      resp.json = () => resp.text().then((s) => JSON.parse(s));
+      resolve(resp);
+    });
+    req.on("error", reject);
+    if (init.signal) {
+      const sig = init.signal;
+      if (sig.aborted) req.destroy(sig.reason || new Error("aborted"));
+      else sig.addEventListener("abort", () => req.destroy(sig.reason || new Error("aborted")), { once: true });
+    }
+    if (body != null) req.write(body);
+    req.end();
+  });
+}
+
+// [asw-2x] 国内线请求体/系统闸门（2.x 网关 406 三要素，PR#4 对照实验定案）：
+//  reasoning_effort 必须 "high"、max_completion_tokens 模型满额 307200、store:false；
+//  system 必须与应用 persona **完全一致**——整体替换，调用方原 system 挪进首条 user 消息。
+// 幂等：system 已是 persona（池内跨号重试第二功）时只补 body 参数，不再搬运。
+function applyCnGate(payload) {
+  if (!payload || !Array.isArray(payload.messages)) return payload;
+  const mt = Number(payload.max_completion_tokens ?? payload.max_tokens);
+  payload.max_completion_tokens = Math.max(Number.isFinite(mt) && mt > 0 ? mt : 0, 307200);
+  delete payload.max_tokens;
+  payload.store = false;
+  payload.reasoning_effort = "high";
+  if (CN_PERSONA_CACHE === null) {
+    try { CN_PERSONA_CACHE = fs.readFileSync(CN_PERSONA_FILE, "utf8"); }
+    catch { CN_PERSONA_CACHE = "You are AutoClaw. Answer the user directly and concisely."; }
+  }
+  const msgs = payload.messages;
+  const textOf = (c) => (typeof c === "string"
+    ? c
+    : (Array.isArray(c) ? c.map((x) => (x && typeof x.text === "string" ? x.text : "")).filter(Boolean).join("\n") : ""));
+  const si = msgs.findIndex((m) => m && m.role === "system");
+  const curSys = si === -1 ? "" : textOf(msgs[si].content);
+  if (curSys.trim() === CN_PERSONA_CACHE.trim()) return payload;   // 已闸过（跨号重试）
+  if (si !== -1) msgs.splice(si, 1);
+  if (curSys) {
+    const ui = msgs.findIndex((m) => m && m.role === "user");
+    const prefix = "[system-note] 以下为调用方（编码代理）的系统指令，与本任务相关时遵循之：\n" + curSys + "\n[system-note 结束]\n";
+    if (ui === -1) msgs.unshift({ role: "user", content: prefix });
+    else {
+      const um = msgs[ui];
+      msgs[ui] = { ...um, content: prefix + (typeof um.content === "string" ? um.content : JSON.stringify(um.content)) };
+    }
+  }
+  msgs.unshift({ role: "system", content: CN_PERSONA_CACHE });
+  return payload;
+}
+
+function cloudHeaders(route, stream, auth, lane) {
   const reqId = randomUUID();
   const ts = String(Math.floor(Date.now() / 1e3));
   const token = String(auth || cloudCredential() || "").replace(/^Bearer\s*/i, "");
+  if (lane === "cn") {
+    // 国内官方渠道（2.x 契约，PandaKing2021 逆向 + e2e 验证）：
+    // X-Channel: official、X-Session-Id 会话头（缺它即 406）、X-Auth-Sign 签名三件套、
+    // SDK 指纹头、X-Version 四段式。
+    return {
+      "content-type": "application/json",
+      "accept": "application/json",
+      "user-agent": SDK_UA,
+      "x-agent-id": process.env.AUTOCLAW_AGENT_ID || "main",
+      "x-auth-appid": AUTOCLAW_APP_ID,
+      "x-auth-sign": createHash("md5")
+        .update(`${AUTOCLAW_APP_ID}&${ts}&${AUTOCLAW_APP_KEY}`)
+        .digest("hex"),
+      "x-auth-timestamp": ts,
+      "x-authorization": token ? `Bearer ${token}` : "",
+      "x-channel": process.env.AUTOCLAW_CN_CHANNEL || "official",
+      "x-client-type": readJwtHeaders().clientType || "pc",
+      "x-lang": "zh-CN",
+      "x-product": "autoclaw",
+      "x-request-id": reqId,
+      "x-request-model": route,
+      "x-session-id": randomUUID(),
+      "x-stainless-arch": "x64",
+      "x-stainless-lang": "js",
+      "x-stainless-os": "Windows",
+      "x-stainless-package-version": SDK_VERSION,
+      "x-stainless-retry-count": "0",
+      "x-stainless-runtime": "node",
+      "x-stainless-runtime-version": SDK_NODE_VERSION,
+      "x-tm": "win",
+      "x-trace-id": reqId,
+      "x-version": CN_VERSION,
+    };
+  }
   const headers = {
     "accept": "application/json",
     "content-type": "application/json",
@@ -474,11 +625,20 @@ async function callCloud(route, payload, { stream }, acc, externalSignal) {
     else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
   }
   try {
-    const freshAuth = acc ? await freshAccessToken(acc) : null;
-    return await fetch(`${CLOUD_BASE}/chat/completions`, {
+    const lane = (acc && acc.lane) === "cn" ? "cn" : "oversea";
+    // 国内线：persona 闸门在账号选定后应用（system 整体替换，handler 层预置的 harness
+    // 标记随原 system 一起被替换掉，跨线重试时两边闸门各自成立）。海外线：标记已在
+    // handler 层应用（幂等），broker/单凭证路径也依赖它，保持原位不动。
+    let body = payload;
+    if (lane === "cn") body = applyCnGate(payload);
+    // 现刷票只用于海外线（PR#3）；国内票由 watch_auth 跟随 2.x 客户端轮换，保持新鲜
+    const freshAuth = lane === "cn" ? null : (acc ? await freshAccessToken(acc) : null);
+    const send = lane === "cn" ? httpsFetch : fetch;
+    const base = lane === "cn" ? CN_CLOUD_BASE : CLOUD_BASE;
+    return await send(`${base}/chat/completions`, {
       method: "POST",
-      headers: cloudHeaders(route, stream, freshAuth || (acc && acc.auth)),
-      body: JSON.stringify({ ...payload, model: cloudBodyModel(route) }),
+      headers: cloudHeaders(route, stream, freshAuth || (acc && acc.auth), lane),
+      body: JSON.stringify({ ...body, model: cloudBodyModel(route) }),
       signal: ctl.signal,
     });
   } finally {
@@ -850,18 +1010,46 @@ function readPool() {
   const now = Date.now();
   let st;
   try { st = fs.statSync(POOL_FILE); } catch { return null; }   // 没有池子文件：A-SWITCH 还没导过
+  // 国内凭证文件独立轮换（watch_auth 随 2.x 客户端重写），mtime 也要进缓存键
+  let cnMtime = 0;
+  try { cnMtime = fs.statSync(CN_POOL_FILE).mtimeMs; } catch { /* 没有国内凭证源 */ }
   // 文件没动就不重复解析；动了立刻重读（A-SWITCH 每 10 秒原子改写一次，一次 stat 而已）
-  if (st.mtimeMs === pool.mtime) return pool.accounts.length ? pool : null;
+  if (st.mtimeMs === pool.mtime && cnMtime === pool.cnMtime) return pool.accounts.length ? pool : null;
   if (now - st.mtimeMs > POOL_STALE_MS) {
-    log(`账号池已过期 ${Math.round((now - st.mtimeMs) / 60_000)} 分钟没刷新 —— A-SWITCH 大概没在跑，退回单凭证`);
+    // 海外池过期只影响海外号（A-SWITCH 没在跑）；国内号走独立凭证源，保留可用
+    const cnOnly = (pool.accounts || []).filter((a) => a.lane === "cn");
+    log(`海外账号池已过期 ${Math.round((now - st.mtimeMs) / 60_000)} 分钟没刷新 —— A-SWITCH 大概没在跑`
+        + (cnOnly.length ? `，仅保留 ${cnOnly.length} 个国内号` : "，退回单凭证"));
     pool.mtime = st.mtimeMs;
-    pool.accounts = [];
-    return null;
+    pool.cnMtime = cnMtime;
+    pool.accounts = cnOnly;
+    return pool.accounts.length ? pool : null;
   }
   try {
     const j = JSON.parse(fs.readFileSync(POOL_FILE, "utf8"));
     pool.accounts = Array.isArray(j.accounts) ? j.accounts : [];
+    // 国内官方线账号并入统一池（PR#4）：watch_auth.py 把 2.x 客户端 DPAPI 凭证解密成
+    // 1.x 形状写到 auth-compat/auth.json（跟随客户端轮换自动刷新，写完即生效）。
+    // 该文件缺失 = 没装 2.x 客户端/没跑同步器，静默跳过，海外线不受影响。
+    try {
+      const cj = JSON.parse(fs.readFileSync(CN_POOL_FILE, "utf8"));
+      const uid = String(cj.userInfo?.user_id || cj.deviceId || "cn-local");
+      if (cj.token && uid && uid !== "cn-local") {
+        const existed = pool.accounts.find((a) => a.uid === uid);
+        const entry = {
+          uid, lane: "cn",
+          name: `[CN]${cj.userInfo?.user_name || cj.userInfo?.nickname || uid.slice(0, 8)}`,
+          auth: String(cj.token).toLowerCase().startsWith("bearer ") ? cj.token : `Bearer ${cj.token}`,
+          refresh_token: cj.refreshToken || "",
+          device_id: cj.deviceId || "",
+          points: null, expiring: null, is_live: false,
+        };
+        if (existed) Object.assign(existed, entry);
+        else pool.accounts.push(entry);
+      }
+    } catch { /* 没有国内凭证源：纯海外池，正常 */ }
     pool.mtime = st.mtimeMs;
+    pool.cnMtime = cnMtime;
     pool.clientVersion = j.client_version || "";
     // A-SWITCH 换了票（指纹变了）→ 上一轮因 401/403 上的冷却已经没有意义，立刻解除
     const fresh = new Set(pool.accounts.map((a) => `${a.uid}|${authFp(a.auth)}`));
@@ -1153,7 +1341,7 @@ async function callCloudPool(route, payload, opts) {
     // 真实到达上游：提交日预算 + 模型多样性时间戳（限速配额已在发出前占过，不重复记）
     commitDaily(acc.uid, Date.now(), route);
     resp._poolUid = acc.uid; resp._poolName = acc.name;
-    if (resp.ok) { poolClear(acc.uid, route); log(`pool pick: ${acc.name} ← ${route}`); return resp; }
+    if (resp.ok) { poolClear(acc.uid, route); log(`pool pick: ${acc.name}(${acc.lane || "oversea"}) ← ${route}`); return resp; }
     const detail = await readDetail(resp);
     poolLastReject = { detail, at: Date.now() };
     if (POOL_EXHAUST_RE.test(detail)) {

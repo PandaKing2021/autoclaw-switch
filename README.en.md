@@ -18,6 +18,8 @@ Three things it does:
 
 AutoClaw's international endpoint supports email registration (the CN endpoint is phone-only). New accounts get 10,000 points, granted over 7 days. Register from the official client's login page or the web portal. Running several accounts in rotation beats leaning on one.
 
+> **★ Dual-lane relay (2026-10)**: `relay/server.mjs` is now a single unified proxy for **both CN and international accounts** — one port (18766), one pool, per-account lane routing. International accounts (aswitch_cloud_pool.json, default lane) hit `autoglm-api.autoglm.ai` with the 2.0.2 contract (harness-marker gate + fresh-token-per-request). CN accounts (`~/.autoclaw-relay/auth-compat/auth.json`, produced by `bridge/watch_auth.py` which decrypts and follows the 2.x client's token rotation) hit `autoglm-api.zhipuai.cn` with the official-channel contract (exact-persona system gate + X-Session-Id/signature headers + node:https transport). To add a CN account: sign in via the 2.x client, then keep `python bridge/watch_auth.py` running. Details in the Chinese README, section "2.x 适配".
+
 ## Install
 
 Two ways.

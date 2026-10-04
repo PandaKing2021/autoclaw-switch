@@ -21,6 +21,14 @@ AutoClaw 的国际端支持邮箱注册（国内端只有手机号）。新号�
 
 ## 2.x 适配（2.0.1 官方渠道）
 
+> **★ 双线统一（2026-10）**：`relay/server.mjs` 现在是**国内/国际通用**的单进程反代——
+> 同一端口（18766）、同一账号池按号选线：海外号（aswitch_cloud_pool.json，默认 lane）
+> 走 `autoglm-api.autoglm.ai` + 2.0.2 契约（harness 标记闸门 + 每请求现刷票）；
+> 国内号（`~/.autoclaw-relay/auth-compat/auth.json`，由 `bridge/watch_auth.py` 从 2.x
+> 客户端解密跟随轮换）走 `autoglm-api.zhipuai.cn` + 官方渠道契约（persona system 整体
+> 替换 + X-Session-Id/签名三件套 + node:https 传输）。挑号日志带 `(cn)`/`(oversea)` 标识，
+> healthz 池子混编。想加国内号：装 2.x 客户端登录 → `python bridge/watch_auth.py` 常驻，完事。
+
 ### 2.x 改了什么
 
 AutoClaw 2.x 相比 1.17.8 有五处结构性变化，每一处都会让旧版反代直接失效：
