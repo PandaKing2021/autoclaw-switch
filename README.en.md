@@ -1,3 +1,5 @@
+> **2.x adaptation note (2026-10)**: This branch adds full support for AutoClaw 2.0.1 (official channel) — credential bridging, the acceleration-gateway contract, and an Electron console. See the Chinese README (README.md) section "2.x 适配" for details.
+
 # A-SWITCH
 
 [English](README.en.md) | [中文](README.md)
