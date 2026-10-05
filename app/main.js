@@ -7,20 +7,61 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const ZC = require("./zcode-config.js");   // ZCode 供应商配置的读写闸门（纯 Node，回归测试见 app/test_zcode_config.js）
 
 const HOME = os.homedir();
 const RELAY_DIR = path.join(HOME, ".autoclaw-relay");
 const RELAY_SERVER = path.join(RELAY_DIR, "server.mjs");
 const RELAY_LOG = path.join(RELAY_DIR, "relay.log");
+const RELAY_PERSONA = path.join(RELAY_DIR, "persona.txt");
 const WATCH_LOG = path.join(RELAY_DIR, "watch_auth.log");
 const AUTH_COMPAT = path.join(RELAY_DIR, "auth-compat", "auth.json");
 const STATE_DIR = path.join(HOME, ".openclaw-autoclaw");
 const REQ_HEADERS = path.join(STATE_DIR, "request-headers.json");
-const ZCODE_CFG = path.join(HOME, ".zcode", "v2", "provider_config.json");
+const ZCODE_CFG = process.env.ASWITCH_ZCODE_CFG || path.join(HOME, ".zcode", "v2", "provider_config.json");
 const PROVIDER_ID = "autoclaw-glm-provider";
-const PROJECT_DIR = path.join(__dirname, "..");
-const BRIDGE_DIR = path.join(__dirname, "..", "bridge");
+const WB_PROVIDER_ID = "workbuddy-openai-provider";
+// 资源根：打包态（exe）由 electron-builder 的 extraResources 放进 resources/，
+// 开发态用工作区的兄弟目录。两种形态保持同名目录层级，Python 片段里的相对路径
+// `../autoclaw-switch/a_switch.py`（cwd=bridge/）在两种形态下都成立。
+const IS_PACKAGED = app.isPackaged;
+const RES_ROOT = IS_PACKAGED ? process.resourcesPath : path.join(__dirname, "..");
+const WB_BIN_DIR = IS_PACKAGED
+  ? path.join(RES_ROOT, "workbuddy")
+  : path.join(RES_ROOT, "workbuddy", "workbuddy-manager-v1.0.79", "upstream");
+// wb2api 用相对路径读写 ./auths 与 ./data，安装目录（如 Program Files）又可能不可写，
+// 所以打包态固定用用户目录当工作目录，首次启动从资源里播种 config.json
+const WB_WORK_DIR = IS_PACKAGED ? path.join(HOME, ".workbuddy-gateway") : WB_BIN_DIR;
+const WB_EXE = path.join(WB_BIN_DIR, "wb2api.exe");
+const WB_LOGIN_EXE = path.join(WB_BIN_DIR, "wb2api-login.exe");
+const WB_CONFIG = path.join(WB_WORK_DIR, "config.json");
+const WB_LOG = path.join(WB_WORK_DIR, "server.log");
+const WB_PORT = 7863;
+const WB_API_KEY = "wb-local-key";
+const WB_MODELS = ["glm-5.3", "glm-5.2", "cn:auto", "cn:fast-model"];
+const TRAE_PROVIDER_ID = "trae-openai-provider";
+const TRAE_RELAY = path.join(RES_ROOT, "trae", "relay.mjs");
+// 日志放在用户目录而不是项目里：relay 的启动日志会打印 Trae 账号名与到期时间，
+// 放在仓库树内有被一起提交的风险
+const TRAE_LOG = path.join(HOME, ".trae-relay", "relay.log");
+const TRAE_PORT = 18768;
+const TRAE_API_KEY = "trae-local-key";
+const DOUBAO_PROVIDER_ID = "doubao-openai-provider";
+const DOUBAO_RELAY = path.join(RES_ROOT, "doubao", "relay.mjs");
+// 同 Trae：日志落在用户目录；cookie 快照与 relay 配置都在 ~/.doubao-relay/，不进仓库
+const DOUBAO_LOG = path.join(HOME, ".doubao-relay", "relay.log");
+const DOUBAO_COOKIES = path.join(HOME, ".doubao-relay", "cookies-cdp.json");
+const DOUBAO_CDP = path.join(RES_ROOT, "doubao", "cdp.js");
+const DOUBAO_CDP_PORT = 9222;
+const DOUBAO_PORT = 18770;
+const DOUBAO_API_KEY = "doubao-local-key";
+const BRIDGE_DIR = path.join(RES_ROOT, "bridge");
+const RELAY_SRC = path.join(BRIDGE_DIR, "server_2x.mjs");   // relay 源码随项目走，首次运行部署到 RELAY_DIR
+const PERSONA_SRC = path.join(BRIDGE_DIR, "persona.txt");    // 同上：2.x 闸门要求的应用 persona
 const PYTHON = "python";
+// 与 trae/relay.mjs 保持一致：Trae 客户端把登录态写在这里，relay 离线解密它
+const TRAE_STORAGE = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"),
+  "TRAE SOLO CN", "User", "globalStorage", "storage.json");
 
 const RELAY_ENV = {
   ...process.env,
@@ -50,17 +91,125 @@ function relayAlive() {
   } catch { return false; }
 }
 
+/**
+ * 首次运行自举：relay 运行在 ~/.autoclaw-relay/，源码随项目走（bridge/）。
+ * 两个文件都必须到位：server.mjs 是反代本体；persona.txt 是 2.x 闸门的硬要求
+ * （system 必须与应用 persona 逐字一致，relay 自带的兜底文案会被判 406）。
+ * 返回 null 表示可用，返回字符串表示失败原因。
+ */
+function ensureRelayServer() {
+  try { fs.mkdirSync(RELAY_DIR, { recursive: true }); } catch {}
+  if (!fs.existsSync(RELAY_SRC)) return `未找到 relay 源码（${RELAY_SRC}），请确认在完整项目目录内运行控制台`;
+  try {
+    if (!fs.existsSync(RELAY_SERVER)) {
+      fs.copyFileSync(RELAY_SRC, RELAY_SERVER);
+      log("deployed relay server.mjs from", RELAY_SRC);
+    }
+    if (!fs.existsSync(RELAY_PERSONA)) {
+      if (!fs.existsSync(PERSONA_SRC)) return `未找到 persona 模板（${PERSONA_SRC}），2.x 闸门会拒绝所有请求`;
+      fs.copyFileSync(PERSONA_SRC, RELAY_PERSONA);
+      log("deployed relay persona.txt from", PERSONA_SRC);
+    }
+    return null;
+  } catch (e) { return `部署 relay 失败：${String((e && e.message) || e)}`; }
+}
+
+/**
+ * 打包态：WorkBuddy 网关的工作目录固定在用户目录（~/.workbuddy-gateway/），
+ * 首次启动播种 config.json 并建好 auths/ 与 data/（wb2api 以相对路径读写它们）。
+ * 开发态直接复用工作区 upstream 目录，无需播种。返回 null 表示可用。
+ */
+function ensureWbWorkDir() {
+  if (!IS_PACKAGED) return null;
+  try {
+    fs.mkdirSync(path.join(WB_WORK_DIR, "auths"), { recursive: true });
+    fs.mkdirSync(path.join(WB_WORK_DIR, "data"), { recursive: true });
+    if (!fs.existsSync(WB_CONFIG)) {
+      const src = path.join(WB_BIN_DIR, "config.json");
+      if (!fs.existsSync(src)) return `未找到随包的 config.json（${src}）`;
+      fs.copyFileSync(src, WB_CONFIG);
+      log("seeded workbuddy config.json ->", WB_CONFIG);
+    }
+    return null;
+  } catch (e) { return `准备 WorkBuddy 工作目录失败：${String((e && e.message) || e)}`; }
+}
+
+/**
+ * spawn 包装：命令不存在时（没装 python / node）Node 会抛未捕获的 'error' 事件，
+ * 在 Electron 主进程里表现为 “A JavaScript error occurred in the main process” 模态弹窗，
+ * 且弹窗会阻塞主进程事件循环——整个控制台卡死。所有 spawn 都必须挂 error 监听，
+ * 把失败降级成可以展示给用户的错误字符串。
+ */
+function trySpawn(cmd, args, opts) {
+  const st = { proc: null, error: null };
+  try {
+    const p = spawn(cmd, args, opts);
+    p.on("error", (e) => {
+      st.error = e && e.code === "ENOENT" ? `未找到可执行文件：${cmd}（PATH 中不存在）` : String((e && e.message) || e);
+      log("[spawn error]", cmd, st.error);
+    });
+    st.proc = p;
+  } catch (e) {
+    st.error = String((e && e.message) || e);
+    log("[spawn throw]", cmd, st.error);
+  }
+  return st;
+}
+
 function spawnDetached(cmd, args, opts = {}) {
-  const p = spawn(cmd, args, {
+  // detached：控制台关闭后同步器等后台服务继续存活
+  const st = trySpawn(cmd, args, {
     cwd: opts.cwd || RELAY_DIR,
     env: { ...process.env, ...(opts.env || {}) },
     windowsHide: true,
-    detached: false,
+    detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (!st.proc) return st;
+  const p = st.proc;
+  p.unref();
   p.stdout.on("data", () => {});
   p.stderr.on("data", (d) => log("[stderr]", String(d).slice(0, 200)));
-  return p;
+  return st;
+}
+
+/** 跑一条命令取首行输出（环境体检用来探测 node / python 是否可用） */
+function probeCmd(cmd, args, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const st = trySpawn(cmd, args, { windowsHide: true });
+    if (!st.proc) return resolve({ ok: false, error: st.error || "无法启动" });
+    let out = "";
+    st.proc.stdout.on("data", (c) => (out += c));
+    st.proc.stderr.on("data", (c) => (out += c));
+    const tm = setTimeout(() => { try { st.proc.kill(); } catch {} resolve({ ok: false, error: `超时（${timeoutMs / 1000}s）` }); }, timeoutMs);
+    st.proc.on("error", (e) => { clearTimeout(tm); resolve({ ok: false, error: st.error || String((e && e.message) || e) }); });
+    st.proc.on("close", (code) => { clearTimeout(tm); resolve({ ok: code === 0, out: out.trim().split(/\r?\n/)[0] || "" }); });
+  });
+}
+
+/**
+ * Node 运行时发现：exe 客户端不能假设用户装了 Node（relay 与 Trae 网关都是 .mjs）。
+ * 顺序：PATH（≥18）→ AutoClaw 自带 node（装了客户端就有）→ 控制台自身
+ * （Electron 以 ELECTRON_RUN_AS_NODE 当纯 node 跑，版本随 Electron，等同 Node 20）。
+ */
+function findNode() {
+  const probe = (cmd) => {
+    try {
+      const out = execSync(`"${cmd}" -v`, { timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+      const m = out.match(/^v?(\d+)\./);
+      return m && Number(m[1]) >= 18 ? out : null;
+    } catch { return null; }
+  };
+  const sys = probe("node");
+  if (sys) return { cmd: "node", env: {}, source: `PATH · ${sys}` };
+  const roots = [process.env.AUTOCLAW_HOME, "C:\\AutoClaw", "D:\\AutoClaw", "E:\\AutoClaw", "F:\\AutoClaw",
+    path.join(HOME, "AppData", "Local", "AutoClaw")].filter(Boolean);
+  for (const r of roots) {
+    const p = path.join(r, "resources", "node", "node.exe");
+    if (fs.existsSync(p)) { const v = probe(p); if (v) return { cmd: p, env: {}, source: `AutoClaw 自带 · ${v}` }; }
+  }
+  return { cmd: process.execPath, env: { ELECTRON_RUN_AS_NODE: "1" },
+    source: `控制台自带运行时 · Node ${process.versions.node}` };
 }
 
 function healthOnce(timeoutMs = 4000) {
@@ -94,18 +243,169 @@ function readTokenExp() {
   } catch { return { exp: 0, iat: 0, uid: "" }; }
 }
 
+let wbProc = null;
+let wbCreditsCache = null;
+
+function wbAlive() {
+  try {
+    const out = execSync(`netstat -ano | findstr :${WB_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+    return /LISTENING/.test(out);
+  } catch { return false; }
+}
+
+function wbHttp(method, apiPath, body, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = http.request({
+      host: "127.0.0.1", port: WB_PORT, path: apiPath, method,
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${WB_API_KEY}`,
+                 ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
+      timeout: timeoutMs,
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => { try { resolve({ ok: res.statusCode === 200, status: res.statusCode, j: JSON.parse(d) }); } catch { resolve({ ok: res.statusCode < 400, status: res.statusCode, raw: d.slice(0, 200) }); } });
+    });
+    req.on("error", () => resolve({ ok: false, status: 0 }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false, status: 0 }); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function wbHealth() {
+  if (!wbAlive()) return { running: false, ok: false };
+  const m = await wbHttp("GET", "/v1/models");
+  return { running: true, ok: m.ok, models: (m.j?.data || []).map((x) => x.id) };
+}
+
+// --- Trae 平台（trae/relay.mjs，同时提供 openai + anthropic 两套协议）---
+let traeProc = null;
+
+function traeAlive() {
+  try {
+    const out = execSync(`netstat -ano | findstr :${TRAE_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+    return /LISTENING/.test(out);
+  } catch { return false; }
+}
+
+function traeHttp(method, apiPath, body, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = http.request({
+      host: "127.0.0.1", port: TRAE_PORT, path: apiPath, method,
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TRAE_API_KEY}`,
+                 ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
+      timeout: timeoutMs,
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => { try { resolve({ ok: res.statusCode === 200, status: res.statusCode, j: JSON.parse(d) }); } catch { resolve({ ok: res.statusCode < 400, status: res.statusCode, raw: d.slice(0, 200) }); } });
+    });
+    req.on("error", () => resolve({ ok: false, status: 0 }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false, status: 0 }); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+/** 一次拿全：运行状态 + 凭证 + 模型目录（relay 的 /health 已聚合，sessions 也在里面） */
+async function traeHealth() {
+  if (!traeAlive()) return { running: false, ok: false };
+  const h = await traeHttp("GET", "/health", null, 20000);
+  if (!h.j) return { running: true, ok: false };
+  return { running: true, ok: h.ok && h.j.credential?.ok === true, ...h.j };
+}
+
+/** Trae 的 openai 兼容模型目录（状态展示与 ZCode 注册共用） */
+async function traeModels() {
+  const m = await traeHttp("GET", "/v1/models", null, 20000);
+  return m.j?.data || [];
+}
+
+// --- 豆包工作（doubao/relay.mjs；登录态来自客户端 cookie 快照）---
+let doubaoProc = null;
+
+function doubaoAlive() {
+  try {
+    const out = execSync(`netstat -ano | findstr :${DOUBAO_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+    return /LISTENING/.test(out);
+  } catch { return false; }
+}
+
+function doubaoHttp(method, apiPath, body, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = http.request({
+      host: "127.0.0.1", port: DOUBAO_PORT, path: apiPath, method,
+      headers: { "Content-Type": "application/json", "x-api-key": DOUBAO_API_KEY,
+                 ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
+      timeout: timeoutMs,
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => { try { resolve({ ok: res.statusCode === 200, status: res.statusCode, j: JSON.parse(d) }); } catch { resolve({ ok: res.statusCode < 400, status: res.statusCode, raw: d.slice(0, 200) }); } });
+    });
+    req.on("error", () => resolve({ ok: false, status: 0 }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false, status: 0 }); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+/** relay 的 /health 已聚合 cookie 体检；ok 以“有 sessionid/ttwid 且没有缺失”为准 */
+async function doubaoHealth() {
+  if (!doubaoAlive()) return { running: false, ok: false };
+  const h = await doubaoHttp("GET", "/health", null, 10000);
+  if (!h.j) return { running: true, ok: false };
+  return { running: true, ok: h.ok && h.j.cookies?.ok === true, ...h.j };
+}
+
+async function doubaoModels() {
+  const m = await doubaoHttp("GET", "/v1/models", null, 10000);
+  return m.j?.data || [];
+}
+
+/** 豆包工作客户端的可执行文件：默认装在 D:\DoubaoWork，也认 %LOCALAPPDATA% 下的用户级安装 */
+function findDoubaoExe() {
+  const candidates = [
+    "D:\\DoubaoWork\\DoubaoWork.exe",
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "DoubaoWork", "DoubaoWork.exe"),
+    path.join(process.env.LOCALAPPDATA || "", "DoubaoWork", "DoubaoWork.exe"),
+  ];
+  return candidates.find((p) => p && fs.existsSync(p)) || "";
+}
+
+/** 客户端是否带着调试端口在跑（cookie 快照只能从 CDP 抓） */
+function doubaoClientDebug() {
+  return new Promise((resolve) => {
+    const req = http.request({ host: "127.0.0.1", port: DOUBAO_CDP_PORT, path: "/json/version", method: "GET", timeout: 2500 }, (res) => {
+      let d = ""; res.on("data", (c) => (d += c));
+      res.on("end", () => { try { resolve({ ok: res.statusCode === 200, browser: JSON.parse(d).Browser }); } catch { resolve({ ok: false }); } });
+    });
+    req.on("error", () => resolve({ ok: false }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false }); });
+    req.end();
+  });
+}
+
 function readZcodeRegistration() {
   try {
     const cfg = JSON.parse(fs.readFileSync(ZCODE_CFG, "utf8"));
     const conf = cfg.config || {};
-    const rule = (conf.providerConfigRules?.providerRules || []).find((r) => r.providerId === PROVIDER_ID);
-    if (!rule) return { registered: false };
+    const rules = conf.providerConfigRules?.providerRules || [];
+    const rule = rules.find((r) => r.providerId === PROVIDER_ID);
+    // 卡片要显示的是“ZCode 侧已注册多少模型”（配置文件为准），不是网关当前存活多少
+    const countOf = (pid) => (rules.find((r) => r.providerId === pid)?.config?.personalModelIds || []).length;
+    const counts = { wbModels: countOf(WB_PROVIDER_ID), traeModels: countOf(TRAE_PROVIDER_ID), doubaoModels: countOf(DOUBAO_PROVIDER_ID) };
+    if (!rule) return { registered: false, ...counts };
     return {
       registered: true,
       enabled: !!rule.enabled,
       baseUrl: rule.config?.api?.baseUrl || "",
       models: rule.config?.personalModelIds || [],
       inOrder: (conf.providerOrder || []).includes(PROVIDER_ID),
+      ...counts,
     };
   } catch (e) { return { registered: false, error: String(e) }; }
 }
@@ -113,23 +413,30 @@ function readZcodeRegistration() {
 function pythonOneShot(script, extraEnv = {}, timeoutMs = 90000) {
   // 用 importlib 加载 a_switch.py 并执行片段；单次按需调用，非固定节奏。
   return new Promise((resolve) => {
-    const p = spawn(PYTHON, ["-c", script], {
+    let out = "", err = "", settled = false, timer = null;
+    const done = (v) => { if (!settled) { settled = true; if (timer) clearTimeout(timer); resolve(v); } };
+    const st = trySpawn(PYTHON, ["-c", script], {
       cwd: BRIDGE_DIR,
       env: { ...process.env, AUTOCLAW_AUTH_DIR: path.join(RELAY_DIR, "auth-compat"), PYTHONIOENCODING: "utf-8", ...extraEnv },
       windowsHide: true,
     });
-    let out = "", err = "";
+    const p = st.proc;
+    if (!p) {
+      done({ ok: false, error: `${st.error || "无法启动 python"}；一键注册 / 余额查询 / 凭证同步依赖本机 Python（a_switch.py）` });
+      return;
+    }
+    timer = setTimeout(() => { try { p.kill(); } catch {} done({ ok: false, error: `python 调用超时（${Math.round(timeoutMs / 1000)} 秒）`, out, err }); }, timeoutMs);
     p.stdout.on("data", (c) => (out += c));
     p.stderr.on("data", (c) => (err += c));
-    const timer = setTimeout(() => { p.kill(); resolve({ ok: false, error: "timeout", out, err }); }, timeoutMs);
-    p.on("close", (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, out, err }); });
+    p.on("error", (e) => done({ ok: false, error: st.error || String((e && e.message) || e), out, err }));
+    p.on("close", (code) => done({ ok: code === 0, code, out, err }));
   });
 }
 
 const POINTS_SNIPPET = `
 import sys, json; sys.argv=['x']
 import importlib.util
-spec=importlib.util.spec_from_file_location('a','../a_switch.py')
+spec=importlib.util.spec_from_file_location('a','../autoclaw-switch/a_switch.py')
 m=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 m.BASE = "https://autoglm-api.zhipuai.cn"  # CN 账号余额在 CN identity 网关
@@ -148,36 +455,24 @@ else:
 const REGISTER_SNIPPET = `
 import sys, json, subprocess, os; sys.argv=['x']
 import importlib.util
-spec=importlib.util.spec_from_file_location('a','../a_switch.py')
+spec=importlib.util.spec_from_file_location('a','../autoclaw-switch/a_switch.py')
 m=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 m.subprocess=subprocess
 r=m.zcode_register_provider()
-# [asw-2x] 2.x acceleration 网关只有 4 个模型；a_switch 内置 1.x 目录含 tdpsk DeepSeek（2.x 不存在），注册后统一修正
-models = [("GLM-5.3", "zaicoding_glm-5.3", False, 1048576), ("GLM-5.3-Flash", "zai_glm-5.3-flash", True, 1048576),
-          ("Auto", "zai_auto", True, 1048576), ("Auto-Fast", "zai_auto-fast", True, 1048576)]
-p = os.path.expanduser("~/.zcode/v2/provider_config.json")
-cfg = json.load(open(p, encoding="utf-8"))
-conf = cfg.setdefault("config", {})
-pid = "autoclaw-glm-provider"
-for rule in conf.get("providerConfigRules", {}).get("providerRules", []):
-    if rule.get("providerId") == pid:
-        rule["config"]["personalModelIds"] = [mm[0] for mm in models]
-mcr = conf.get("modelConfigRules", {}).get("providerModelRules", [])
-mcr[:] = [x for x in mcr if x.get("providerId") != pid]
-for display, _route, image, ctx in models:
-    mcr.append({"providerId": pid, "modelId": display, "config": {"enabled": True, "properties": {
-        "contextWindow": ctx, "inputFormat": {"supportsText": True, "supportsImage": image,
-        "supportsVideo": False, "supportsAudio": False, "supportsPdf": False}, "outputFormat": {"supportsText": True}}}})
-json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-r["models"] = [mm[0] for mm in models]
+# 模型目录以 a_switch 自己的 ZCODE_MODELS 为准（含逐路由实测的视觉矩阵）。
+# 这里刻意不再做“统一修正”：历史上那段代码会把 a_switch 注册的模型删掉、
+# 并把上下文长度与视觉声明改回旧值。并集、闸门与落盘统一在 JS 侧完成。
+# 注意：zcode_register_provider() 内部固定写 ~/.zcode/v2/provider_config.json，
+# ASWITCH_ZCODE_CFG 只能重定向控制台自己的写入——定点自测 zcode:register 会真实改动配置。
+r["catalog"] = [{"modelId": d, "route": rt, "vision": bool(v), "contextWindow": c} for d, rt, v, c in m.ZCODE_MODELS]
 print(json.dumps(r, ensure_ascii=False))
 `;
 
 const SYNC_SNIPPET = `
 import sys, json; sys.argv=['x']
 import importlib.util
-spec=importlib.util.spec_from_file_location('a','../a_switch.py')
+spec=importlib.util.spec_from_file_location('a','../autoclaw-switch/a_switch.py')
 m=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 ok=m.write_single_credential()
@@ -192,6 +487,22 @@ function tailFile(file, n = 200) {
   } catch { return "(日志文件不存在或为空)"; }
 }
 
+// ---------------------------------------------------------------- ZCode 配置写入
+// 枚举校验、结构丢失断言、原子写/回滚、只读体检全部在 ./zcode-config.js 里实现
+// （纯 Node 模块，可脱离 Electron 跑回归测试）。这里只做常量与薄封装。
+const ZCODE_API_TYPES = ZC.ZCODE_API_TYPES;
+const writeZcodeConfig = (next, prevRaw, opts) => ZC.writeZcodeConfig(ZCODE_CFG, next, prevRaw, opts);
+const checkZcodeConfig = () => ZC.checkZcodeConfig(ZCODE_CFG);
+
+/** 新注册的模型条目：默认文本输入输出，多模态模型额外声明图片输入。
+ *  已存在的条目不会用这份默认值覆盖——见 zcode-config.js 的 OWNED_PROPERTY_KEYS。 */
+function modelEntry(providerId, modelId, contextWindow, multimodal = false) {
+  return { providerId, modelId, config: { enabled: true, properties: {
+    contextWindow,
+    inputFormat: { supportsText: true, supportsImage: !!multimodal, supportsVideo: false, supportsAudio: false, supportsPdf: false },
+    outputFormat: { supportsText: true } } } };
+}
+
 const handlers = {};
 function handle(channel, fn) { handlers[channel] = fn; ipcMain.handle(channel, (e, ...args) => fn(e, ...args)); }
 
@@ -202,7 +513,39 @@ function setupIpc() {
     const token = readTokenExp();
     let credential = "缺失";
     try { credential = JSON.parse(fs.readFileSync(REQ_HEADERS, "utf8")).headers["X-Authorization"].slice(0, 16) + "…"; } catch {}
+    const wbH = await wbHealth();
+    let wbAccount = null;
+    try {
+      const st = await wbHttp("GET", "/status");
+      const accs = st.j?.accounts || [];
+      if (accs.length) wbAccount = { uid: accs[0].uid, nickname: accs[0].nickname, credits: accs[0].credits };
+    } catch {}
+    const traeH = await traeHealth();
+    const doubaoH = await doubaoHealth();
     return {
+      doubao: {
+        running: doubaoH.running,
+        ok: doubaoH.ok,
+        models: (doubaoH.models || []).map((m) => (typeof m === "string" ? m : m.id)),
+        cookies: doubaoH.cookies || null,
+        conversation: doubaoH.conversation || "",
+        sessions: doubaoH.sessions ?? 0,
+        client: await doubaoClientDebug(),
+      },
+      trae: {
+        running: traeH.running,
+        ok: traeH.ok,
+        models: traeH.models || [],
+        credential: traeH.credential || null,
+        sessions: traeH.sessions ?? 0,
+      },
+      workbuddy: {
+        running: wbH.running,
+        ok: wbH.ok,
+        models: wbH.models || [],
+        account: wbAccount,
+        creditsCache: wbCreditsCache,
+      },
       relay: {
         running: !!health.running || relayAlive(),
         ok: health.ok,
@@ -219,19 +562,23 @@ function setupIpc() {
   });
 
   handle("relay:start", async () => {
+    const boot = ensureRelayServer();   // 先补齐运行时文件（server.mjs / persona.txt），relay 已在跑时也要补
+    if (boot) return { ok: false, error: boot };
     if (relayAlive()) return { ok: true, already: true };
-    if (!fs.existsSync(RELAY_SERVER)) return { ok: false, error: "未找到 relay（~/.autoclaw-relay/server.mjs）" };
-    relayProc = spawn("node", [RELAY_SERVER], {
-      cwd: RELAY_DIR, env: RELAY_ENV, windowsHide: true, detached: true,
+    const nd = findNode();
+    const st = trySpawn(nd.cmd, [RELAY_SERVER], {
+      cwd: RELAY_DIR, env: { ...RELAY_ENV, ...nd.env }, windowsHide: true, detached: true,
       stdio: ["ignore", fs.openSync(RELAY_LOG, "a"), fs.openSync(RELAY_LOG, "a")],
     });
+    if (!st.proc) return { ok: false, error: `${st.error || "无法启动 Node 运行时"}（${nd.source}）` };
+    relayProc = st.proc;
     relayProc.unref();  // 关闭控制台后 relay 继续作为后台服务存活
     relayProc.on("exit", (code) => { log("relay exited", code); relayProc = null; });
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 500));
       if (relayAlive()) return { ok: true };
     }
-    return { ok: false, error: "10 秒内未就绪，查看 relay.log" };
+    return { ok: false, error: st.error || `10 秒内未就绪（运行时：${nd.source}），查看 relay.log` };
   });
 
   handle("relay:stop", async () => {
@@ -246,10 +593,13 @@ function setupIpc() {
 
   handle("watcher:start", async () => {
     if (watchProc) return { ok: true, already: true };
-    watchProc = spawnDetached(PYTHON, [path.join(BRIDGE_DIR, "watch_auth.py")], { cwd: BRIDGE_DIR });
+    const st = spawnDetached(PYTHON, [path.join(BRIDGE_DIR, "watch_auth.py")], { cwd: BRIDGE_DIR });
+    if (!st.proc) return { ok: false, error: `${st.error || "无法启动 python"}；凭证同步器依赖本机 Python` };
+    watchProc = st.proc;
     watchProc.on("exit", (code) => { log("watcher exited", code); watchProc = null; });
     await new Promise((r) => setTimeout(r, 800));
-    return { ok: !!watchProc };
+    if (!watchProc) return { ok: false, error: st.error || "python 启动后立即退出（缺 cryptography？见同步器日志）" };
+    return { ok: true };
   });
 
   handle("watcher:stop", async () => {
@@ -270,25 +620,176 @@ function setupIpc() {
 
   handle("points:refresh", async () => {
     const r = await pythonOneShot(POINTS_SNIPPET);
+    if (!r.ok && r.error) return { ok: false, error: r.error };   // python 缺失/超时等：直接说原因，别退化成“解析失败”
     try {
-      const line = r.out.trim().split("\n").filter((l) => l.startsWith("{")).pop();
+      const line = (r.out || "").trim().split("\n").filter((l) => l.startsWith("{")).pop();
       return JSON.parse(line || "{}");
     } catch { return { ok: false, error: r.err || r.out || "解析失败" }; }
   });
 
   handle("zcode:register", async () => {
+    // 全新机器上 ZCode 还没跑过、配置不存在时，先给可执行的指引（python 的注册器同样以该文件为落点）
+    if (!fs.existsSync(ZCODE_CFG)) {
+      return { ok: false, error: `未找到 ZCode 供应商配置（${ZCODE_CFG}）。请先安装并运行一次 ZCode（它会创建该文件），再回来点注册` };
+    }
     const r = await pythonOneShot(REGISTER_SNIPPET, {}, 120000);
+    let res = {};
     try {
-      const line = r.out.trim().split("\n").filter((l) => l.startsWith("{")).pop();
-      const res = JSON.parse(line || "{}");
-      return { ...res, raw: r.out.slice(0, 300) };
-    } catch { return { ok: false, error: r.err || r.out || "解析失败" }; }
+      if (!r.ok && r.error) throw new Error(r.error);   // python 缺失/超时：把原因原样带给用户
+      const line = (r.out || "").trim().split("\n").filter((l) => l.startsWith("{")).pop();
+      res = JSON.parse(line || "{}");
+    } catch (e) { res = { ok: false, error: r.err || (e && e.message) || r.out || "解析失败" }; }
+    // [all-in-one] 三个平台共用一次读取、一次校验、一次写入。
+    // provider_config.json 归 ZCode 自己所有：只允许增量修改自己的供应商，
+    // 任何“整体重建”的写法都会丢字段（2026-10-05 丢掉 manualProviderModelRules 的教训），
+    // 任何“统一修正目录”的写法都会删掉别人注册的模型（同日删掉两个 DeepSeek 的教训）。
+    const CATALOG_ALLOW = [PROVIDER_ID, WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID]
+      .map((p) => `config.modelConfigRules.providerModelRules[${p}/`);   // 模型目录由各家实时目录重写
+    // 网关目录各自单独取：某个网关没启动，只跳过它的目录刷新，不牵连同一次注册
+    let wbCatalog = [];
+    try { wbCatalog = ((await wbHttp("GET", "/v1/models", null, 15000)).j?.data || []).map((x) => [x.id, 200000]); }
+    catch (e) { res.wbCatalogError = String((e && e.message) || e); }
+    let traeCatalog = [];
+    try { traeCatalog = await traeModels(); }
+    catch (e) { res.traeCatalogError = String((e && e.message) || e); }
+    let doubaoCatalog = [];
+    try { doubaoCatalog = await doubaoModels(); }
+    catch (e) { res.doubaoCatalogError = String((e && e.message) || e); }
+
+    try {
+      const prevRaw = fs.readFileSync(ZCODE_CFG, "utf8");
+      const cfg = JSON.parse(prevRaw);
+      const conf = cfg.config || {};
+      const rules = conf.providerConfigRules.providerRules;
+      const entries = conf.modelConfigRules.providerModelRules;
+
+      // ① AutoClaw：目录以 a_switch.py 的 ZCODE_MODELS 为准（它带逐路由实测的视觉矩阵），
+      //    这里只做并集与补条目，绝不删条目——曾因“统一修正成 4 个模型”把两个可用的
+      //    DeepSeek 注册项删掉过。上下文长度按注册器的声明刷新，其余属性保留。
+      const acCatalog = Array.isArray(res.catalog) ? res.catalog : [];
+      if (acCatalog.length) {
+        const acIds = acCatalog.map((x) => x.modelId);
+        for (const rule of rules) {
+          if (rule.providerId === PROVIDER_ID) {
+            rule.config.personalModelIds = [...new Set([...(rule.config.personalModelIds || []), ...acIds])];
+          }
+        }
+        ZC.upsertModelEntries(entries, PROVIDER_ID,
+          acCatalog.map((x) => modelEntry(PROVIDER_ID, x.modelId, x.contextWindow || 500000, !!x.vision)));
+        res.models = acIds;
+        res.autoclaw = { registered: true, models: acIds };
+      } else {
+        res.autoclaw = { error: "注册器未返回模型目录（a_switch.py 未被加载？），目录未刷新" };
+      }
+
+      // ② WorkBuddy：目录从网关动态拉取（新模型自动收录）
+      if (wbCatalog.length) {
+        ZC.upsertProviderRule(rules, { providerId: WB_PROVIDER_ID, providerName: "WorkBuddy", enabled: true,
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: WB_API_KEY },
+            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${WB_PORT}/v1` },
+            personalModelIds: wbCatalog.map((m) => m[0]) } });
+        ZC.upsertModelEntries(entries, WB_PROVIDER_ID, wbCatalog.map(([id, ctx]) => modelEntry(WB_PROVIDER_ID, id, ctx)));
+        res.workbuddy = { registered: true, models: wbCatalog.map((m) => m[0]) };
+      } else {
+        res.workbuddy = { error: "WorkBuddy 网关未运行，模型目录未刷新（已注册条目保持不变）" };
+      }
+
+      // ③ Trae：目录同样来自 relay（免费额度模型会自动收录）
+      if (traeCatalog.length) {
+        ZC.upsertProviderRule(rules, { providerId: TRAE_PROVIDER_ID, providerName: "Trae", enabled: true,
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: TRAE_API_KEY },
+            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${TRAE_PORT}/v1` },
+            personalModelIds: traeCatalog.map((m) => m.id) } });
+        ZC.upsertModelEntries(entries, TRAE_PROVIDER_ID, traeCatalog.map((m) =>
+          // Trae 目录里 max 常为 0（如 glm-5.3 = {dev:200000,max:0}），真实可用值在 dev
+          modelEntry(TRAE_PROVIDER_ID, m.id, m.trae?.context_window?.dev || m.trae?.context_window?.max || 184000, !!m.trae?.multimodal)));
+        res.trae = { registered: true, models: traeCatalog.map((m) => m.id) };
+      } else {
+        res.trae = { error: "Trae 网关未运行，模型目录未刷新（已注册条目保持不变）" };
+      }
+
+      // ④ 豆包工作：目录来自 relay（当前为 doubao / doubao-think 两个合成模型）
+      if (doubaoCatalog.length) {
+        const ids = doubaoCatalog.map((m) => m.id);
+        ZC.upsertProviderRule(rules, { providerId: DOUBAO_PROVIDER_ID, providerName: "豆包工作", enabled: true,
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: DOUBAO_API_KEY },
+            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${DOUBAO_PORT}/v1` },
+            personalModelIds: ids } });
+        ZC.upsertModelEntries(entries, DOUBAO_PROVIDER_ID, doubaoCatalog.map((m) => modelEntry(DOUBAO_PROVIDER_ID, m.id, 16000)));
+        res.doubao = { registered: true, models: ids };
+      } else {
+        res.doubao = { error: "豆包工作网关未运行，模型目录未刷新（已注册条目保持不变）" };
+      }
+
+      const order = conf.providerOrder || (conf.providerOrder = []);
+      for (const p of [WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID]) if (!order.includes(p)) order.push(p);
+
+      // 单次落盘：枚举 + 结构丢失 + 原子写 + 读回校验，任一道不过就整体拒绝
+      res.backup = path.basename(writeZcodeConfig(cfg, prevRaw, { allowRemovedPaths: CATALOG_ALLOW }));
+    } catch (e) {
+      res.registerError = String((e && e.message) || e);
+      res.zcode = checkZcodeConfig();
+    }
+    return res;
+  });
+
+  // 只读体检：报告配置是否健康（供应商枚举、必需字段、模型条目数），不改文件
+  handle("zcode:check", async () => {
+    try { return checkZcodeConfig(); } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+  });
+
+  // 环境体检：新机器上先点这个——缺什么、影响哪块功能、怎么补，一眼看清（只读，不启动任何服务）
+  handle("env:check", async () => {
+    const items = [];
+    const add = (name, ok, detail, hint) => items.push({ name, ok: !!ok, detail: detail || "", hint: hint || "" });
+    const rel = (p) => String(p).replace(HOME, "~");
+    const nd = findNode();
+    add("Node 运行时", !!nd, nd ? nd.source : "未找到", "relay 与 Trae 网关由它启动；exe 版自带兜底运行时（PATH → AutoClaw 自带 → 控制台自身），缺了才会报错");
+    const py = await probeCmd(PYTHON, ["--version"]);
+    add("Python", py.ok, py.ok ? py.out : py.error, "一键注册 / 余额查询 / 凭证同步依赖它（加载 autoclaw-switch/a_switch.py）");
+    if (py.ok) {
+      // 同步器要解密 2.x 登录态，没这个包 spawn 能成功但进程会立刻崩，症状是「同步器点了没反应」
+      const cr = await probeCmd(PYTHON, ["-c", "import cryptography;print('cryptography',cryptography.__version__)"]);
+      add("Python 包 cryptography", cr.ok, cr.ok ? cr.out : cr.error, "凭证同步器用它解密 AutoClaw 2.x 登录态：pip install cryptography");
+    }
+    const file = (name, p, hint) => add(name, fs.existsSync(p), rel(p), hint);
+    file("relay 源码", RELAY_SRC, "随控制台分发（bridge/）；缺失说明安装包不完整，重装一次即可");
+    file("relay 运行时", RELAY_SERVER, "点「启动」会自动从 bridge/server_2x.mjs 部署，无需手工准备");
+    file("relay persona", RELAY_PERSONA, "2.x 闸门要求 system 与应用 persona 逐字一致；点「启动」自动从 bridge/persona.txt 部署，缺了会全部 406");
+    file("WorkBuddy 网关", WB_EXE, "上游 Go 二进制，随包分发；开发态在 workbuddy/…/upstream/");
+    file("WorkBuddy 配置", WB_CONFIG, "打包版点「启动」自动播种；登录用 wb2api-login.exe");
+    file("Trae 网关", TRAE_RELAY, "项目自带（trae/relay.mjs）");
+    file("Trae 登录态", TRAE_STORAGE, "需安装并登录 Trae SOLO CN 客户端；relay 离线解密它，无需重开 IDE");
+    file("豆包工作网关", DOUBAO_RELAY, "项目自带（doubao/relay.mjs）");
+    file("豆包登录态", DOUBAO_COOKIES, "需安装并登录豆包工作客户端；点「同步登录态」从客户端抓 cookie（客户端需带调试端口，控制台可代重启）");
+    file("豆包工作客户端", findDoubaoExe(), "默认装在 D:\\DoubaoWork，装好后登录一次即可");
+    file("AutoClaw 凭证", REQ_HEADERS, "需安装并登录 AutoClaw 桌面客户端；同步器把登录态搬成反代凭证");
+    file("ZCode 配置", ZCODE_CFG, "需先安装并运行过一次 ZCode，注册才有落点");
+    return { ok: items.every((i) => i.ok), items };
+  });
+
+  // 一键启动：按依赖顺序拉起三家网关与凭证同步器；某个平台缺前置只影响它自己，不阻塞其它
+  handle("all:start", async () => {
+    const steps = [];
+    const run = async (name, ch) => {
+      let r = null;
+      try { r = await handlers[ch]({}); } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+      const ok = !!(r && r.ok);
+      steps.push({ name, ok, detail: ok ? (r.already ? "已在运行" : "已启动") : (r && r.error) || "失败" });
+    };
+    await run("AutoClaw relay", "relay:start");
+    await run("WorkBuddy 网关", "workbuddy:start");
+    await run("Trae 网关", "trae:start");
+    await run("豆包工作网关", "doubao:start");
+    await run("凭证同步器", "watcher:start");
+    return { ok: steps.every((s) => s.ok), steps };
   });
 
   handle("credential:sync", async () => {
     const r = await pythonOneShot(SYNC_SNIPPET, {}, 120000);
+    if (!r.ok && r.error) return { ok: false, error: r.error };
     try {
-      const line = r.out.trim().split("\n").filter((l) => l.startsWith("{")).pop();
+      const line = (r.out || "").trim().split("\n").filter((l) => l.startsWith("{")).pop();
       return JSON.parse(line || "{}");
     } catch { return { ok: false, error: r.err || r.out || "解析失败" }; }
   });
@@ -320,9 +821,201 @@ function setupIpc() {
     });
   });
 
+  handle("workbuddy:start", async () => {
+    if (wbAlive()) return { ok: true, already: true };
+    const seed = ensureWbWorkDir();
+    if (seed) return { ok: false, error: seed };
+    if (!fs.existsSync(WB_EXE)) return { ok: false, error: `未找到 wb2api.exe（${WB_EXE}）；该网关是上游 Go 二进制，需随包分发或按 workbuddy/…/UPSTREAM-SRC.txt 自行编译` };
+    if (!fs.existsSync(WB_CONFIG)) return { ok: false, error: `未找到 config.json（${WB_CONFIG}）；开发版先用 wb2api-login.exe 登录一次生成` };
+    const st = trySpawn(WB_EXE, ["-config", WB_CONFIG], {
+      cwd: WB_WORK_DIR, windowsHide: true, detached: true,
+      stdio: ["ignore", fs.openSync(WB_LOG, "a"), fs.openSync(WB_LOG, "a")],
+    });
+    if (!st.proc) return { ok: false, error: st.error || "无法启动 wb2api.exe" };
+    wbProc = st.proc;
+    wbProc.unref();
+    wbProc.on("exit", (code) => { log("workbuddy gateway exited", code); wbProc = null; });
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (wbAlive()) return { ok: true };
+    }
+    return { ok: false, error: st.error || "10 秒内未就绪，查看 server.log" };
+  });
+
+  handle("workbuddy:stop", async () => {
+    try {
+      const out = execSync(`netstat -ano | findstr :${WB_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+      const pid = out.trim().split(/\s+/).pop();
+      if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
+      if (wbProc) { try { wbProc.kill(); } catch {} wbProc = null; }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  handle("workbuddy:smoke", async () => {
+    const r = await wbHttp("POST", "/v1/chat/completions", {
+      model: "glm-5.3", max_tokens: 64,
+      messages: [{ role: "user", content: "请只回复OK" }],
+    }, 180000);
+    let reply = "", stop = "";
+    try {
+      const j = r.j;
+      const msg = j.choices?.[0]?.message || {};
+      reply = (msg.content || (msg.reasoning_content ? "[thinking] " + msg.reasoning_content : "")).slice(0, 120);
+      stop = j.choices?.[0]?.finish_reason || "";
+    } catch { reply = r.raw || ""; }
+    // 推理模型可能只输出 reasoning（content 为空但结构合法）：以 200 + choices 判定
+    return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop };
+  });
+
+  handle("workbuddy:credits", async () => {
+    const st = await wbHttp("GET", "/status");
+    const accs = st.j?.accounts || [];
+    if (!accs.length) return { ok: false, error: "无账号" };
+    wbCreditsCache = accs[0].credits;
+    return { ok: true, credits: accs[0].credits, nickname: accs[0].nickname };
+  });
+
+  // --- 豆包工作：relay 在项目目录内（doubao/relay.mjs），登录态用 doubao/cdp.js 从客户端抓快照 ---
+  handle("doubao:start", async () => {
+    if (doubaoAlive()) return { ok: true, already: true };
+    if (!fs.existsSync(DOUBAO_RELAY)) return { ok: false, error: `未找到 doubao/relay.mjs（${DOUBAO_RELAY}）` };
+    fs.mkdirSync(path.dirname(DOUBAO_LOG), { recursive: true });
+    const nd = findNode();
+    const st = trySpawn(nd.cmd, [DOUBAO_RELAY], {
+      cwd: path.dirname(DOUBAO_RELAY), env: { ...process.env, ...nd.env }, windowsHide: true, detached: true,
+      stdio: ["ignore", fs.openSync(DOUBAO_LOG, "a"), fs.openSync(DOUBAO_LOG, "a")],
+    });
+    if (!st.proc) return { ok: false, error: `${st.error || "无法启动 Node 运行时"}（${nd.source}）` };
+    doubaoProc = st.proc;
+    doubaoProc.unref();
+    doubaoProc.on("exit", (code) => { log("doubao relay exited", code); doubaoProc = null; });
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (doubaoAlive()) {
+        const h = await doubaoHealth();
+        // 网关起来了但 cookie 过期/缺失：不算启动成功，把原因带出去让用户点「同步登录态」
+        if (h.cookies && h.cookies.ok === false) {
+          return { ok: true, warn: `网关已启动，但豆包登录态不可用（${h.cookies.error || "缺少 " + (h.cookies.missing || []).join(",")}）` };
+        }
+        return { ok: true };
+      }
+    }
+    return { ok: false, error: st.error || `10 秒内未就绪（运行时：${nd.source}），查看 ~/.doubao-relay/relay.log` };
+  });
+
+  handle("doubao:stop", async () => {
+    try {
+      const out = execSync(`netstat -ano | findstr :${DOUBAO_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+      const pid = out.trim().split(/\s+/).pop();
+      if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
+      if (doubaoProc) { try { doubaoProc.kill(); } catch {} doubaoProc = null; }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  // 登录态同步：客户端必须带 --remote-debugging-port=9222 启动（控制台可代为重启客户端）
+  handle("doubao:sync-cookies", async (_e, opts) => {
+    const wantRestart = !!(opts && opts.restart);
+    const dbg = await doubaoClientDebug();
+    if (!dbg.ok) {
+      if (!wantRestart) {
+        return { ok: false, error: "豆包工作客户端没有开启调试端口。点「重启客户端并同步」由控制台代劳，或手动加 --remote-debugging-port=9222 后重试" };
+      }
+      const exe = findDoubaoExe();
+      if (!exe) return { ok: false, error: "未找到 DoubaoWork.exe（默认安装目录 D:\\DoubaoWork），无法代重启" };
+      try { execSync('taskkill /IM DoubaoWork.exe /F', { shell: "cmd.exe", timeout: 15000 }); } catch {}
+      await new Promise((r) => setTimeout(r, 1500));
+      try {
+        const st = trySpawn(exe, ["--remote-debugging-port=" + DOUBAO_CDP_PORT], { cwd: path.dirname(exe), detached: true, stdio: "ignore", windowsHide: false });
+        if (st.proc) st.proc.unref();
+      } catch (e) { return { ok: false, error: "重启客户端失败：" + String((e && e.message) || e) }; }
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const d = await doubaoClientDebug();
+        if (d.ok) break;
+      }
+      const d2 = await doubaoClientDebug();
+      if (!d2.ok) return { ok: false, error: "客户端已重启但调试端口未就绪（可能需要重新登录）" };
+    }
+    if (!fs.existsSync(DOUBAO_CDP)) return { ok: false, error: `未找到 doubao/cdp.js（${DOUBAO_CDP}）` };
+    const nd = findNode();
+    const r = await probeCmd(nd.cmd, [DOUBAO_CDP, "cookies"], 60000);
+    if (!fs.existsSync(DOUBAO_COOKIES)) return { ok: false, error: "抓取失败：" + (r.out || r.error || "未生成 cookie 快照").slice(-200) };
+    await doubaoHttp("POST", "/admin/reload-cookies", {}, 8000);   // 网关在线则立即热加载
+    const h = await doubaoHealth();
+    return { ok: true, cookies: h.cookies || null };
+  });
+
+  handle("doubao:smoke", async () => {
+    const model = (await doubaoModels())[0]?.id || "doubao";
+    const r = await doubaoHttp("POST", "/v1/chat/completions", {
+      model, max_tokens: 64, messages: [{ role: "user", content: "请只回复OK" }],
+    }, 120000);
+    let reply = "", stop = "";
+    try {
+      const j = r.j;
+      const msg = j.choices?.[0]?.message || {};
+      reply = (msg.content || "").slice(0, 120);
+      stop = j.choices?.[0]?.finish_reason || "";
+    } catch { reply = r.raw || ""; }
+    return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model };
+  });
+
+  // --- Trae：relay 在项目目录内（trae/relay.mjs），凭证由 relay 自行从 Trae 客户端解密读取 ---
+  handle("trae:start", async () => {
+    if (traeAlive()) return { ok: true, already: true };
+    if (!fs.existsSync(TRAE_RELAY)) return { ok: false, error: `未找到 trae/relay.mjs（${TRAE_RELAY}）` };
+    fs.mkdirSync(path.dirname(TRAE_LOG), { recursive: true });
+    const nd = findNode();
+    const st = trySpawn(nd.cmd, [TRAE_RELAY], {
+      cwd: path.dirname(TRAE_RELAY), env: { ...process.env, ...nd.env }, windowsHide: true, detached: true,
+      stdio: ["ignore", fs.openSync(TRAE_LOG, "a"), fs.openSync(TRAE_LOG, "a")],
+    });
+    if (!st.proc) return { ok: false, error: `${st.error || "无法启动 Node 运行时"}（${nd.source}）` };
+    traeProc = st.proc;
+    traeProc.unref();
+    traeProc.on("exit", (code) => { log("trae relay exited", code); traeProc = null; });
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (traeAlive()) return { ok: true };
+    }
+    return { ok: false, error: st.error || `10 秒内未就绪（运行时：${nd.source}），查看 trae/relay.log` };
+  });
+
+  handle("trae:stop", async () => {
+    try {
+      const out = execSync(`netstat -ano | findstr :${TRAE_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+      const pid = out.trim().split(/\s+/).pop();
+      if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
+      if (traeProc) { try { traeProc.kill(); } catch {} traeProc = null; }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  handle("trae:smoke", async () => {
+    // Trae 每次提问都要在远端拉起沙箱会话，首字延迟通常 5-30 秒，这里给足超时
+    const model = (await traeModels())[0]?.id || "Doubao-Seed-Code";
+    const r = await traeHttp("POST", "/v1/chat/completions", {
+      model, max_tokens: 64,
+      messages: [{ role: "user", content: "请只回复OK" }],
+    }, 240000);
+    let reply = "", stop = "";
+    try {
+      const j = r.j;
+      const msg = j.choices?.[0]?.message || {};
+      reply = (msg.content || (msg.reasoning_content ? "[thinking] " + msg.reasoning_content : "")).slice(0, 120);
+      stop = j.choices?.[0]?.finish_reason || "";
+    } catch { reply = r.raw || ""; }
+    return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model };
+  });
+
   handle("logs:tail", async (_e, which) => {
     if (which === "watch") return tailFile(WATCH_LOG, 120);
     if (which === "console") return tailFile(path.join(RELAY_DIR, "console.log"), 120);
+    if (which === "workbuddy") return tailFile(WB_LOG, 150);
+    if (which === "trae") return tailFile(TRAE_LOG, 150);
+    if (which === "doubao") return tailFile(DOUBAO_LOG, 150);
     return tailFile(RELAY_LOG, 200);
   });
 }
@@ -340,6 +1033,10 @@ function createWindow() {
 
 app.whenReady().then(() => {
   log("console started");
+  const boot = ensureRelayServer();   // 首次运行：把 relay 部署到 ~/.autoclaw-relay/
+  if (boot) log("relay 自举失败:", boot);
+  const wbBoot = ensureWbWorkDir();   // 打包态：播种 ~/.workbuddy-gateway/（config.json + auths/ + data/）
+  if (wbBoot) log("workbuddy 自举失败:", wbBoot);
   setupIpc();
   if (process.env.ASWITCH_SELFTEST === "1") {
     // 自测模式：顺序执行各 IPC 处理器（等同逐个点击按钮），结果输出到 stdout
@@ -350,9 +1047,34 @@ app.whenReady().then(() => {
     };
     (async () => {
       const results = [];
-      const t = async (name, ok) => { results.push([name, !!ok]); console.log(`${ok ? "PASS" : "FAIL"} ${name}`); };
+      const progFile = path.join(RELAY_DIR, "selftest-progress.txt");
+      const prog = (msg) => { try { fs.appendFileSync(progFile, `${new Date().toISOString().slice(11, 19)} ${msg}
+`); } catch {} };
+      const t = async (name, ok) => { results.push([name, !!ok]); prog(`${name}: ${ok ? "PASS" : "FAIL"}`); };
+      prog("selftest start");
+      // 定向自测：ASWITCH_SELFTEST_ONLY="zcode:register,trae:smoke" 只跑指定处理器，
+      // 便于快速迭代单个按钮（全量自测会重启 relay，耗时较长）
+      const only = (process.env.ASWITCH_SELFTEST_ONLY || "").split(",").map((s) => s.trim()).filter(Boolean);
+      if (only.length) {
+        for (const ch of only) {
+          try {
+            const out = await invoke(ch);
+            prog(`only ${ch} -> ${JSON.stringify(out).slice(0, 400)}`);
+            console.log(`==== ONLY ${ch} ====`);
+            console.log(JSON.stringify(out, null, 1).slice(0, 2000));
+          } catch (e) {
+            prog(`only ${ch} ERROR: ${e.message}`);
+            console.log(`==== ONLY ${ch} ERROR: ${e.message} ====`);
+          }
+        }
+        app.exit(0);
+        return;
+      }
       const s1 = await invoke("status:query");
       await t("status:query", s1.relay.running && s1.zcode.registered);
+      const env = await invoke("env:check");
+      prog(`env:check ${(env.items || []).filter((i) => !i.ok).map((i) => i.name + ":" + i.detail).join(" | ") || "全部就绪"}`);
+      await t("env:check", env.ok === true);
       const p1 = await invoke("points:refresh");
       await t("points:refresh", p1.ok && p1.total != null);
       const c1 = await invoke("credential:sync");
@@ -365,13 +1087,44 @@ app.whenReady().then(() => {
       await new Promise((r) => setTimeout(r, 2500));
       const w1 = await invoke("status:query");
       await t("watcher:start", w1.watcher.running === true);
+      prog("smoke:test 发起（上游慢时最长 3 分钟）");
       const sm = await invoke("smoke:test");
-      await t("smoke:test", sm.ok === true && sm.reply,);
+      await t("smoke:test", sm.ok === true && sm.reply);
+      await invoke("workbuddy:start");
+      prog("workbuddy:smoke 发起");
+      const wbs = await invoke("workbuddy:smoke");
+      prog(`workbuddy:smoke detail status=${wbs.status} reply=${String(wbs.reply).slice(0, 80)}`);
+      await t("workbuddy:smoke", wbs.ok === true);
+      const wbc = await invoke("workbuddy:credits");
+      await t("workbuddy:credits", wbc.ok === true);
+      await invoke("trae:start");
+      prog("trae:smoke 发起（Trae 需远端拉起沙箱会话，通常 10-40 秒）");
+      const trs = await invoke("trae:smoke");
+      prog(`trae:smoke detail status=${trs.status} model=${trs.model} reply=${String(trs.reply).slice(0, 80)}`);
+      await t("trae:smoke", trs.ok === true);
+      await invoke("doubao:start");
+      prog("doubao:smoke 发起（豆包首字通常 3-10 秒）");
+      const dbs = await invoke("doubao:smoke");
+      prog(`doubao:smoke detail status=${dbs.status} model=${dbs.model} reply=${String(dbs.reply).slice(0, 80)}`);
+      await t("doubao:smoke", dbs.ok === true);
+      // 一键启动（此时三家都已在跑，应全部报“已在运行”）
+      const all = await invoke("all:start");
+      prog(`all:start ${(all.steps || []).map((s) => `${s.name}:${s.ok ? s.detail : s.detail}`).join(" | ")}`);
+      await t("all:start", all.ok === true);
       const rg = await invoke("zcode:register");
-      await t("zcode:register", rg.ok === true && Array.isArray(rg.models) && rg.models.length === 4);
+      prog(`zcode:register detail trae=${JSON.stringify(rg.trae).slice(0, 200)} workbuddy=${JSON.stringify(rg.workbuddy).slice(0, 120)}`);
+      await t("zcode:register", rg.ok === true && Array.isArray(rg.models) && rg.models.length >= 4);
+      await t("zcode:register:trae", rg.trae?.registered === true && rg.trae.models.length > 0);
+      // 注册后立即体检：配置必须仍然健康（合法枚举 + manualProviderModelRules 在位）
+      const zc = await invoke("zcode:check");
+      prog(`zcode:check providers=${(zc.providers || []).map((p) => `${p.providerId}:${p.apiType || "none"}`).join(",")} manual=${zc.hasManualRules}`);
+      await t("zcode:check", zc.ok === true && zc.hasManualRules === true && zc.modelRuleCount > 0);
+      prog(`zcode:register detail backup=${rg.backup}`);
       const l1 = await invoke("logs:tail", "relay");
       const l2 = await invoke("logs:tail", "watch");
-      await t("logs:tail", l1.length > 50 && l2.length > 0);
+      const l3 = await invoke("logs:tail", "trae");
+      await t("logs:tail", l1.length > 50 && l2.length > 0 && l3.length > 0);
+      prog("relay:stop 发起");
       await invoke("relay:stop");
       await new Promise((r) => setTimeout(r, 2500));
       const h0 = await new Promise((res) => {
@@ -384,10 +1137,9 @@ app.whenReady().then(() => {
       const s2 = await invoke("status:query");
       await t("relay:start (恢复)", s2.relay.ok === true);
       const pass = results.filter((r) => r[1]).length;
+      prog(`selftest 完成 ${pass}/${results.length}`);
       console.log(`==== SELFTEST ${pass}/${results.length} ====`);
-      try { fs.writeFileSync(path.join(RELAY_DIR, "selftest-result.txt"),
-        JSON.stringify({ time: new Date().toISOString(), pass, total: results.length,
-          results: results.map(([n, ok]) => ({ name: n, ok })) }, null, 1)); } catch {}
+      try { fs.writeFileSync(path.join(RELAY_DIR, "selftest-result.txt"), JSON.stringify({ time: new Date().toISOString(), pass, total: results.length, results: results.map(([n, ok]) => ({ name: n, ok })) }, null, 1)); } catch {}
       app.exit(pass === results.length ? 0 : 1);
     })();
     return;
