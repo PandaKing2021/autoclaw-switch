@@ -529,7 +529,7 @@ function setupIpc() {
         models: (doubaoH.models || []).map((m) => (typeof m === "string" ? m : m.id)),
         cookies: doubaoH.cookies || null,
         conversation: doubaoH.conversation || "",
-        sessions: doubaoH.sessions ?? 0,
+        mode: doubaoH.mode || "stateless",
         client: await doubaoClientDebug(),
       },
       trae: {
@@ -537,7 +537,7 @@ function setupIpc() {
         ok: traeH.ok,
         models: traeH.models || [],
         credential: traeH.credential || null,
-        sessions: traeH.sessions ?? 0,
+        mode: traeH.mode || "stateless",
       },
       workbuddy: {
         running: wbH.running,

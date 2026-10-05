@@ -49,7 +49,7 @@ async function refreshStatus() {
     $("trae-status").textContent = tr.ok ? "ok" : tr.running ? "无上游/凭证失效" : "未运行";
     $("trae-account").textContent = tr.credential?.account || (tr.credential?.userId ? String(tr.credential.userId) : "-");
     $("trae-exp").textContent = tr.credential?.expiresAt ? tr.credential.expiresAt.slice(0, 16).replace("T", " ") : "-";
-    $("trae-sessions").textContent = tr.running ? `${tr.sessions} 个（复用中）` : "-";
+    $("trae-sessions").textContent = tr.running ? (tr.mode === "stateless" ? "无状态（每请求新建，不复用）" : tr.mode || "-") : "-";
     const trModels = tr.models || [];
     $("trae-model-count").textContent = trModels.length || "-";
     // 目录随账号变（免费组之外还有 agent/work 组），超过 12 个就把余下的挂到「+N」的悬浮提示里
@@ -66,7 +66,7 @@ async function refreshStatus() {
       ? (dbCookieOk ? `有效（${db.cookies.count} 条，${db.cookies.ageMinutes} 分钟前同步）` : `缺失 ${(db.cookies.missing || []).join(",") || "未知"}`)
       : "未同步";
     $("doubao-conv").textContent = db.conversation && db.conversation !== "(auto/new)" ? db.conversation : "自动（用当前活跃对话）";
-    $("doubao-sessions").textContent = db.running ? `${db.sessions} 个（复用中）` : "-";
+    $("doubao-sessions").textContent = db.running ? (db.mode === "stateless" ? "无状态（每请求全量铺平）" : db.mode || "-") : "-";
     const dbModels = db.models || [];
     $("doubao-model-count").textContent = dbModels.length || "-";
     $("doubao-models").innerHTML = dbModels.map((m) => `<span>${m}</span>`).join("");

@@ -9,8 +9,9 @@
 //
 // 上游：POST https://www.doubao.com/chat/completion （SSE）
 //   * 仅需 cookie（sessionid/ttwid/msToken...），无需 a_bogus（已实测）
-//   * 会话上下文由服务端按 conversation_id 保持；本 relay 只发最新一轮，
-//     未命中会话时用扁平化历史重建上下文。
+//   * 无状态语义（对齐 AutoClaw relay）：调用方每次带来完整历史，本 relay
+//     把历史拍平成一条消息发出去；上游的 conversation_id 只是传输草稿纸，
+//     不构成任何跨请求的隐藏状态。
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, statSync, writeFileSync, mkdirSync } from "node:fs";
@@ -23,8 +24,6 @@ const AID = "1044603";
 // 设备指纹正常情况下从 cookie 的 device_id 取；取不到时用随机值，不硬编码任何真实设备 ID
 const FALLBACK_DEVICE_ID = process.env.DOUBAO_DEVICE_ID || String(Math.floor(Math.random() * 9e15) + 1e15);
 const DEFAULT_MODEL = "doubao";
-const SESSION_IDLE_MS = 30 * 60 * 1000;
-const SESSION_MAX = 64;
 
 // --------------------------------------------------------------- models
 
@@ -267,34 +266,14 @@ async function runCompletion(text, { model, conversationId, onText, onThink, sig
   return { text: acc, think, conversationId: conv, short: acc !== brief && brief.length > 0 && brief.length < acc.length };
 }
 
-// --------------------------------------------------------------- sessions
-
-const pool = new Map(); // key -> { conversationId, turns, model, used }
-const convKey = (messages) => {
-  const first = messages.find((m) => m.role === "user");
-  const system = messages.find((m) => m.role === "system");
-  const sys = typeof (system || {}).content === "string" ? system.content : "";
-  const fst = first ? (typeof first.content === "string" ? first.content : (first.content || []).map((p) => p.text || "").join("")) : "";
-  return createHash("sha1").update(sys + "\u0000" + fst).digest("hex");
-};
-const poolGet = (key, turns, model) => {
-  const hit = pool.get(key);
-  if (!hit) return null;
-  if (Date.now() - hit.used > SESSION_IDLE_MS || hit.turns !== turns || hit.model !== model) return null;
-  hit.used = Date.now();
-  return hit;
-};
-const poolSet = (key, conversationId, turns, model) => {
-  pool.set(key, { conversationId, turns, model, used: Date.now() });
-  if (pool.size > SESSION_MAX) {
-    const oldest = [...pool.entries()].sort((a, b) => a[1].used - b[1].used)[0];
-    if (oldest) pool.delete(oldest[0]);
-  }
-};
+// --------------------------------------------------------------- stateless
+// 对齐 AutoClaw relay 的无状态语义：历史每次由调用方全量带来，网关不依赖
+// 任何会话池/隐藏状态。上游的"会话"只是传输草稿纸——每次请求都把完整
+// 历史拍平成一条消息发进固定会话，回答只取决于本次请求内容。
 
 const textOf = (m) => (typeof m.content === "string" ? m.content : (m.content || []).map((p) => p.text || "").join(""));
 
-/** 未命中会话时把历史拍平成一段带角色标签的文本，给模型重建上下文。 */
+/** 把调用方发来的完整历史拍平成一段带角色标签的文本（AutoClaw 语义：历史每次自带）。 */
 function flatten(messages) {
   const parts = [];
   for (const m of messages) {
@@ -340,16 +319,13 @@ async function handleChat(req, res) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const model = resolveModel(body.model);
   const turns = messages.filter((m) => m.role === "user").length;
-  const key = convKey(messages);
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const latest = lastUser ? textOf(lastUser) : "";
-  const stream = body.stream === true;
-  const id = "chatcmpl-" + createHash("sha1").update(key + turns + Date.now()).digest("hex").slice(0, 24);
+  const id = "chatcmpl-" + createHash("sha1").update(JSON.stringify(messages).slice(0, 4096) + turns + Date.now()).digest("hex").slice(0, 24);
   const created = Math.floor(Date.now() / 1000);
   const chunk = (delta, finish = null) => ({
     id, object: "chat.completion.chunk", created, model,
     choices: [{ index: 0, delta, finish_reason: finish }],
   });
+  const stream = body.stream === true;
 
   if (stream) {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
@@ -361,29 +337,15 @@ async function handleChat(req, res) {
   const emitThink = (d) => { if (stream) sse(res, "data", chunk({ reasoning_content: d })); };
 
   try {
-    let hit = poolGet(key, turns - 1, model);
-    let convId = state.conversationId || "";
-    let prompt = latest;
-    let used = "continue";
-    if (hit) {
-      convId = hit.conversationId;
-    } else if (state.conversationId) {
-      convId = state.conversationId;
-      prompt = flatten(messages);
-      used = "shared-conversation";
-    } else {
-      convId = "";
-      prompt = flatten(messages);
-      used = "new-conversation";
-    }
+    const convId = state.conversationId || "";
+    const prompt = flatten(messages); // 永远全量：无状态，不依赖任何池
     const ac = new AbortController();
     req.on("close", () => ac.abort());
     const result = await runCompletion(prompt, {
       model, conversationId: convId, signal: ac.signal,
       onText: emit, onThink: emitThink,
     });
-    poolSet(key, result.conversationId || convId, turns, model);
-    log(`chat model=${model} turns=${turns} ${used} conv=${result.conversationId || convId || "(none)"} stream=${stream} len=${result.text.length}`);
+    log(`chat model=${model} turns=${turns} stateless conv=${result.conversationId || convId || "(none)"} stream=${stream} len=${result.text.length}`);
     const text = result.text || sent;
     if (stream) {
       const tail = text.startsWith(sent) ? text.slice(sent.length) : "";
@@ -417,11 +379,8 @@ async function handleAnthropic(req, res) {
   const full = system ? [{ role: "system", content: system }, ...messages] : messages;
   const model = resolveModel(body.model);
   const turns = messages.filter((m) => m.role === "user").length;
-  const key = convKey(full);
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const latest = lastUser ? textOf(lastUser) : "";
   const stream = body.stream === true;
-  const id = "msg_" + createHash("sha1").update(key + turns + Date.now()).digest("hex").slice(0, 24);
+  const id = "msg_" + createHash("sha1").update(JSON.stringify(full).slice(0, 4096) + turns + Date.now()).digest("hex").slice(0, 24);
   const usage = { input_tokens: 0, output_tokens: 0 };
 
   if (stream) {
@@ -432,13 +391,8 @@ async function handleAnthropic(req, res) {
 
   let sent = "";
   try {
-    let hit = poolGet(key, turns - 1, model);
-    let convId = state.conversationId || "";
-    let prompt = latest;
-    let used = "continue";
-    if (hit) convId = hit.conversationId;
-    else { prompt = flatten(full); used = state.conversationId ? "shared-conversation" : "new-conversation"; }
-
+    const convId = state.conversationId || "";
+    const prompt = flatten(full); // 永远全量：无状态，不依赖任何池
     const ac = new AbortController();
     req.on("close", () => ac.abort());
     const result = await runCompletion(prompt, {
@@ -449,9 +403,8 @@ async function handleAnthropic(req, res) {
       },
       onThink: () => {},
     });
-    poolSet(key, result.conversationId || convId, turns, model);
     const text = result.text || sent;
-    log(`messages model=${model} turns=${turns} ${used} conv=${result.conversationId || convId || "(none)"} stream=${stream} len=${text.length}`);
+    log(`messages model=${model} turns=${turns} stateless conv=${result.conversationId || convId || "(none)"} stream=${stream} len=${text.length}`);
     if (stream) {
       const tail = text.startsWith(sent) ? text.slice(sent.length) : "";
       if (tail) res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: tail } })}\n\n`);
@@ -482,7 +435,7 @@ const server = createServer(async (req, res) => {
         upstream: "https://www.doubao.com/chat/completion",
         cookies: cookieHealth(),
         conversation: state.conversationId || "(auto/new)",
-        sessions: pool.size,
+        mode: "stateless",
         models: MODELS.map((m) => m.id),
       });
     }

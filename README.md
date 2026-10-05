@@ -61,8 +61,8 @@ Electron 管理面板，六个卡片 + 顶栏：
 - **Relay 卡片**（AutoClaw）：运行状态 / 上游通道 / 运行时长 / 模型别名；启动、停止、连通性测试（真实推理）
 - **账号卡片**：积分余额与即将过期（CN 网关按需查询）、token 剩余有效期、凭证同步器状态与启停
 - **WorkBuddy 卡片**：网关状态 / 积分 / 账号 / 模型目录；启动、停止、连通性测试
-- **Trae 卡片**：网关状态 / 账号 / 凭证到期 / 会话池大小 / 模型目录；启动、停止、连通性测试
-- **豆包工作卡片**：网关状态 / cookie 健康度 / 固定会话 / 会话池 / 模型目录；启动、停止、连通性测试、**同步登录态**、**重启客户端并同步**
+- **Trae 卡片**：网关状态 / 账号 / 凭证到期 / 运行模式（无状态）/ 模型目录；启动、停止、连通性测试
+- **豆包工作卡片**：网关状态 / cookie 健康度 / 固定会话（仅作传输通道）/ 运行模式（无状态）/ 模型目录；启动、停止、连通性测试、**同步登录态**、**重启客户端并同步**
 - **ZCode 卡片**：注册状态 / 四家接入地址与模型数 / 模型清单 / 一键注册（同步模型目录）/ **配置体检**（只读检查 `provider_config.json` 的枚举与必需字段）
 - **日志查看器**：反代 / 同步器 / WorkBuddy / Trae / 豆包 / 控制台六标签，自动刷新
 - **顶栏**：**一键启动全部**（某项缺前置只影响它自己，失败时自动把体检结果摆出来）与**环境体检**
@@ -79,6 +79,8 @@ node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测�
 结果落盘在 `~/.autoclaw-relay/selftest-result.txt`。注意全量自测会重启 relay，改单个按钮时用定向自测；改完 `app/main.js` 或 `preload.js` 必须重启 electron 进程——运行中的窗口不会热更新。
 
 ## 四条链路各自的原理
+
+**四条链路统一是「无状态」网关，语义对齐 AutoClaw 的 relay。** 网关不保存任何会话：每次请求都独立地去完成一次上游调用，历史由调用方（ZCode）在 `messages` 里全量带来，回答只取决于本次请求内容。AutoClaw 链路本来就长这样（`bridge/server_2x.mjs` 里没有任何会话/会话池代码）；Trae 链路每请求新建一个远端会话再把历史拍平进去，用完即弃；豆包链路没有"新建会话"这个接口，于是把固定会话当作**传输草稿纸**——每次请求都把完整历史拍平成一条消息发进去，不复用服务端上下文。这样做的收益是行为可预测：同一份 `messages` 无论何时发、上一轮发生过什么，结果都一致，也不存在会话池串味/污染的可能；代价写在各自的章节里（Trae 每轮都要重付 agent system prompt 的固定开销，豆包每轮都要重发全量历史）。
 
 ### AutoClaw：凭证桥接 + 2.x 网关契约
 
@@ -147,7 +149,7 @@ plaintext = sha512(body)(64) || body        # PKCS7 填充，头部哈希用于�
 
 只有这个 **user token** 能过鉴权；`GenerateTempToken` 签发的临时 JWT 打远程 API 一律 401。线上真实生效的 query 是 `[{"type":"text","data":{"content":...}}]`——服务端**回显/落库**时会规范化成 `text_content` 形态，照抄回显格式发出去，提示词会被静默丢弃。
 
-**会话池。** 每轮都新建会话既浪费（每轮约 17.6k prompt token 的固定系统开销）又丢上下文，所以网关按 `sha1(system + 首条 user 消息)` 维护会话池：下一轮命中且轮数连续就复用同一会话（响应里标 `mode:continue`），否则把历史展开成带角色标注的转录后新建会话。SSE 的 `plan_item` 增量翻译成 OpenAI 的 `delta` 与 Anthropic 的 `content_block_delta`，`token_usage` 翻译成 `usage`。
+**无状态转发（对齐 AutoClaw）。** 网关**不再维护会话池**：每个请求都 `POST /chat_sessions` 新建一个远端会话，把调用方带来的全部历史展开成带角色标注（`[System instructions]` / `[User]` / `[Assistant]`）的转录作为首条消息发出去，回答完即弃，响应里标 `mode:"stateless"`。代价如实说：每轮都要重付一次 Trae agent system prompt 的固定开销（实测约 17.6k–20.8k prompt token，无法靠复用摊薄），Trae 账号的会话列表增长也更快；换来的是没有跨请求隐藏状态，同一个 `messages` 任何时候发都是同一个结果，也不会出现"会话池命中错了导致上下文串味"。SSE 的 `plan_item` 增量翻译成 OpenAI 的 `delta` 与 Anthropic 的 `content_block_delta`，`token_usage` 翻译成 `usage`。
 
 **模型目录要带参数问**：`GET /api/remote/v1/models` 不带参数只回默认的 `solo_coder` 一组（12 个模型），客户端实际发的是 `functions=solo_coder,solo_agent_lite,solo_agent_remote,solo_work_lite,solo_work_remote,solo_design_lite,solo_design_remote,builder&show_custom_model=true`，带上才会返回 7 个分组。网关现在两次都取、并集去重（同名模型会在多组出现），本账号当前共 **27 个**可选模型：除 solo_coder 的 12 个外，还有 glm-5.3、glm-5.2、deepseek-v4.1-flash、DeepSeek-V4-Flash/Pro 正式版、kimi-k3、kimi-k2.7-code、minimax-m3、qwen3.8-max、qwen-3.7-plus、step-5-preview、Doubao-Seed-Evolving、Doubao-Seed-2.1-Pro/Turbo。`show_custom_model=true` 带出的自定义条目里 `z-ai/glm-5.2` 实测返回 200 但 content 为空，已在网关里排除（能选但不出字比没有更糟）。目录随账号与客户端版本变化，控制台与注册流程每次都从网关动态拉取。
 
@@ -159,7 +161,7 @@ plaintext = sha512(body)(64) || body        # PKCS7 填充，头部哈希用于�
 - **登录态通过 CDP 抓取**：客户端以 `--remote-debugging-port=9222` 启动后，用 `Network.getAllCookies` 可以直接拿到明文 cookie（省去 DPAPI 解密），落到 `~/.doubao-relay/cookies-cdp.json`。控制台的两种取法：「同步登录态」（客户端已带调试端口在跑）与「重启客户端并同步」（先 taskkill 再带端口重启，然后抓取）。
 - **请求要在 query 上带足客户端指纹**：`aid/channel/client_platform/device_platform/pc_version=2.31.10/pkg_type/region=CN/runtime=web/runtime_version=3.39.0/samantha_web=1/use-olympus-account=1/web_tab_id=<uuid>` 等，UA 形如 `…SamanthaDoubaoWork/2.31.10`，body 里带着 `bot_id` 与 `client_meta`。（可工作的最小集合已经固化在 relay 里。）
 - **SSE 事件语法**（完整枚举过）：`SSE_HEARTBEAT` / `SSE_ACK`（回执里的 `ack_client_meta.conversation_id` 才是权威会话 id）/ `FULL_MSG_NOTIFY`（用户消息回显）/ `STREAM_MSG_NOTIFY` / `STREAM_CHUNK`（`patch_op` 增量）/ **`CHUNK_DELTA`（正文增量，主要来源）** / `STREAM_TIMEOUT_CONTROL` / `SSE_REPLY_END`（`end_type` 1/2/3 表示不同阶段的结束）。正文按到达顺序拼接三个来源的增量即可得到完整回答；`end_type=1` 里的 `brief` 只是**截断摘要**，仅在没有增量时兜底。
-- **会话**：服务端默认把请求路由到本机「最近一个会话」，所以 relay 把一个专用 `conversation_id` 固定下来（配置文件 `~/.doubao-relay/config.json`，也可 `POST /admin/conversation` 改），多轮上下文由服务端维护；没有固定会话时才把历史展开成带角色的转录一次性发。**会话只能由客户端界面创建**（新建会话 + 发一句话），接口层创建不出来。
+- **会话只是个传输草稿纸（无状态）**：服务端默认把请求路由到本机「最近一个会话」，而接口层**创建不出新会话**（只能由客户端界面新建会话 + 发一句话），所以 relay 把客户端里已有的一个 `conversation_id` 固定下来（配置文件 `~/.doubao-relay/config.json`，也可 `POST /admin/conversation` 改）纯粹当作收发通道——**不复用服务端上下文**：每个请求都把调用方带来的完整历史拍平成一条消息（`[System instructions]` / `[User]` / `[Assistant]` + 只回答最后一条 `[User]` 的指令）发进去，回答完即弃，`/health` 里标 `mode:"stateless"`。上游那条固定会话仍会累积历史，但网关不读、不依赖它，所以换账号/换会话/被清了历史都不影响正确性。
 - **模型目录不可枚举**：模型是服务端下发的（客户端 bundle 里没有目录，`model_item_key` 也没找到枚举接口），网关只暴露两个合成条目——`doubao`（标准）与 `doubao-think`（深思考，`conversation_init_ext` 用 `need_deep_think=9` + `reasoning_effort="5"`）。
 - **注意**：反代的调用会真实出现在你本机的豆包工作会话列表里（就是那个固定会话）。不想要痕迹就在客户端里另建一个专用会话，再用 `POST /admin/conversation` 指过去。
 - **工具调用不支持**（与 Trae 同为仅文本），`tools` 字段会被忽略而不是报错。
@@ -196,20 +198,20 @@ curl -X POST http://127.0.0.1:18766/v1/messages \
 
 # Trae 网关（:18768，openai）
 node trae/relay.mjs &
-curl http://127.0.0.1:18768/health        # 凭证账号/到期、模型目录、会话池大小
+curl http://127.0.0.1:18768/health        # 凭证账号/到期、模型目录、模式（stateless）
 curl -X POST http://127.0.0.1:18768/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"glm-5.1","messages":[{"role":"user","content":"用一句话解释反向代理"}]}'
 
 # 豆包工作网关（:18770，openai，另有 /v1/messages）
 node doubao/relay.mjs &
-curl http://127.0.0.1:18770/health        # cookie 健康度、固定会话、会话池、模型
+curl http://127.0.0.1:18770/health        # cookie 健康度、固定会话、模式（stateless）、模型
 curl -X POST http://127.0.0.1:18770/v1/chat/completions \
   -H 'Content-Type: application/json' -H 'Authorization: Bearer doubao-local-key' \
   --data-binary @req.json                  # {"model":"doubao","messages":[...]}，中文务必走文件
 ```
 
-回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮续接）、`node trae/test_robust.mjs`（system/tools 兼容、会话隔离、多轮记忆）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）。注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
+回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）。注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
 
 ## 故障速查
 
@@ -248,7 +250,7 @@ autoclaw-to-zcode/                 ← 工作区根目录
 │   ├── persona.txt                ★ 应用 persona system prompt
 │   └── test_*.mjs / probe_*.mjs   406 闸门的实验、验证与二分脚本
 ├── trae/                          ← Trae SOLO CN 反代
-│   ├── relay.mjs                  ★ 网关本体（openai + anthropic，凭证解密 + 会话池）
+│   ├── relay.mjs                  ★ 网关本体（openai + anthropic，凭证解密 + 无状态转发）
 │   ├── decrypt_auth.py            离线解密 storage.json 的参考实现
 │   ├── remote_api_spec.json       枚举出的 198 个远程端点（逆向记录）
 │   ├── dump_events.mjs            原始 SSE 事件转储（协议分析用）
@@ -256,7 +258,7 @@ autoclaw-to-zcode/                 ← 工作区根目录
 ├── workbuddy/                     ← WorkBuddy 网关（wb2api 源码 + config.json）
 │   └── workbuddy-manager-v1.0.79/upstream/   Go 源码，UPSTREAM-SRC.txt 说明来源
 ├── doubao/                        ← 豆包工作反代
-│   ├── relay.mjs                  ★ 网关本体（openai + anthropic，cookie 鉴权 + SSE 解析 + 会话池）
+│   ├── relay.mjs                  ★ 网关本体（openai + anthropic，cookie 鉴权 + SSE 解析 + 无状态全量铺平）
 │   ├── cdp.js                     CDP 工具（cookies 抓取 / 请求头与网络转储 / drive 注入脚本）
 │   ├── probe.mjs / im.mjs / raw.mjs        协议探针（SSE 事件、IM cmd 协议、任意端点）
 │   ├── test-relay.mjs / test-zcode-shape.mjs  回归测试
