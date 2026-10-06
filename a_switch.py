@@ -2658,6 +2658,7 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
         if honor_cancel and LOGIN_CANCEL.is_set():
             cancelled = True
             break
+        _inflight_beat(profile_dir)      # 心跳：标记本登录目录"进行中"，防孤儿清理误删
         # 回跳自检：登录期间主 profile 的 auth.json 被改写 = z.ai 网页登录的深链
         # （autoclaw:// → 系统拉起 D:\AutoClaw\AutoClaw.exe 接收）已把凭证落回主配置。
         # 若身份仍是快照里那个号 = 浏览器交回的就是当前已登录账号（不是新号），
