@@ -1640,6 +1640,39 @@ def _display_name_index():
 _DISPLAY_INDEX = _display_name_index()
 
 
+# 千问办公的目录是**封闭**的：上游只认 qwork 场景里那几把 key。CN 全局别名
+# 表里同名条目指向的是另一套 key（"Qwen3.8-Flash" -> qfmodel），一旦落到那
+# 张表上游就报 403 Model is not available for this user，所以本区必须自带
+# 别名表并把解析范围锁在本区目录内。
+QWORK_ALIASES = {
+    "flash": "flash", "标准": "flash", "standard": "flash",
+    "qwen3.8-flash": "flash", "qwen3.8-flash (标准)": "flash",
+    "pro": "pro", "高级": "pro", "advanced": "pro",
+    "qwen3.8-max-preview": "qwen3.8-max-preview",
+    "qwen3.8-max": "qwen3.8-max-preview", "max": "qwen3.8-max-preview",
+}
+CLOSED_REALMS = ("qworkcn",)
+
+
+def _realm_alias_index(realm):
+    """区域自带别名 + 本区目录 display_name/i18n 名的合并索引。"""
+    if realm not in CLOSED_REALMS:
+        return {}
+    idx = dict(QWORK_ALIASES)
+    for m in models_for_realm(realm):
+        key = m.get("key")
+        if not key:
+            continue
+        idx.setdefault(key.lower(), key)
+        names = [(m.get("display_name") or "")]
+        i18n = (m.get("i18n") or {}).get("display_name") or {}
+        names.extend(i18n.values() if isinstance(i18n, dict) else [])
+        for name in names:
+            if str(name).strip():
+                idx.setdefault(str(name).strip().lower(), key)
+    return idx
+
+
 def resolve_upstream_key(model, realm=None):
     """把客户端请求的模型名解析为上游 model key。
 
@@ -1660,6 +1693,22 @@ def resolve_upstream_key(model, realm=None):
             m_key = m
     else:
         m_key = m
+
+    # 封闭区：只在本区目录 + 本区别名里解析，绝不落到 CN/INTL 全局表
+    # （跨表命中会把 CN 的 key 发给只认自家 key 的网关）。未命中就原样透传，
+    # 由上游给准确错误，便于排查。
+    if realm in CLOSED_REALMS:
+        low = m_key.lower()
+        if keys and m_key in keys:
+            return m_key
+        scoped = _realm_alias_index(realm)
+        if low in scoped:
+            return scoped[low]
+        if low.startswith("auto") or low in ("default", "智能选择"):
+            default = [x for x in models_for_realm(realm) if x.get("is_default")]
+            if default:
+                return default[0]["key"]
+        return m_key
 
     if keys and m_key in keys:
         return m_key

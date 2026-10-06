@@ -12,18 +12,20 @@
 | **豆包工作**（字节 DoubaoWork） | 客户端内置额度 | CDP 取登录 cookie → 直连 `/chat/completion` | openai（+anthropic） | 18770 | 2（合成） | ❌ 仅文本 |
 | **Comate 文心快码**（百度） | Comate IDE 内置额度 | 读 settings.json 里的 license → 驱动其云端 agent 三步链 | openai（+anthropic） | 18774 | 15 | ❌ 仅文本 |
 | **Qoder CN**（阿里） | 客户端内置额度（Free 档 Qwen3.8 系可用） | vendored 社区网关（COSY 签名）+ 本机凭证入池 | openai | 8791 | 14 | ✅ 透传 |
-| **千问办公**（QoderWork CN） | 同 Qoder 平台，独立网关 | 同 COSY 体系（见千问办公一节，chat 链路收尾中） | openai | 8791 | 3* | ❌ 仅文本 |
+| **千问办公**（QoderWork CN） | 同 Qoder 平台，独立网关 | 同 COSY 体系，多一处形态声明（见千问办公一节） | openai | 8791 | 3 | ✅ 透传 |
 
 \* 模型目录随账号动态拉取，表中为 2026-10 本机实测值；豆包的目录在服务端且不可枚举，网关只能给出两个合成条目。
 
-所有组件都跑在 `127.0.0.1`，凭证不离开你的电脑；七个平台在 ZCode 里是并列供应商（`autoclaw-glm-provider` / `workbuddy-openai-provider` / `trae-openai-provider` / `doubao-openai-provider` / `comate-openai-provider` / `qoder-openai-provider`），模型名不冲突，同一个会话里可以自由切换。
+所有组件都跑在 `127.0.0.1`，凭证不离开你的电脑；七个平台在 ZCode 里是并列供应商（`autoclaw-glm-provider` / `workbuddy-openai-provider` / `trae-openai-provider` / `doubao-openai-provider` / `comate-openai-provider` / `qoder-openai-provider` / `qwenwork-openai-provider`），模型名不冲突，同一个会话里可以自由切换。
+
+Qoder CN 与千问办公共用 `8791` 这**一个**网关进程（同一份账号池、同一套 COSY 签名），ZCode 侧靠**绑定出口的 API Key** 分成两个并列供应商（ZCode 的供应商配置没有自定义请求头字段，绑 Key 是官方设计的出口选择方式）：控制台注册时会自己生成两把 Key 写进网关、并关掉该网关的密钥校验（网关只监听回环，此前本就免鉴权），老的注册方式不受影响。
 
 ## 这是什么 / 不是什么
 
-四个上游都是**消费级 agent 客户端**，不是模型厂商的公开 API。它们各自把自家积分/免费额度消耗在官方客户端里，本项目的反代让 ZCode 之类的标准 IDE 也能吃到这些额度。
+七个上游都是**消费级 agent 客户端**，不是模型厂商的公开 API。它们各自把自家积分/免费额度消耗在官方客户端里，本项目的反代让 ZCode 之类的标准 IDE 也能吃到这些额度。
 
 - **是**：本地协议翻译层。ZCode 发标准 anthropic/openai 请求 → 网关翻译成各上游的真实协议 → 流式回填。
-- **不是**：官方接口。四条链路全部来自对客户端的逆向（凭证存储格式、网关域名、请求头签名、WAF 闸门、会话协议）。上游一旦改版，接入层就要跟着逆向更新——2.x 适配、Trae 的 functions 目录参数、豆包的 SSE 事件语法都是这么来的。
+- **不是**：官方接口。七条链路全部来自对客户端的逆向（凭证存储格式、网关域名、请求头签名、WAF 闸门、会话协议）。上游一旦改版，接入层就要跟着逆向更新——2.x 适配、Trae 的 functions 目录参数、豆包的 SSE 事件语法、千问办公的场景声明都是这么来的。
 - **代价**：非官方调用有封号风险（AutoClaw 尤其看推理流水的"形状"，见防封一节）；额度计费按各平台自己的规则走。
 
 ## 快速开始
@@ -38,10 +40,10 @@ npm start
 打开控制台后**就三步**：
 
 1. **环境体检**：顶栏按钮，只读探测，缺什么会逐项告诉你影响和补法；
-2. **一键启动全部**：按依赖顺序拉起四家网关与凭证同步器；
-3. **一键注册**：把四个供应商写进 ZCode 的模型目录。
+2. **一键启动全部**：按依赖顺序拉起各家网关与凭证同步器（Qoder CN 与千问办公共用一个进程）；
+3. **一键注册**：把七个供应商写进 ZCode 的模型目录。
 
-然后**重启 ZCode**，模型列表里就能看到四个平台的模型了。
+然后**重启 ZCode**，模型列表里就能看到七个平台的模型了。
 
 冷启动加固已做：反代的运行时文件（`~/.autoclaw-relay/server.mjs` 与 `persona.txt`）由控制台自动从 `bridge/` 部署，第一次也是每次点「启动」时都会补齐，不需要手工 cp。
 
@@ -66,7 +68,7 @@ Electron 管理面板，六个卡片 + 顶栏：
 - **WorkBuddy 卡片**：网关状态 / 积分 / 账号 / 模型目录；启动、停止、连通性测试
 - **Trae 卡片**：网关状态 / 账号 / 凭证到期 / 运行模式（无状态）/ 模型目录；启动、停止、连通性测试
 - **豆包工作卡片**：网关状态 / cookie 健康度 / 固定会话（仅作传输通道）/ 运行模式（无状态）/ 模型目录；启动、停止、连通性测试、**同步登录态**、**重启客户端并同步**
-- **ZCode 卡片**：注册状态 / 四家接入地址与模型数 / 模型清单 / 一键注册（同步模型目录）/ **配置体检**（只读检查 `provider_config.json` 的枚举与必需字段）
+- **ZCode 卡片**：注册状态 / 七家接入地址与模型数 / 模型清单 / 一键注册（同步模型目录）/ **配置体检**（只读检查 `provider_config.json` 的枚举与必需字段）
 - **日志查看器**：反代 / 同步器 / WorkBuddy / Trae / 豆包 / 控制台六标签，自动刷新
 - **顶栏**：**一键启动全部**（某项缺前置只影响它自己，失败时自动把体检结果摆出来）与**环境体检**
 
@@ -74,16 +76,16 @@ Electron 管理面板，六个卡片 + 顶栏：
 
 ```
 cd app && npm start                     # 启动（等价于 npx electron .）
-ASWITCH_SELFTEST=1 npx electron .       # 18 项功能自检（覆盖体检、一键启动、四家连通性与注册）
+ASWITCH_SELFTEST=1 npx electron .       # 26 项功能自检（覆盖体检、一键启动、七家连通性与注册）
 ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # 只跑指定处理器
-node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，12 条用例）
+node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，13 条用例）
 ```
 
 结果落盘在 `~/.autoclaw-relay/selftest-result.txt`。注意全量自测会重启 relay，改单个按钮时用定向自测；改完 `app/main.js` 或 `preload.js` 必须重启 electron 进程——运行中的窗口不会热更新。
 
-## 四条链路各自的原理
+## 各条链路各自的原理
 
-**四条链路统一是「无状态」网关，语义对齐 AutoClaw 的 relay。** 网关不保存任何会话：每次请求都独立地去完成一次上游调用，历史由调用方（ZCode）在 `messages` 里全量带来，回答只取决于本次请求内容。AutoClaw 链路本来就长这样（`bridge/server_2x.mjs` 里没有任何会话/会话池代码）；Trae 链路每请求新建一个远端会话再把历史拍平进去，用完即弃；豆包链路没有"新建会话"这个接口，于是把固定会话当作**传输草稿纸**——每次请求都把完整历史拍平成一条消息发进去，不复用服务端上下文。这样做的收益是行为可预测：同一份 `messages` 无论何时发、上一轮发生过什么，结果都一致，也不存在会话池串味/污染的可能；代价写在各自的章节里（Trae 每轮都要重付 agent system prompt 的固定开销，豆包每轮都要重发全量历史）。
+**七条链路统一是「无状态」网关，语义对齐 AutoClaw 的 relay。** 网关不保存任何会话：每次请求都独立地去完成一次上游调用，历史由调用方（ZCode）在 `messages` 里全量带来，回答只取决于本次请求内容。AutoClaw 链路本来就长这样（`bridge/server_2x.mjs` 里没有任何会话/会话池代码）；Trae 链路每请求新建一个远端会话再把历史拍平进去，用完即弃；豆包链路没有"新建会话"这个接口，于是把固定会话当作**传输草稿纸**——每次请求都把完整历史拍平成一条消息发进去，不复用服务端上下文；Comate 链路复刻的是 IDE 内核到云端 agent 的三步链，同样是每请求一次完整往返；Qoder CN 与千问办公（同一个 COSY 网关的两个出口）把 `messages` 拍平成 `query` 转录后走各自的 `agent_chat_generation` 流。这样做的收益是行为可预测：同一份 `messages` 无论何时发、上一轮发生过什么，结果都一致，也不存在会话池串味/污染的可能；代价写在各自的章节里（Trae 每轮都要重付 agent system prompt 的固定开销，豆包每轮都要重发全量历史）。
 
 ### AutoClaw：凭证桥接 + 2.x 网关契约
 
@@ -182,22 +184,25 @@ Comate（`D:\Comate`，VS Code fork v1.108）是「扩展 → 本地内核（com
 
 ### Qoder CN / 千问办公：COSY 签名（vendored 社区网关）
 
-Qoder CN（`D:\Qoder CN`，`com.qodercn.app.stable`）与千问办公（QwenWork CN，`D:\QwenWorkCN`）同属阿里的 Qoder 平台，上游是 **COSY 签名体系**：RSA 包裹 AES 会话密钥 + MD5 请求签名 + 自定义 Base64 请求体编码（qoder_encode）。这一条我们没有自研——vendored 了社区的 [qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（MIT，纯标准库 Python，`qoder/` 目录；本地补丁：新增 qworkcn 区域、chat/models 前缀分离），以 `qoder/qoder_proxy.py --port 8791` 长驻运行：
+Qoder CN（`D:\Qoder CN`，`com.qodercn.app.stable`）与千问办公（QwenWork CN，`D:\QwenWorkCN`）同属阿里的 Qoder 平台，上游是 **COSY 签名体系**：RSA 包裹 AES 会话密钥 + MD5 请求签名 + 自定义 Base64 请求体编码（qoder_encode）。这一条我们没有自研——vendored 了社区的 [qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（MIT，纯标准库 Python，`qoder/` 目录；本地补丁：新增 qworkcn 区域、chat/models 前缀分离、目录场景与工作台形态按区域可配），以 `qoder/qoder_proxy.py --port 8791` 长驻运行：
 
 - **凭证入池**：桌面 App 的 `%APPDATA%\com.qodercn.app.stable\auth.v1.dat`（v10+AES-GCM，密钥在 Local State）；千问办公是 `%APPDATA%\QwenWorkCN\auth-v2.dat`（schemaVersion=2，Ory JWT + `ory_rt_` 刷新令牌）。控制台「同步账号」= 面板登录（默认密码 admin，仅回环）+ `/accounts/import/desktop` 两步确认。
 - **Qoder CN 全链路已通**：模型目录动态跟随官方（`/algo/api/v2/model/list`，GET 也要带同款签名 body 否则 403），对话走 `POST {gateway}/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`，**tools 透传已实测**（finish_reason:tool_calls）。Free 档只有 Qwen3.8-Max/Flash 计 0 credits，其余模型上游 403 code 112（要付费套餐），网关的 `/v1/models` 会带 `enabled` 标志，注册时过滤。
-- **千问办公（收尾中）**：网关独立（`gateway.qwenwork.cn`）、模型列表路径无 `/algo` 前缀而 chat 路径**带** `/algo`（CLI 日志 + 二进制字符串实证）；凭证解密、COSY 签名、模型目录（flash/pro/qwen3.8-max-preview 三档，1M 上下文）全部打通，但 chat 的业务层对「非 host 铸造的令牌」返回 503 `Model catalog unavailable`——jobToken 由客户端内 `qoder-auth-wasm` 现签、绑定会话，直接用 auth-v2.dat 的 Ory JWT 会被业务层拒绝。收尾方向：worker 运行时（`qoder-worker-runtime.obf.mjs`，undici 传输）的 dispatcher 级 hook，或复刻 wasm 的令牌铸造。
+- **千问办公全链路已通**：网关独立（`gateway.qwenwork.cn`）、模型列表路径无 `/algo` 前缀而 chat 路径**带** `/algo`（CLI 日志 + 二进制字符串实证）；凭证解密、COSY 签名、模型目录（flash/pro/qwen3.8-max-preview 三档，1M 上下文）全部打通。**tools 透传已实测**（finish_reason:tool_calls，参数正确回填），流式 41 chunk + `[DONE]`。
+- **千问办公的两个坑**（都会表现为 **SSE 内嵌 503 `Model catalog unavailable`**，HTTP 层面却是 200，看状态码会以为链路没问题）：一是**模型目录按场景分区**——`model/list` 返回 `chat/developer/assistant/inline/quest/nap/qwork/...` 一排格子，qworkcn 的 `chat` 是空数组，模型挂在 `qwork` 里，取错格子就拿到 0 个模型；二是**上行 body 必须声明工作台形态**（`session_type`/`business.product` = `qoder_work`，即客户端在 `QODER_WORK_INTEGRATION_MODE=1` 下的取值），不声明服务端就把请求归到默认场景、查不到该用户的目录。两处在 `qoder_accounts.py` 的 `REALM_CONFIGS["qworkcn"]` 里是 `model_scene` / `session_type` / `business_product` 三个配置项，由 `qoder_proxy.py` 按区域读取——cn/intl 不配这几项，行为与上游模板一致。
+- **千问办公的模型名是封闭目录**：上游只认 `qwork` 场景里那几把 key。CN 全局别名表里同名条目指向的是另一套 key（"Qwen3.8-Flash" → `qfmodel`），一旦落到那张表上游就报 403 `Model is not available for this user`；所以 qworkcn 走 `CLOSED_REALMS` 分支，解析范围锁死在本区目录 + 本区别名表（`QWORK_ALIASES`），未命中就原样透传给上游报错，绝不跨表。
 - **账号池与签到**：网关自带多账号轮询、设备指纹派生（同号固定同虚拟设备）、每日签到/活动领取（官方幂等）。账号池文件在 `~/.qoder-relay/accounts/`（控制台启动时以 `--accounts-dir` 指定），**不入库**。
 
 ## ZCode 供应商注册：写入安全边界（重要）
 
-`~/.zcode/v2/provider_config.json` 是 **ZCode 自己的配置文件**，控制台只被允许增量修改自己注册的三个供应商。历史上这里踩过两次同一个根因的坑：写入非法的 `api.type`（把内部 kind `openai-compatible` 当成合法值，导致整个供应商加载失败），以及"规范化成我认识的集合"把别人的条目删掉（丢掉必填的 `manualProviderModelRules`；又把 AutoClaw 目录削成 4 个模型）。现在的规则写死在 `app/zcode-config.js` 里：
+`~/.zcode/v2/provider_config.json` 是 **ZCode 自己的配置文件**，控制台只被允许增量修改自己注册的七个供应商。历史上这里踩过两次同一个根因的坑：写入非法的 `api.type`（把内部 kind `openai-compatible` 当成合法值，导致整个供应商加载失败），以及"规范化成我认识的集合"把别人的条目删掉（丢掉必填的 `manualProviderModelRules`；又把 AutoClaw 目录削成 4 个模型）。现在的规则写死在 `app/zcode-config.js` 里：
 
 - **api.type 只认三个值**：`anthropic-messages` / `openai-responses` / `openai-chat-completions`（取自 ZCode 自身代码的 switch 分支）
-- **写入前后做结构键集断言**：丢了任何既有键/条目就整体拒绝落盘，白名单只有三家自己的模型目录
+- **写入前后做结构键集断言**：丢了任何既有键/条目就整体拒绝落盘，白名单只有七家自己的模型目录
 - **目录只做并集**：`personalModelIds` 只加不删，模型条目缺则补；已存在条目的能力声明（如 `supportsImage`）保留，只刷新 `contextWindow`
 - **原子写 + 读回校验 + 回滚**：先写临时文件再 rename，写完重新解析，失败自动回滚到 `*.bak-<时间戳>`
 - **AutoClaw 的目录真源是 `a_switch.py` 的 `ZCODE_MODELS`**（6 个模型，带逐路由实测的视觉矩阵），控制台不自带写死的列表
+- **出口选择靠绑 Key，不靠请求头**：ZCode 的供应商条目没有自定义请求头字段，而 Qoder CN 与千问办公共用 `8791` 一个进程，于是注册前先调网关面板生成两把绑定到各自区域的 Key（`~/.autoclaw-relay/qoder-realm-keys.json`，0600 权限，明文只留本机），并顺带下发 `auth_disabled: true`——否则网关一旦存在 Key 就要求 `/v1` 全部带 Key，老注册会突然 401；写面板时用空 `key` 值占位保留别人建的条目，只增改自己那两条
 
 沙箱回归测试 `node app/test_zcode_config.js` 里，A1/A2/A3 三条用例正好是上面两个历史错误，旧实现必失败、现实现必通过。
 
@@ -240,10 +245,12 @@ curl -X POST http://127.0.0.1:18774/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"auto","messages":[{"role":"user","content":"reply OK"}]}'
 
-# Qoder CN 网关（:8791，openai；需 Python 3.9+）
+# Qoder CN / 千问办公网关（:8791，openai；需 Python 3.9+，两条出口共用一个进程）
 python qoder/qoder_proxy.py --port 8791 --accounts-dir ~/.qoder-relay/accounts &
-curl http://127.0.0.1:8791/health         # 账号池数量、当前区域
+curl http://127.0.0.1:8791/health         # 账号池数量、当前区域，以及按区域分列的 realms 明细
 curl http://127.0.0.1:8791/v1/models      # enabled=false 的项是付费墙模型，Free 账号调用会 403
+# 千问办公出口：带出口 Key（控制台生成，见 ~/.autoclaw-relay/qoder-realm-keys.json）或 X-Realm 头
+curl http://127.0.0.1:8791/v1/models -H "X-Realm: qworkcn"    # 三个模型：标准 / 高级 / Qwen3.8-Max
 ```
 
 回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）。注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
@@ -257,6 +264,8 @@ curl http://127.0.0.1:8791/v1/models      # enabled=false 的项是付费墙模�
 | 406 空响应 | 2.x 闸门五要素缺一（见上文）；最常见是 persona.txt 没部署——控制台点「启动」会自动补 |
 | 810001 系统繁忙 | GLM-5.3-Flash 白天高峰限流，夜间 23:00-09:00 畅通；反代已自动退避重试，白天建议改用 GLM-5.3 或 Auto 路由 |
 | Trae 401 | 凭证约 5 天过期，重新打开 Trae 登录一次；网关遇 401 自动重读 storage.json，无需重启 |
+| Qoder/千问办公 401 或 `no usable account for realm` | 该区域账号池为空或凭证过期。控制台「同步账号」重新入池；冷却中的账号要等冷却结束（或重启网关）才会重新可用 |
+| 千问办公 SSE 里回 `503 Model catalog unavailable`（HTTP 却是 200） | 上游按场景分区目录、且要请求声明工作台形态：取错 `model_scene` 或没带 `session_type`/`business.product`。此提示只在 HTTP 200 的 SSE 正文里，看状态码发现不了——排查时直接看报文内容 |
 | 豆包 401 / cookie 缺失 | 客户端登录态过期。控制台点「同步登录态」（需客户端已带调试端口运行）或「重启客户端并同步」重新抓 cookie |
 | 豆包回复乱码 / 空 | 先确认请求正文本身是 UTF-8（Git Bash 的 `curl -d '中文'` 会发 GBK 乱码，见「验证」一节）；固定会话被删时用 `POST /admin/conversation` 换一个 |
 | 点按钮没反应 | 大概率是 Python 缺 cryptography——spawn 成功但同步器立刻崩。点「环境体检」确认 |
@@ -271,7 +280,7 @@ curl http://127.0.0.1:8791/v1/models      # enabled=false 的项是付费墙模�
 
 **Comate 的固有限制**：不支持工具透传（云端 agent 自己决定工具）；每轮 8-40 秒的三步链延迟；上游 agent 的自我认知是它自己的系统提示词（自称 Cursor 系助手），不是 ZCode。
 
-**Qoder 的固有限制**：Free 账号多数模型在付费墙后（`/v1/models` 里 `enabled:false`，注册时已过滤）；千问办公（qworkcn）的 chat 链路在收尾中（目录与鉴权已通，见上文）。
+**Qoder 的固有限制**：Free 账号多数模型在付费墙后（`/v1/models` 里 `enabled:false`，注册时已过滤）。千问办公的模型目录只有三档且**不通用**——它只认自己那套 key，所以在 qworkcn 出口下 CN 的模型名一个也用不了（反之亦然），这是上游的封闭目录决定的，不是网关的过滤。
 
 ## 目录结构
 
@@ -280,7 +289,7 @@ autoclaw-to-zcode/                 ← 工作区根目录
 ├── app/                           ← Electron 管理控制台（三平台统一面板，活体代码）
 │   ├── main.js / preload.js       生命周期管理 + IPC（含 ASWITCH_SELFTEST 自测模式）
 │   ├── zcode-config.js            ★ ZCode 配置写入闸门（纯 Node：枚举/结构/原子/回滚）
-│   ├── test_zcode_config.js       闸门的沙箱回归测试（合成 fixture，12 条用例）
+│   ├── test_zcode_config.js       闸门的沙箱回归测试（合成 fixture，13 条用例）
 │   └── renderer/                  状态面板 UI
 ├── bridge/                        ← AutoClaw 2.x 适配层
 │   ├── make_compat_auth.py        凭证桥接（DPAPI 解密 → auth.json）
@@ -318,8 +327,8 @@ autoclaw-to-zcode/                 ← 工作区根目录
 └── TEST_REPORT.md                 完整测试报告（根因分析、实验记录、证据链）
 ```
 
-运行时数据（自动生成，均带敏感信息，不入库）：`~/.autoclaw-relay/`（部署的反代、persona、日志）、`~/.openclaw-autoclaw/`（凭证源）、`~/.trae-relay/`（Trae 日志与会话转储）、`~/.doubao-relay/`（豆包 cookie、固定会话、日志）、`~/.comate-relay/`（Comate 日志与设备指纹）、`~/.qoder-relay/`（Qoder 账号池与网关日志，含真实令牌，绝不外传）、`~/.zcode/v2/provider_config.json`（ZCode 注册，备份为 `.bak-autoclaw`）。
+运行时数据（自动生成，均带敏感信息，不入库）：`~/.autoclaw-relay/`（部署的反代、persona、日志、Qoder/千问办公的出口 Key `qoder-realm-keys.json`）、`~/.openclaw-autoclaw/`（凭证源）、`~/.trae-relay/`（Trae 日志与会话转储）、`~/.doubao-relay/`（豆包 cookie、固定会话、日志）、`~/.comate-relay/`（Comate 日志与设备指纹）、`~/.qoder-relay/`（Qoder/千问办公账号池与网关日志，含真实令牌，绝不外传）、`~/.zcode/v2/provider_config.json`（ZCode 注册，备份为 `.bak-autoclaw`）。
 
 ## 免责声明
 
-本项目通过逆向 AutoClaw / WorkBuddy / Trae / 豆包工作 客户端实现了对非官方接口的调用，仅供学习研究。使用本项目导致的账号封禁、积分损失由使用者自行承担。请勿用于商业用途。AutoClaw 是智谱/Z.ai 的产品，WorkBuddy 相关服务来自腾讯云，Trae 与豆包工作是字节跳动的产品，本项目与上述公司均无关。
+本项目通过逆向 AutoClaw / WorkBuddy / Trae / 豆包工作 / Comate 文心快码 / Qoder CN / 千问办公 客户端实现了对非官方接口的调用，仅供学习研究。使用本项目导致的账号封禁、积分损失由使用者自行承担。请勿用于商业用途。AutoClaw 是智谱/Z.ai 的产品，WorkBuddy 相关服务来自腾讯云，Trae 与豆包工作是字节跳动的产品，Comate 文心快码是百度的产品，Qoder 与千问办公是阿里的产品，本项目与上述公司均无关。

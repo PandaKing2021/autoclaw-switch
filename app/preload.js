@@ -31,5 +31,6 @@ contextBridge.exposeInMainWorld("api", {
   qoderStop: () => ipcRenderer.invoke("qoder:stop"),
   qoderSmoke: () => ipcRenderer.invoke("qoder:smoke"),
   qoderSyncAccounts: () => ipcRenderer.invoke("qoder:sync-accounts"),
+  qwenworkSmoke: () => ipcRenderer.invoke("qwenwork:smoke"),
   tailLog: (which) => ipcRenderer.invoke("logs:tail", which),
 });

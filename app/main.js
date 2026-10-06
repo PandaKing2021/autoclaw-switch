@@ -68,6 +68,11 @@ const QODER_PROXY = path.join(RES_ROOT, "qoder", "qoder_proxy.py");
 const QODER_LOG = path.join(HOME, ".qoder-relay", "gateway.log");
 const QODER_PORT = 8791;
 const QODER_PANEL_PASSWORD = "admin";   // 社区网关面板默认密码，仅绑定 127.0.0.1 使用
+// --- 千问办公（QwenWork CN）：与 Qoder CN 共用上面这个网关进程（同一端口、
+// 同一账号池），靠「绑定出口的 API Key」把请求分流到 qworkcn 账号池。
+// ZCode 的供应商配置没有自定义请求头字段，绑 Key 是官方设计的出口选择方式 ---
+const QWENWORK_PROVIDER_ID = "qwenwork-openai-provider";
+const QODER_REALM_KEYS = path.join(RELAY_DIR, "qoder-realm-keys.json");
 const BRIDGE_DIR = path.join(RES_ROOT, "bridge");
 const RELAY_SRC = path.join(BRIDGE_DIR, "server_2x.mjs");   // relay 源码随项目走，首次运行部署到 RELAY_DIR
 const PERSONA_SRC = path.join(BRIDGE_DIR, "persona.txt");    // 同上：2.x 闸门要求的应用 persona
@@ -453,12 +458,77 @@ async function qoderHealth() {
   if (!qoderAlive()) return { running: false, ok: false };
   const h = await qoderHttp("GET", "/health", null, 10000);
   if (!h.j) return { running: true, ok: false };
-  return { running: true, ok: h.ok && (h.j.accounts_ready || 0) > 0, accounts: h.j.accounts || 0, realm: h.j.realm || "" };
+  const realm = h.j.realm || "cn";
+  const p = (h.j.realms || {})[realm];   // 老网关没有分区明细，退回总量
+  return {
+    running: true,
+    ok: p ? (p.ready || 0) > 0 : (h.j.accounts_ready || 0) > 0,
+    accounts: p ? (p.accounts || 0) : (h.j.accounts || 0),
+    ready: p ? (p.ready || 0) : (h.j.accounts_ready || 0),
+    realm,
+  };
 }
 
-async function qoderModels() {
-  const m = await qoderHttp("GET", "/v1/models", null, 20000);
+async function qoderModels(timeoutMs = 20000) {
+  const m = await qoderHttp("GET", "/v1/models", null, timeoutMs);
   return (m.j?.data || []).filter((x) => x && x.id && x.enabled !== false);
+}
+
+/** 千问办公的模型目录：同一个网关，换成 qworkcn 出口的 Key 再问一次 */
+async function qwenworkModels(timeoutMs = 20000) {
+  const key = qoderRealmKey("qworkcn");
+  const m = await qoderHttp("GET", "/v1/models", null, timeoutMs, key ? { Authorization: `Bearer ${key}` } : { "X-Realm": "qworkcn" });
+  return (m.j?.data || []).filter((x) => x && x.id && x.enabled !== false);
+}
+
+/** 千问办公的登录态：网关 /health 的分区明细里取 qworkcn 一栏 */
+async function qwenworkHealth() {
+  if (!qoderAlive()) return { running: false, ok: false };
+  const h = await qoderHttp("GET", "/health", null, 10000);
+  if (!h.j) return { running: true, ok: false };
+  const r = (h.j.realms || {}).qworkcn || {};
+  return { running: true, ok: (r.ready || 0) > 0, accounts: r.accounts || 0, realm: "qworkcn" };
+}
+
+/** 控制台自己生成并保管的两个出口 Key（明文只在本地文件里，网关侧存副本） */
+function readRealmKeys() {
+  try { return JSON.parse(fs.readFileSync(QODER_REALM_KEYS, "utf8")) || {}; } catch { return {}; }
+}
+
+function qoderRealmKey(realm) { return readRealmKeys()[realm] || ""; }
+
+/**
+ * 让网关里存在「绑定到本机两个出口」的 Key，并把明文留一份给控制台注册用。
+ *
+ * ZCode 供应商配置没有自定义请求头字段，出口只能靠 Key 绑定来选（网关
+ * _request_realm：显式参数 > Key 绑定 > X-Realm 头 > 全局开关）。写入走面板
+ * 的 /settings/save 全量替换语义——别人在面板里建的 Key 用空值占位保留原值，
+ * 只增改控制台自己那两条（id = aswitch-<realm>）。
+ *
+ * 同时把网关的密钥校验关掉：所有网关都只监听 127.0.0.1，且此前就是免鉴权；
+ * 一旦存在 Key 网关会要求 /v1 全部带 Key，老的 Qoder CN 注册（占位 Key）会
+ * 突然 401。这两把 Key 只当出口选择器用。
+ */
+async function qoderEnsureRealmKeys() {
+  const l = await qoderHttp("POST", "/panel/login", { password: QODER_PANEL_PASSWORD }, 10000);
+  const token = l.j?.token || "";
+  if (!token) return { ok: false, error: "面板登录失败（默认密码 admin 被改过？在网关看板里改回，或同步此处的密码）" };
+  const st = await qoderHttp("GET", "/panel/status", null, 10000, { "X-Panel-Token": token });
+  const existing = st.j?.api_keys || [];
+  const store = readRealmKeys();
+  const payload = existing.map((e) => ({ id: e.id, name: e.name, realm: e.realm, enabled: e.enabled !== false, key: "" }));
+  let changed = false;
+  for (const [realm, label] of [["cn", "Qoder CN"], ["qworkcn", "千问办公"]]) {
+    if (!store[realm]) { store[realm] = "qd-" + require("crypto").randomBytes(18).toString("hex"); changed = true; }
+    const id = `aswitch-${realm}`;
+    const row = { id, name: `A-SWITCH ${label}`, realm, enabled: true, key: store[realm] };
+    const i = payload.findIndex((e) => e.id === id);
+    if (i >= 0) payload[i] = row; else payload.push(row);
+  }
+  try { fs.writeFileSync(QODER_REALM_KEYS, JSON.stringify(store, null, 1), { mode: 0o600 }); } catch (e) { return { ok: false, error: `出口 Key 落盘失败：${e.message}` }; }
+  const save = await qoderHttp("POST", "/settings/save", { api_keys: payload, auth_disabled: true }, 15000, { "X-Panel-Token": token });
+  if (!save.ok) return { ok: false, error: `出口 Key 写入网关失败：${save.j?.error?.message || ("HTTP " + save.status)}` };
+  return { ok: true, generated: changed, realms: Object.keys(store) };
 }
 
 /** 把本机已登录的 Qoder/千问办公桌面凭证导入网关账号池（面板两步确认流程的自动化） */
@@ -510,7 +580,8 @@ function readZcodeRegistration() {
     // 卡片要显示的是“ZCode 侧已注册多少模型”（配置文件为准），不是网关当前存活多少
     const countOf = (pid) => (rules.find((r) => r.providerId === pid)?.config?.personalModelIds || []).length;
     const counts = { wbModels: countOf(WB_PROVIDER_ID), traeModels: countOf(TRAE_PROVIDER_ID), doubaoModels: countOf(DOUBAO_PROVIDER_ID),
-      comateModels: countOf(COMATE_PROVIDER_ID), qoderModels: countOf(QODER_PROVIDER_ID) };
+      comateModels: countOf(COMATE_PROVIDER_ID), qoderModels: countOf(QODER_PROVIDER_ID),
+      qwenworkModels: countOf(QWENWORK_PROVIDER_ID) };
     if (!rule) return { registered: false, ...counts };
     return {
       registered: true,
@@ -637,6 +708,7 @@ function setupIpc() {
     const doubaoH = await doubaoHealth();
     const comateH = await comateHealth();
     const qoderH = await qoderHealth();
+    const qwH = await qwenworkHealth();
     return {
       doubao: {
         running: doubaoH.running,
@@ -660,12 +732,23 @@ function setupIpc() {
         credential: comateH.credential || null,
         mode: comateH.mode || "stateless",
         modelsCached: comateH.models_cached || 0,
+        models: comateH.running ? await comateModels().then((ms) => ms.map((m) => m.display_name || m.id)).catch(() => []) : [],
       },
       qoder: {
         running: qoderH.running,
         ok: qoderH.ok,
         accounts: qoderH.accounts || 0,
+        ready: qoderH.ready || 0,
         realm: qoderH.realm || "",
+        models: qoderH.running ? await qoderModels(8000).then((ms) => ms.map((m) => m.display_name || m.id)).catch(() => []) : [],
+      },
+      // 千问办公与 Qoder CN 共用 :8791 的网关进程，只是出口不同
+      qwenwork: {
+        running: qwH.running,
+        ok: qwH.ok,
+        accounts: qwH.accounts || 0,
+        sharedPort: QODER_PORT,
+        models: qwH.running ? await qwenworkModels(8000).then((ms) => ms.map((m) => m.display_name || m.id)).catch(() => []) : [],
       },
       workbuddy: {
         running: wbH.running,
@@ -771,8 +854,11 @@ function setupIpc() {
     // provider_config.json 归 ZCode 自己所有：只允许增量修改自己的供应商，
     // 任何“整体重建”的写法都会丢字段（2026-10-05 丢掉 manualProviderModelRules 的教训），
     // 任何“统一修正目录”的写法都会删掉别人注册的模型（同日删掉两个 DeepSeek 的教训）。
-    const CATALOG_ALLOW = [PROVIDER_ID, WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID]
-      .map((p) => `config.modelConfigRules.providerModelRules[${p}/`);   // 模型目录由各家实时目录重写
+    // 结构路径里的数组元素身份是 `providerId/modelId`（见 zcode-config.js 的 elementId）；
+    // 缺 modelId 的坏条目只有 `providerId`，两种形态都要放行，否则这类条目永远改不掉
+    const CATALOG_ALLOW = [PROVIDER_ID, WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID, QWENWORK_PROVIDER_ID]
+      .flatMap((p) => [`config.modelConfigRules.providerModelRules[${p}]`,
+                       `config.modelConfigRules.providerModelRules[${p}/`]);   // 模型目录由各家实时目录重写
     // 网关目录各自单独取：某个网关没启动，只跳过它的目录刷新，不牵连同一次注册
     let wbCatalog = [];
     try { wbCatalog = ((await wbHttp("GET", "/v1/models", null, 15000)).j?.data || []).map((x) => [x.id, 200000]); }
@@ -789,6 +875,10 @@ function setupIpc() {
     let qoderCatalog = [];
     try { qoderCatalog = await qoderModels(); }
     catch (e) { res.qoderCatalogError = String((e && e.message) || e); }
+
+    let qwenworkCatalog = [];
+    try { qwenworkCatalog = await qwenworkModels(); }
+    catch (e) { res.qwenworkCatalogError = String((e && e.message) || e); }
 
     try {
       const prevRaw = fs.readFileSync(ZCODE_CFG, "utf8");
@@ -868,11 +958,17 @@ function setupIpc() {
         res.comate = { error: "Comate 网关未运行，模型目录未刷新（已注册条目保持不变）" };
       }
 
-      // ⑥ Qoder CN（含千问办公 qworkcn 区的模型；已过滤掉账号不可用的付费项）
+      // ⑥⑦ Qoder CN 与千问办公：同一个网关的两条出口，靠绑定出口的 Key 分流。
+      // 两把 Key 由控制台生成并写进网关（见 qoderEnsureRealmKeys），明文留在
+      // ~/.autoclaw-relay/qoder-realm-keys.json，此处只读取用于注册。
+      const realmKeys = await qoderEnsureRealmKeys();
+      res.realmKeys = realmKeys.ok ? { generated: realmKeys.generated, realms: realmKeys.realms }
+        : { error: realmKeys.error };
+      // Qoder CN（已过滤掉账号不可用的付费项）
       if (qoderCatalog.length) {
         const ids = qoderCatalog.map((m) => m.id);
         ZC.upsertProviderRule(rules, { providerId: QODER_PROVIDER_ID, providerName: "Qoder CN", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: "qoder-local" },
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: qoderRealmKey("cn") || "qoder-local" },
             api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${QODER_PORT}/v1` },
             personalModelIds: ids } });
         ZC.upsertModelEntries(entries, QODER_PROVIDER_ID, qoderCatalog.map((m) => modelEntry(QODER_PROVIDER_ID, m.id, m.max_input_tokens || 200000)));
@@ -881,8 +977,21 @@ function setupIpc() {
         res.qoder = { error: "Qoder 网关未运行或账号池为空，模型目录未刷新（已注册条目保持不变）" };
       }
 
+      // 千问办公（qworkcn 出口：标准 / 高级 / Qwen3.8-Max）
+      if (qwenworkCatalog.length) {
+        const ids = qwenworkCatalog.map((m) => m.id);
+        ZC.upsertProviderRule(rules, { providerId: QWENWORK_PROVIDER_ID, providerName: "千问办公", enabled: true,
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: qoderRealmKey("qworkcn") || "qwenwork-local" },
+            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${QODER_PORT}/v1` },
+            personalModelIds: ids } });
+        ZC.upsertModelEntries(entries, QWENWORK_PROVIDER_ID, qwenworkCatalog.map((m) => modelEntry(QWENWORK_PROVIDER_ID, m.id, m.max_input_tokens || 1000000)));
+        res.qwenwork = { registered: true, models: ids };
+      } else {
+        res.qwenwork = { error: "千问办公目录为空：网关未运行或 qworkcn 账号未同步（已注册条目保持不变）" };
+      }
+
       const order = conf.providerOrder || (conf.providerOrder = []);
-      for (const p of [WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID]) if (!order.includes(p)) order.push(p);
+      for (const p of [WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID, QWENWORK_PROVIDER_ID]) if (!order.includes(p)) order.push(p);
 
       // 单次落盘：枚举 + 结构丢失 + 原子写 + 读回校验，任一道不过就整体拒绝
       res.backup = path.basename(writeZcodeConfig(cfg, prevRaw, { allowRemovedPaths: CATALOG_ALLOW }));
@@ -926,7 +1035,8 @@ function setupIpc() {
     file("Comate 网关", COMATE_RELAY, "项目自带（comate/relay.mjs）");
     file("Comate 登录态", COMATE_SETTINGS, "需安装并登录 Comate IDE（文心快码）；relay 从 settings.json 读 license，重新登录后无需重启");
     file("Qoder 网关", QODER_PROXY, "项目自带（qoder/qoder_proxy.py，社区 COSY 网关，需 Python）");
-    file("Qoder 登录态", path.join(process.env.APPDATA || "", "com.qodercn.app.stable", "auth.v1.dat"), "需安装并登录 Qoder CN 客户端；点「同步账号」把本机凭证导入网关账号池（千问办公同理）");
+    file("Qoder 登录态", path.join(process.env.APPDATA || "", "com.qodercn.app.stable", "auth.v1.dat"), "需安装并登录 Qoder CN 客户端；点「同步账号」把本机凭证导入网关账号池");
+    file("千问办公登录态", path.join(process.env.APPDATA || "", "QwenWorkCN", "auth-v2.dat"), "需安装并登录千问办公客户端（QwenWorkCN）；与 Qoder 共用同一个网关，点「同步账号」一次导入两条出口");
     file("AutoClaw 凭证", REQ_HEADERS, "需安装并登录 AutoClaw 桌面客户端；同步器把登录态搬成反代凭证");
     file("ZCode 配置", ZCODE_CFG, "需先安装并运行过一次 ZCode，注册才有落点");
     return { ok: items.every((i) => i.ok), items };
@@ -1285,6 +1395,25 @@ function setupIpc() {
 
   handle("qoder:sync-accounts", async () => qoderSyncAccounts());
 
+  handle("qwenwork:smoke", async () => {
+    const models = (await qwenworkModels()).map((m) => m.id);
+    if (!models.length) return { ok: false, error: "千问办公模型目录为空（账号池里没有 qworkcn 账号？点「同步账号」）" };
+    const model = models.includes("Qwen3.8-Flash") ? "Qwen3.8-Flash" : models[0];
+    const key = qoderRealmKey("qworkcn");
+    const hdr = key ? { Authorization: `Bearer ${key}` } : { "X-Realm": "qworkcn" };
+    const r = await qoderHttp("POST", "/v1/chat/completions", {
+      model, max_tokens: 64,
+      messages: [{ role: "user", content: "请只回复OK" }],
+    }, 240000, hdr);
+    let reply = "", stop = "";
+    try {
+      const msg = r.j.choices?.[0]?.message || {};
+      reply = (msg.content || "").slice(0, 120);
+      stop = r.j.choices?.[0]?.finish_reason || "";
+    } catch { reply = r.raw || ""; }
+    return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model, available: models };
+  });
+
   handle("logs:tail", async (_e, which) => {
     if (which === "watch") return tailFile(WATCH_LOG, 120);
     if (which === "console") return tailFile(path.join(RELAY_DIR, "console.log"), 120);
@@ -1338,7 +1467,7 @@ app.whenReady().then(() => {
             const out = await invoke(ch);
             prog(`only ${ch} -> ${JSON.stringify(out).slice(0, 400)}`);
             console.log(`==== ONLY ${ch} ====`);
-            console.log(JSON.stringify(out, null, 1).slice(0, 2000));
+            console.log(JSON.stringify(out, null, 1).slice(0, 8000));
           } catch (e) {
             prog(`only ${ch} ERROR: ${e.message}`);
             console.log(`==== ONLY ${ch} ERROR: ${e.message} ====`);
@@ -1384,14 +1513,37 @@ app.whenReady().then(() => {
       const dbs = await invoke("doubao:smoke");
       prog(`doubao:smoke detail status=${dbs.status} model=${dbs.model} reply=${String(dbs.reply).slice(0, 80)}`);
       await t("doubao:smoke", dbs.ok === true);
-      // 一键启动（此时三家都已在跑，应全部报“已在运行”）
+      await invoke("comate:start");
+      prog("comate:smoke 发起（云端 agent 三步链，通常 8-40 秒）");
+      const cms = await invoke("comate:smoke");
+      prog(`comate:smoke detail status=${cms.status} model=${cms.model} reply=${String(cms.reply).slice(0, 80)}`);
+      await t("comate:smoke", cms.ok === true);
+      await invoke("qoder:start");
+      await invoke("qoder:sync-accounts");
+      prog("qoder:smoke 发起（COSY 签名链路，通常 3-15 秒）");
+      const qds = await invoke("qoder:smoke");
+      prog(`qoder:smoke detail status=${qds.status} model=${qds.model} reply=${String(qds.reply).slice(0, 80)}`);
+      await t("qoder:smoke", qds.ok === true);
+      // 千问办公与 Qoder 共用网关进程，只是出口不同（qworkcn 账号池）
+      prog("qwenwork:smoke 发起");
+      const qws = await invoke("qwenwork:smoke");
+      prog(`qwenwork:smoke detail status=${qws.status} model=${qws.model} reply=${String(qws.reply).slice(0, 80)}`);
+      await t("qwenwork:smoke", qws.ok === true);
+      // 一键启动（此时各家都已在跑，应全部报“已在运行”）
       const all = await invoke("all:start");
       prog(`all:start ${(all.steps || []).map((s) => `${s.name}:${s.ok ? s.detail : s.detail}`).join(" | ")}`);
       await t("all:start", all.ok === true);
       const rg = await invoke("zcode:register");
-      prog(`zcode:register detail trae=${JSON.stringify(rg.trae).slice(0, 200)} workbuddy=${JSON.stringify(rg.workbuddy).slice(0, 120)}`);
+      prog(`zcode:register detail trae=${JSON.stringify(rg.trae).slice(0, 200)} workbuddy=${JSON.stringify(rg.workbuddy).slice(0, 120)} comate=${JSON.stringify(rg.comate).slice(0, 120)} qoder=${JSON.stringify(rg.qoder).slice(0, 120)} qwenwork=${JSON.stringify(rg.qwenwork).slice(0, 120)}`);
       await t("zcode:register", rg.ok === true && Array.isArray(rg.models) && rg.models.length >= 4);
       await t("zcode:register:trae", rg.trae?.registered === true && rg.trae.models.length > 0);
+      await t("zcode:register:comate", rg.comate?.registered === true && rg.comate.models.length > 0);
+      await t("zcode:register:qoder", rg.qoder?.registered === true && rg.qoder.models.length > 0);
+      // 第八家：千问办公走绑定了 qworkcn 的出口 Key，注册成功即证明 Key 分流链路在位
+      await t("zcode:register:qwenwork", rg.qwenwork?.registered === true && rg.qwenwork.models.length > 0);
+      await t("zcode:realm-keys", rg.realmKeys?.realms?.includes("cn") === true && rg.realmKeys?.realms?.includes("qworkcn") === true);
+      // 注册结果里 ok 只代表目录取到了；写入被闸门拦下是另一个字段（历史上这么漏过一次）
+      await t("zcode:register:未被闸门拦下", !rg.registerError);
       // 注册后立即体检：配置必须仍然健康（合法枚举 + manualProviderModelRules 在位）
       const zc = await invoke("zcode:check");
       prog(`zcode:check providers=${(zc.providers || []).map((p) => `${p.providerId}:${p.apiType || "none"}`).join(",")} manual=${zc.hasManualRules}`);

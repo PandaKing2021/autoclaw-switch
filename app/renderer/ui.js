@@ -17,6 +17,14 @@ function fmtExp(ts) {
   return `${d.toLocaleDateString()}（余 ${Math.floor(ms / 3600000)} 小时）`;
 }
 function setPill(id, cls, text) { const el = $(id); el.className = "pill " + cls; el.textContent = text; }
+/** 模型目录 chips：超过 12 个折叠成 +N；网关没起来时清单为空，计数显示 "-" */
+function renderModels(key, models) {
+  const list = models || [];
+  $(key + "-model-count").textContent = list.length || "-";
+  $(key + "-models").innerHTML = list.slice(0, 12)
+    .map((m) => `<span title="${String(m).replace(/"/g, "&quot;")}">${m}</span>`).join("") +
+    (list.length > 12 ? `<span>+${list.length - 12}</span>` : "");
+}
 
 async function refreshStatus() {
   try {
@@ -78,14 +86,23 @@ async function refreshStatus() {
     $("comate-status").textContent = cm.ok ? "ok" : cm.running ? "未登录 Comate IDE" : "未运行";
     $("comate-cred").textContent = cm.credential || "-";
     $("comate-mode").textContent = cm.running ? (cm.mode === "stateless" ? "无状态（每请求新建会话）" : cm.mode || "-") : "-";
+    renderModels("comate", cm.models);
 
     // Qoder CN（账号池来自桌面凭证导入）
     const qd = s.qoder || { running: false, ok: false };
     setPill("qoder-pill", qd.running && qd.ok ? "ok" : qd.running ? "warn" : "err",
       qd.running && qd.ok ? "运行中" : qd.running ? "账号池为空" : "已停止");
     $("qoder-status").textContent = qd.ok ? "ok" : qd.running ? "待同步账号" : "未运行";
-    $("qoder-accounts").textContent = qd.running ? String(qd.accounts ?? "-") : "-";
-    $("qoder-realm").textContent = qd.realm || "-";
+    $("qoder-accounts").textContent = qd.running ? `${qd.accounts ?? "-"} 个（可用 ${qd.ready ?? "-"}）` : "-";
+    renderModels("qoder", qd.models);
+
+    // 千问办公（与 Qoder 同一网关进程，qworkcn 出口）
+    const qw = s.qwenwork || { running: false, ok: false };
+    setPill("qwenwork-pill", qw.running && qw.ok ? "ok" : qw.running ? "warn" : "err",
+      qw.running && qw.ok ? "运行中" : qw.running ? "账号池为空" : "未运行");
+    $("qwenwork-status").textContent = qw.ok ? "ok" : qw.running ? "待同步账号" : "未运行";
+    $("qwenwork-accounts").textContent = qw.running ? String(qw.accounts ?? "-") : "-";
+    renderModels("qwenwork", qw.models);
 
     // token / credential（并入 AutoClaw 卡）
     $("token-exp").textContent = fmtExp(s.token.exp);
@@ -106,6 +123,7 @@ async function refreshStatus() {
     $("zcode-doubao-count").textContent = zc.doubaoModels != null ? zc.doubaoModels : "-";
     $("zcode-comate-count").textContent = zc.comateModels != null ? zc.comateModels : "-";
     $("zcode-qoder-count").textContent = zc.qoderModels != null ? zc.qoderModels : "-";
+    $("zcode-qwenwork-count").textContent = zc.qwenworkModels != null ? zc.qwenworkModels : "-";
 
 
     // overall
@@ -262,6 +280,31 @@ $("btn-qoder-sync").onclick = async () => {
   } catch (e) { $("qoder-smoke-result").textContent = "❌ 异常：" + e.message; }
   btn.disabled = false; refreshStatus();
 };
+// 千问办公：启动/停止作用在共用的那个网关进程上（幂等，已在跑会直接返回）
+$("btn-qwenwork-start").onclick = async () => { $("btn-qwenwork-start").disabled = true; await window.api.qoderStart(); $("btn-qwenwork-start").disabled = false; refreshStatus(); };
+$("btn-qwenwork-stop").onclick = async () => { $("btn-qwenwork-stop").disabled = true; await window.api.qoderStop(); $("btn-qwenwork-stop").disabled = false; refreshStatus(); };
+$("btn-qwenwork-smoke").onclick = async () => {
+  const btn = $("btn-qwenwork-smoke"); btn.disabled = true;
+  $("qwenwork-smoke-result").textContent = "测试中（qworkcn 出口，通常 3-15 秒）…";
+  try {
+    const r = await window.api.qwenworkSmoke();
+    $("qwenwork-smoke-result").textContent = r.ok
+      ? `✅ 连通正常（${r.status}）${r.model} 回复：${r.reply}`
+      : `❌ 失败（${r.status || "-"}）：${r.reply || r.error || "无响应"}`;
+  } catch (e) { $("qwenwork-smoke-result").textContent = "❌ 异常：" + e.message; }
+  btn.disabled = false; refreshStatus();
+};
+$("btn-qwenwork-sync").onclick = async () => {
+  const btn = $("btn-qwenwork-sync"); btn.disabled = true;
+  $("qwenwork-smoke-result").textContent = "扫描本机登录态（Qoder CN + 千问办公）并导入账号池…";
+  try {
+    const r = await window.api.qoderSyncAccounts();
+    $("qwenwork-smoke-result").textContent = r.ok
+      ? `✅ 已导入：${(r.imported || []).join("、")}`
+      : "❌ " + (r.error || "未发现可导入的凭证");
+  } catch (e) { $("qwenwork-smoke-result").textContent = "❌ 异常：" + e.message; }
+  btn.disabled = false; refreshStatus();
+};
 $("btn-register").onclick = async () => {
   const btn = $("btn-register"); btn.disabled = true;
   $("register-note").textContent = "注册中…";
@@ -273,6 +316,8 @@ $("btn-register").onclick = async () => {
     if (r.doubao) note += r.doubao.registered ? ` · 豆包工作：已写入 ${r.doubao.models.length} 个模型` : ` · 豆包工作未同步：${r.doubao.error}`;
     if (r.comate) note += r.comate.registered ? ` · Comate：已写入 ${r.comate.models.length} 个模型` : ` · Comate 未同步：${r.comate.error}`;
     if (r.qoder) note += r.qoder.registered ? ` · Qoder：已写入 ${r.qoder.models.length} 个模型` : ` · Qoder 未同步：${r.qoder.error}`;
+    if (r.qwenwork) note += r.qwenwork.registered ? ` · 千问办公：已写入 ${r.qwenwork.models.length} 个模型` : ` · 千问办公未同步：${r.qwenwork.error}`;
+    if (r.realmKeys && r.realmKeys.error) note += `\n⚠️ 出口 Key 未就绪（千问办公会走默认出口）：${r.realmKeys.error}`;
     if (r.backup) note += ` · 备份 ${r.backup}`;
     if (r.registerError) note += `\n⚠️ 写入被闸门拦下，配置未改动：${r.registerError}`;
     $("register-note").textContent = note;
@@ -301,7 +346,8 @@ function setBootNote(text) {
   el.style.display = text ? "block" : "none";
 }
 function updateBootNote(svc) {
-  const names = { relay: "AutoClaw relay", workbuddy: "WorkBuddy 网关", trae: "Trae 网关", doubao: "豆包工作网关", comate: "Comate 网关", qoder: "Qoder 网关", watcher: "凭证同步器" };
+  // 千问办公不单列：它和 Qoder CN 是同一个网关进程的两个出口
+  const names = { relay: "AutoClaw relay", workbuddy: "WorkBuddy 网关", trae: "Trae 网关", doubao: "豆包工作网关", comate: "Comate 网关", qoder: "Qoder 网关（含千问办公出口）", watcher: "凭证同步器" };
   const down = Object.keys(names).filter((k) => !svc[k]);
   if (!down.length) { startAllRan = false; setBootNote(""); return; }
   if (startAllRan) return;   // 保留「一键启动」的结果说明，等补齐后自动收掉

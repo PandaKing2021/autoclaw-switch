@@ -1302,6 +1302,16 @@ def is_chat_model(mid):
 
 CN_UI_ORDER = [m["key"] for m in qoder_catalog.STATIC_CN_MODELS]
 INTL_UI_ORDER = [m["key"] for m in qoder_catalog.STATIC_INTL_MODELS]
+QWORK_UI_ORDER = [m["key"] for m in qoder_catalog.STATIC_QWORK_MODELS]
+
+
+def realm_ui_order(realm):
+    """展示顺序：各区官方清单自身的顺序（qworkcn 不能借 INTL 的快照）。"""
+    if realm == "cn":
+        return CN_UI_ORDER
+    if realm == "qworkcn":
+        return QWORK_UI_ORDER
+    return INTL_UI_ORDER
 
 
 def merge_catalog(primary, realm=None):
@@ -1313,8 +1323,8 @@ def merge_catalog(primary, realm=None):
     """
     r = realm or CURRENT_REALM
     merged = {}
-    source_static = getattr(qoder_catalog, "STATIC_CN_MODELS" if r == "cn"
-                            else "STATIC_INTL_MODELS", qoder_catalog.STATIC_MODELS)
+    # 打底快照必须与出口同区：qworkcn 的目录与 CN/INTL 完全不相交
+    source_static = qoder_catalog.models_for_realm(r)
     for item in source_static:
         mid = item.get("key") or item.get("id")
         if mid and is_chat_model(mid):
@@ -1335,7 +1345,7 @@ def merge_catalog(primary, realm=None):
             merged[mid] = {}
     if primary:
         primary_keys = {mid for mid, _ in primary if is_chat_model(mid)}
-    order = CN_UI_ORDER if r == "cn" else INTL_UI_ORDER
+    order = realm_ui_order(r)
     out = []
     seen = set()
 
@@ -1380,7 +1390,7 @@ def read_local_models(realm=None):
                 blob = fh.read().decode("ascii", "replace")
             from qoder_sign import qmc_decrypt
             plain = json.loads(qmc_decrypt(blob, sub).decode("utf-8"))
-            chat = plain.get("chat") or []
+            chat = plain.get(get_realm_config(r).get("model_scene") or "chat") or []
             out = []
             for m in chat:
                 if not isinstance(m, dict) or not m.get("key"):
@@ -1449,7 +1459,11 @@ def read_dynamic_models(realm=None):
             log("model discovery failed on %s: %s" % (host, exc))
     if payload is None:
         return []
-    chat = payload.get("chat") or []
+    # 目录按场景分区（chat/developer/assistant/inline/quest/nap/qwork/...），
+    # 每个场景各占一格；qworkcn 的 chat 是空数组，模型挂在 qwork，取错格子
+    # 会拿到 0 个模型。
+    scene = get_realm_config(r).get("model_scene") or "chat"
+    chat = payload.get(scene) or []
     out = []
     for m in chat:
         if not isinstance(m, dict):
@@ -1465,7 +1479,7 @@ def read_dynamic_models(realm=None):
         row.setdefault("display_name", m.get("display_name") or mid)
         out.append((mid, row))
     if out:
-        log("model discovery ok: %d chat models from %s" % (len(out), r))
+        log("model discovery ok: %d %s models from %s" % (len(out), scene, r))
     return out
 
 
@@ -3086,6 +3100,15 @@ def build_qoder_body(payload, account, model_key, realm=None):
     body["agent_id"] = "agent_common"
     body["aliyun_user_type"] = getattr(account, "user_type", "") or \
         qoder_sign.DEFAULT_USER_TYPE
+
+    # 形态声明（区域配置驱动）：qworkcn 必须声明工作台形态，否则服务端把
+    # 请求归到默认场景后查不到该用户的目录，SSE 内嵌 503 Model catalog
+    # unavailable；cn/intl 未配置，保持模板原值。
+    cfg = get_realm_config(r)
+    if cfg.get("session_type"):
+        body["session_type"] = cfg["session_type"]
+    if cfg.get("business_product") and isinstance(body.get("business"), dict):
+        body["business"]["product"] = cfg["business_product"]
 
     # model_config（按出口区域的官方清单取元数据 + 动态 key）
     catalog_meta = {}
@@ -5260,6 +5283,16 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts_ready": POOL.count_ready() if POOL else 0,
                 "api_key_required": bool(API_KEY),
             }
+            # 分区明细：一个网关同时供 Qoder CN 与千问办公，控制台要分别显示
+            # 「这边有几个号、有几个可用」。
+            if POOL:
+                info["realms"] = {}
+                for _r in ("intl", "cn", "qworkcn"):
+                    info["realms"][_r] = {
+                        "accounts": len([a for a in POOL.accounts
+                                         if a.realm == _r]),
+                        "ready": POOL.count_ready(_r),
+                    }
             if self._key_ok():
                 info.update({
                     "uid": rep.uid if rep else None,
@@ -5272,7 +5305,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, info)
         if path == "/realm":
             return self._json(200, {"current": CURRENT_REALM,
-                                    "options": ["intl", "cn"]})
+                                    "options": ["intl", "cn", "qworkcn"]})
         if path in ("/v1/models", "/models"):
             if not self._authorized():
                 return
@@ -5539,8 +5572,11 @@ class Handler(BaseHTTPRequestHandler):
                                        "remove the row",
                                        "invalid_request_error")
                 realm = str(item.get("realm") or "").strip().lower()
-                if realm not in ("", "intl", "cn"):
-                    return self._error(400, "realm must be intl, cn or empty",
+                if realm not in qoder_settings.REALMS:
+                    return self._error(400,
+                                       "realm must be one of %s or empty"
+                                       % ", ".join(r for r in
+                                                   qoder_settings.REALMS if r),
                                        "invalid_request_error")
                 created_at = item.get("created_at") \
                     or (existing.get(entry_id, {}).get("created_at")

@@ -130,13 +130,13 @@
         <div id="comate-smoke-result" class="note"></div>
       </div>
 
-      <!-- Qoder CN（含千问办公账号池） -->
+      <!-- Qoder CN -->
       <div class="card">
         <div class="card-head"><h2>Qoder CN</h2><span id="qoder-pill" class="pill unknown">-</span></div>
         <div class="kv">
           <div><label>网关状态</label><span id="qoder-status">-</span></div>
           <div><label>账号池</label><span id="qoder-accounts">-</span></div>
-          <div><label>当前区域</label><span id="qoder-realm">-</span></div>
+          <div><label>出口</label><span class="mono">cn（qoder.com.cn）</span></div>
           <div><label>监听</label><span class="mono">127.0.0.1:8791 · openai · COSY 签名</span></div>
         </div>
         <div class="sec">模型目录（<span id="qoder-model-count">-</span> 个，仅显示账号可用项）</div>
@@ -148,6 +148,26 @@
           <button id="btn-qoder-sync" class="btn">同步账号</button>
         </div>
         <div id="qoder-smoke-result" class="note"></div>
+      </div>
+
+      <!-- 千问办公（与 Qoder CN 共用同一个网关进程，出口不同） -->
+      <div class="card">
+        <div class="card-head"><h2>千问办公</h2><span id="qwenwork-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>网关状态</label><span id="qwenwork-status">-</span></div>
+          <div><label>账号池</label><span id="qwenwork-accounts">-</span></div>
+          <div><label>出口</label><span class="mono">qworkcn（qwenwork.cn）</span></div>
+          <div><label>监听</label><span class="mono">127.0.0.1:8791 · 与 Qoder CN 共用进程</span></div>
+        </div>
+        <div class="sec">模型目录（<span id="qwenwork-model-count">-</span> 个，qwork 场景）</div>
+        <div class="models" id="qwenwork-models"></div>
+        <div class="btns">
+          <button id="btn-qwenwork-start" class="btn ok">启动</button>
+          <button id="btn-qwenwork-stop" class="btn danger">停止</button>
+          <button id="btn-qwenwork-smoke" class="btn">连通性测试</button>
+          <button id="btn-qwenwork-sync" class="btn">同步账号</button>
+        </div>
+        <div id="qwenwork-smoke-result" class="note"></div>
       </div>
 
     </section>
@@ -164,6 +184,7 @@
           <div><label>豆包工作（openai）</label><span class="mono">:18770 · <span id="zcode-doubao-count">-</span> 模型</span></div>
           <div><label>Comate（openai）</label><span class="mono">:18774 · <span id="zcode-comate-count">-</span> 模型</span></div>
           <div><label>Qoder CN（openai）</label><span class="mono">:8791 · <span id="zcode-qoder-count">-</span> 模型</span></div>
+          <div><label>千问办公（openai）</label><span class="mono">:8791 · <span id="zcode-qwenwork-count">-</span> 模型</span></div>
           <div><label>生效方式</label><span>注册后重启 ZCode</span></div>
         </div>
         <div class="sec">ZCode 侧模型清单</div>

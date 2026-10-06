@@ -82,6 +82,15 @@ REALM_CONFIGS = {
         "models_prefix": "",        # model/list 实证不带（CLI 日志）
         "auth_file": "auth-v2.dat",
         "no_refresh": True,
+        # model/list 按场景分区返回，本区只有 qwork 有货（chat 为空数组）。
+        # 取错场景时服务端查不到用户目录，SSE 里内嵌 503 Model catalog
+        # unavailable。
+        "model_scene": "qwork",
+        # 上行 body 必须声明工作台形态，否则同样命中上面的 503：取值即
+        # worker 在 QODER_WORK_INTEGRATION_MODE=1 下的 session_type 与
+        # business.product。
+        "session_type": "qoder_work",
+        "business_product": "qoder_work",
     },
     "intl": {
         "name": "国际版 (Global)",

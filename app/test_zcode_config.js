@@ -114,9 +114,13 @@ function registeredConfig(cfg, { wbEnums = ZCODE_API.OPENAI_CHAT, keepManual = t
   return next;
 }
 
-const CATALOG_ALLOW = [`config.modelConfigRules.providerModelRules[${AC}/`,
-  `config.modelConfigRules.providerModelRules[${WB}/`,
-  `config.modelConfigRules.providerModelRules[${TRAE}/`];
+// 结构路径里的数组元素身份是 `providerId/modelId`，缺 modelId 的坏条目只剩 `providerId`，
+// 两种形态都得放行（2026-10-06 的教训：只放行带斜杠那种，坏条目就永远修不好——任何修复
+// 写入都会被自己的闸门拦下，表现为“注册报成功、配置里还是旧的空条目”）
+const CATALOG_ALLOW = [AC, WB, TRAE].flatMap((p) => [
+  `config.modelConfigRules.providerModelRules[${p}]`,
+  `config.modelConfigRules.providerModelRules[${p}/`]);
+const CATALOG_ALLOW_SLASH_ONLY = [AC, WB, TRAE].map((p) => `config.modelConfigRules.providerModelRules[${p}/`);
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zcfg-test-"));
 const cfgPath = path.join(tmp, "provider_config.json");
@@ -146,6 +150,24 @@ t("A3 拒绝丢失未知兄弟键（未来版本新增字段）", () => {
   const bad = registeredConfig(seed, { keepFuture: false });
   throws(() => writeZcodeConfig(cfgPath, bad, prevRaw, { allowRemovedPaths: CATALOG_ALLOW }),
     "someFutureSibling", "丢失未知兄弟键应被拒绝");
+});
+
+t("A4 缺 modelId 的坏条目可被本家目录重写覆盖（只放行带斜杠的写法会拦住修复）", () => {
+  // 造一条坏条目：有 providerId 没有 modelId（历史上生成过，注册结果里 modelId 全是 null）
+  const broken = JSON.parse(JSON.stringify(seed));
+  broken.config.modelConfigRules.providerModelRules.push({
+    providerId: WB, config: { enabled: true, properties: { contextWindow: 200000 } },
+  });
+  fs.writeFileSync(cfgPath, JSON.stringify(broken, null, 2));
+  const next = registeredConfig(broken);
+  throws(() => writeZcodeConfig(cfgPath, next, JSON.stringify(broken, null, 2), { allowRemovedPaths: CATALOG_ALLOW_SLASH_ONLY }),
+    "丢失既有结构", "旧的白名单写法应拦下修复（这条就是当时的现场）");
+  // 补上不带斜杠的形态后，修复必须放行
+  writeZcodeConfig(cfgPath, next, JSON.stringify(broken, null, 2), { allowRemovedPaths: CATALOG_ALLOW });
+  const left = readConfig(cfgPath).config.modelConfigRules.providerModelRules.filter((r) => r.providerId === WB);
+  assert(left.every((r) => r.modelId), `坏条目应被重写掉，实际剩下 ${JSON.stringify(left.map((r) => r.modelId))}`);
+  assert(readConfig(cfgPath).config.modelConfigRules.manualProviderModelRules !== undefined, "修复不得牵连兄弟键");
+  reset();
 });
 
 // ---- B. 正常注册路径 ----
