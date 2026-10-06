@@ -1220,10 +1220,17 @@ def _read_exe_file_version(exe: Path) -> str:
 def autoclaw_running() -> bool:
     import subprocess
     try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq AutoClaw.exe", "/FO", "CSV"],
-                             capture_output=True, timeout=10,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-        return b"AutoClaw.exe" in (out or b"")
+        # 2.x 客户端进程名是 AutoClaw2.exe，两个镜像都要查
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AutoClaw.exe", "/FO", "CSV"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        out2 = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AutoClaw2.exe", "/FO", "CSV"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        return (b"AutoClaw.exe" in (out or b"")
+                or b"AutoClaw2.exe" in (out2 or b""))
     except Exception:
         return False
 
@@ -1312,26 +1319,27 @@ _ISOLATED_PIDS: set = set()  # 本工具启动的隔离登录实例 PID（登录
 
 
 def _autoclaw_pids() -> set:
-    """所有 AutoClaw.exe 的 PID。
+    """所有 AutoClaw*.exe（1.x AutoClaw.exe + 2.x AutoClaw2.exe）的 PID。
 
     ⚠ AutoClaw 以管理员运行，非管理员查询 CIM 时 CommandLine 是空的
     （这正是 1.18.x 上"启动后探测不到进程"的根因），但 tasklist/CIM 的
     PID 永远可见——所以一切定位改用 PID 差集，不再匹配命令行。
     """
     import subprocess
+    pids = set()
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq AutoClaw.exe", "/FO", "CSV"],
-            capture_output=True, timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-        pids = set()
-        for line in (out or b"").decode("gbk", "replace").splitlines():
-            parts = [x.strip('"') for x in line.split('","')]
-            if len(parts) >= 2 and parts[0] == "AutoClaw.exe":
-                try:
-                    pids.add(int(parts[1]))
-                except ValueError:
-                    pass
+        for image in ("AutoClaw.exe", "AutoClaw2.exe"):
+            out = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV"],
+                capture_output=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            for line in (out or b"").decode("gbk", "replace").splitlines():
+                parts = [x.strip('"') for x in line.split('","')]
+                if len(parts) >= 2 and parts[0] == image:
+                    try:
+                        pids.add(int(parts[1]))
+                    except ValueError:
+                        pass
         return pids
     except Exception as e:
         log(f"枚举 AutoClaw 进程失败：{type(e).__name__}: {e}")
@@ -2523,6 +2531,16 @@ def _launch_isolated_profile(profile_dir: Path) -> set:
     env["OPENCLAW_STATE_DIR"] = str(isolated_home / ".openclaw-autoclaw")
     env["USERPROFILE"] = str(isolated_home)
     env["HOME"] = str(isolated_home)
+    # 2.x 客户端 pinUserDataDirectory() 在 single-instance lock 前调
+    # app.getPath("appData")（Windows 上直接读 APPDATA 环境变量）；
+    # 只改 USERPROFILE/HOME 会让 APPDATA 与 USERPROFILE 指向分裂，
+    # Electron 早期启动即抛 "Failed to get 'appData' path"。三件套一起重定向：
+    iso_appdata = isolated_home / "AppData" / "Roaming"
+    iso_local = isolated_home / "AppData" / "Local"
+    iso_appdata.mkdir(parents=True, exist_ok=True)
+    iso_local.mkdir(parents=True, exist_ok=True)
+    env["APPDATA"] = str(iso_appdata)
+    env["LOCALAPPDATA"] = str(iso_local)
     before = _autoclaw_pids()
     try:
         subprocess.Popen(cmd, env=env,
