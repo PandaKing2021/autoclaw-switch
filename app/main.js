@@ -23,9 +23,15 @@ const PROVIDER_ID = "autoclaw-glm-provider";
 const WB_PROVIDER_ID = "workbuddy-openai-provider";
 // 资源根：打包态（exe）由 electron-builder 的 extraResources 放进 resources/，
 // 开发态用工作区的兄弟目录。两种形态保持同名目录层级，Python 片段里的相对路径
-// `../autoclaw-switch/a_switch.py`（cwd=bridge/）在两种形态下都成立。
+// `../autoclaw-switch/a_switch.py`（cwd=bridge/）在两种形态下都成立；直接 clone
+// 本仓库当工作区时该文件在仓库根，片段里会退到 `../a_switch.py`（见 PY_LOAD_A_SWITCH）。
 const IS_PACKAGED = app.isPackaged;
 const RES_ROOT = IS_PACKAGED ? process.resourcesPath : path.join(__dirname, "..");
+// A-SWITCH 1.x 后端：一键注册 / 余额查询 / 凭证同步都要加载它
+const A_SWITCH_PY = [
+  path.join(RES_ROOT, "autoclaw-switch", "a_switch.py"),
+  path.join(RES_ROOT, "a_switch.py"),
+].find((p) => fs.existsSync(p)) || path.join(RES_ROOT, "autoclaw-switch", "a_switch.py");
 const WB_BIN_DIR = IS_PACKAGED
   ? path.join(RES_ROOT, "workbuddy")
   : path.join(RES_ROOT, "workbuddy", "workbuddy-manager-v1.0.79", "upstream");
@@ -617,12 +623,23 @@ function pythonOneShot(script, extraEnv = {}, timeoutMs = 90000) {
   });
 }
 
-const POINTS_SNIPPET = `
-import sys, json; sys.argv=['x']
+// a_switch.py（A-SWITCH 1.x 后端）在两种开发树里位置不同：工作区的仓库镜像目录是
+// ../autoclaw-switch/，而"直接 clone 本仓库当工作区"时它就在仓库根（../）。两个候选
+// 都试一遍，clone 下来就能用；打包态的 resources/autoclaw-switch/ 命中第一个。
+const PY_LOAD_A_SWITCH = `
+import sys, json, os
 import importlib.util
-spec=importlib.util.spec_from_file_location('a','../autoclaw-switch/a_switch.py')
+_p = next((q for q in ('../autoclaw-switch/a_switch.py', '../a_switch.py') if os.path.exists(q)), None)
+if not _p:
+    print(json.dumps({"ok": False, "error": "找不到 a_switch.py：../autoclaw-switch/ 与 ../ 都没有"}))
+    sys.exit(0)
+sys.argv=['x']
+spec=importlib.util.spec_from_file_location('a', _p)
 m=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+`;
+
+const POINTS_SNIPPET = PY_LOAD_A_SWITCH + `
 m.BASE = "https://autoglm-api.zhipuai.cn"  # CN 账号余额在 CN identity 网关
 accs=m.discover_accounts()
 if not accs:
@@ -636,12 +653,8 @@ else:
                       "expiring": pts.get("expiring"), "token_exp": exp}))
 `;
 
-const REGISTER_SNIPPET = `
-import sys, json, subprocess, os; sys.argv=['x']
-import importlib.util
-spec=importlib.util.spec_from_file_location('a','../autoclaw-switch/a_switch.py')
-m=importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+const REGISTER_SNIPPET = PY_LOAD_A_SWITCH + `
+import subprocess
 m.subprocess=subprocess
 r=m.zcode_register_provider()
 # 模型目录以 a_switch 自己的 ZCODE_MODELS 为准（含逐路由实测的视觉矩阵）。
@@ -653,12 +666,7 @@ r["catalog"] = [{"modelId": d, "route": rt, "vision": bool(v), "contextWindow": 
 print(json.dumps(r, ensure_ascii=False))
 `;
 
-const SYNC_SNIPPET = `
-import sys, json; sys.argv=['x']
-import importlib.util
-spec=importlib.util.spec_from_file_location('a','../autoclaw-switch/a_switch.py')
-m=importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+const SYNC_SNIPPET = PY_LOAD_A_SWITCH + `
 ok=m.write_single_credential()
 print(json.dumps({"ok": bool(ok)}))
 `;
@@ -1015,7 +1023,7 @@ function setupIpc() {
     const nd = findNode();
     add("Node 运行时", !!nd, nd ? nd.source : "未找到", "relay 与 Trae 网关由它启动；exe 版自带兜底运行时（PATH → AutoClaw 自带 → 控制台自身），缺了才会报错");
     const py = await probeCmd(PYTHON, ["--version"]);
-    add("Python", py.ok, py.ok ? py.out : py.error, "一键注册 / 余额查询 / 凭证同步依赖它（加载 autoclaw-switch/a_switch.py）");
+    add("Python", py.ok, py.ok ? py.out : py.error, "一键注册 / 余额查询 / 凭证同步依赖它（加载 a_switch.py，见下一项）");
     if (py.ok) {
       // 同步器要解密 2.x 登录态，没这个包 spawn 能成功但进程会立刻崩，症状是「同步器点了没反应」
       const cr = await probeCmd(PYTHON, ["-c", "import cryptography;print('cryptography',cryptography.__version__)"]);
@@ -1039,6 +1047,7 @@ function setupIpc() {
     file("千问办公登录态", path.join(process.env.APPDATA || "", "QwenWorkCN", "auth-v2.dat"), "需安装并登录千问办公客户端（QwenWorkCN）；与 Qoder 共用同一个网关，点「同步账号」一次导入两条出口");
     file("AutoClaw 凭证", REQ_HEADERS, "需安装并登录 AutoClaw 桌面客户端；同步器把登录态搬成反代凭证");
     file("ZCode 配置", ZCODE_CFG, "需先安装并运行过一次 ZCode，注册才有落点");
+    file("A-SWITCH 后端", A_SWITCH_PY, "一键注册 / 余额查询 / 凭证同步加载它（a_switch.py）；随本仓库分发，打包态在 resources/autoclaw-switch/");
     return { ok: items.every((i) => i.ok), items };
   });
 

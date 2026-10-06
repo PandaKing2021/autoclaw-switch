@@ -5,7 +5,9 @@
  * 全部跑在临时目录里的合成 fixture 上，绝不碰 ~/.zcode 里的真实配置。
  * 用例 A/B/C 复现的正是 2026-10-05 把用户配置改坏的两个错误：写入非法
  * api.type、以及整体重建 modelConfigRules 时丢掉 manualProviderModelRules。
- * 旧的内联实现三条都会失败；新实现三条都必须通过。
+ * 旧的内联实现三条都会失败；新实现三条都必须通过。A4（缺 modelId 的坏条目
+ * 也必须能被本家目录覆盖）与 G1（主进程里不存在同名函数静默覆盖）是
+ * 2026-10-06 新增的两个回归。
  */
 const fs = require("fs");
 const os = require("os");
@@ -276,6 +278,22 @@ t("F3 其它供应商的条目位置不动", () => {
   ];
   upsertModelEntries(arr, "p1", [{ providerId: "p1", modelId: "new" }]);
   assert(arr.map((x) => x.modelId).join() === "a1,new,b1", `位置应保持 a1,new,b1，实际 ${arr.map((x) => x.modelId).join()}`);
+});
+
+// ---- G. 主进程源码卫生 ----
+// 同一作用域里重复声明同名 function，JS 会静默覆盖（不报错，node --check 也过）：
+// 2026-10-06 就这么把 comateModels() 覆盖成了返回字符串数组的版本，导致 15 条
+// comate 目录的 modelId 全写成 null，而注册流程照样报成功。
+t("G1 main.js 里不存在重复声明的函数（静默覆盖曾写出 null modelId）", () => {
+  const src = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  const seen = new Map();
+  src.split("\n").forEach((line, i) => {
+    const m = /^(?:async\s+)?function\s+([A-Za-z0-9_$]+)/.exec(line);
+    if (!m) return;
+    if (seen.has(m[1])) throw new Error(`函数 ${m[1]}() 在第 ${seen.get(m[1])} 行与第 ${i + 1} 行重复声明`);
+    seen.set(m[1], i + 1);
+  });
+  assert(seen.size > 20, `main.js 只扫到 ${seen.size} 个顶层函数声明，正则或文件结构变了，这条用例已失效`);
 });
 
 const pass = results.filter((r) => r[1]).length;
