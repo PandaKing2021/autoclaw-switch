@@ -2659,23 +2659,15 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
             cancelled = True
             break
         _inflight_beat(profile_dir)      # 心跳：标记本登录目录"进行中"，防孤儿清理误删
-        # 回跳自检：登录期间主 profile 的 auth.json 被改写 = z.ai 网页登录的深链
-        # （autoclaw:// → 系统拉起 D:\AutoClaw\AutoClaw.exe 接收）已把凭证落回主配置。
-        # 若身份仍是快照里那个号 = 浏览器交回的就是当前已登录账号（不是新号），
-        # 立刻点破并给出动作指引，别让用户傻等 300 秒超时。
-        if (not handover_reported and main_uid and main_auth.is_file()
-                and main_auth.stat().st_mtime >= flow_start):
+        # 实时监听兑换失败（630014 审核拒绝 / 631001 域名风控 / ...）：后端拒绝后 token
+        # 永远不会落盘，继续等只是白等 300 秒——日志里出现 failed 立即退出，报错里带真因。
+        _authlog = profile_dir / "_home" / ".openclaw-autoclaw" / "logs" / "autoclaw-auth.log"
+        if _authlog.is_file():
             try:
-                dd = json.loads(main_auth.read_text(encoding="utf-8", errors="replace"))
-                ui = dd.get("userInfo") or {}
-                uid_now = str(ui.get("user_id") or "")
-                if uid_now and uid_now == str(main_uid):
-                    handover_reported = True
-                    if on_progress:
-                        who = ui.get("email") or ui.get("user_name") or main_uid
-                        on_progress(f"⚠ 浏览器回跳交回的是当前已登录的账号（{who}）——不是新号。"
-                                    "请先在浏览器退出该账号、登录你想添加的账号，"
-                                    "然后在登录窗口重新点一次登录")
+                _txt = _authlog.read_text(encoding="utf-8", errors="replace")
+                if "oauth-login-zai.failed" in _txt or "oauth-login.failed" in _txt:
+                    cancelled = True
+                    break
             except Exception:
                 pass
         for d in cands:
