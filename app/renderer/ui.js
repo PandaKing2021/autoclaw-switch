@@ -85,7 +85,11 @@ async function refreshStatus() {
       cm.running && cm.ok ? "运行中" : cm.running ? "登录态缺失" : "已停止");
     $("comate-status").textContent = cm.ok ? "ok" : cm.running ? "未登录 Comate IDE" : "未运行";
     $("comate-cred").textContent = cm.credential || "-";
-    $("comate-mode").textContent = cm.running ? (cm.mode === "stateless" ? "无状态（每请求新建会话）" : cm.mode || "-") : "-";
+    // 无状态是传输层的事实；工具调用靠“同会话续跑”补齐，两件事分开写清楚
+    const cmMode = cm.mode === "stateless" ? "无状态（每请求新建会话）" : cm.mode || "-";
+    $("comate-mode").textContent = cm.running
+      ? (cm.toolLoop ? `${cmMode}；工具调用：会话续跑（路由表 ${cm.toolRoutingCached ?? 0} 条）` : cmMode)
+      : "-";
     renderModels("comate", cm.models);
 
     // Qoder CN（账号池来自桌面凭证导入）

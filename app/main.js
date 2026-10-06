@@ -739,6 +739,9 @@ function setupIpc() {
         ok: comateH.ok,
         credential: comateH.credential || null,
         mode: comateH.mode || "stateless",
+        // relay 自报的工具体系：会话续跑（同 conversation+task 交付 toolUseResults）
+        toolLoop: comateH.tool_loop || null,
+        toolRoutingCached: comateH.tool_routing_cached || 0,
         modelsCached: comateH.models_cached || 0,
         models: comateH.running ? await comateModels().then((ms) => ms.map((m) => m.display_name || m.id)).catch(() => []) : [],
       },
@@ -1527,6 +1530,10 @@ app.whenReady().then(() => {
       const cms = await invoke("comate:smoke");
       prog(`comate:smoke detail status=${cms.status} model=${cms.model} reply=${String(cms.reply).slice(0, 80)}`);
       await t("comate:smoke", cms.ok === true);
+      // 工具循环是这一版 relay 的能力，健康检查自报；不花额度就能识别“跑着旧代码的 relay”
+      const cmSt = (await invoke("status:query")).comate || {};
+      prog(`comate:tool-loop detail ${JSON.stringify(cmSt.toolLoop || null)} cached=${cmSt.toolRoutingCached ?? "-"}`);
+      await t("comate:tool-loop", typeof cmSt.toolLoop === "string" && cmSt.toolLoop.includes("continuation"));
       await invoke("qoder:start");
       await invoke("qoder:sync-accounts");
       prog("qoder:smoke 发起（COSY 签名链路，通常 3-15 秒）");

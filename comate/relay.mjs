@@ -21,12 +21,21 @@
  * CLI is Node/axios, so we speak node:https with the same header set
  * (User-Agent axios/1.16.1, Accept-Encoding with br, Connection keep-alive).
  *
- * Stateless like trae/ and doubao/: every request creates a fresh
+ * Stateless like trae/ and doubao/: every NEW question creates a fresh
  * conversation+task, the caller re-sends the full history flattened into
- * `query`; nothing session-shaped survives between requests.
+ * `query`. The one exception is the tool loop (below): it is bounded and
+ * transparent, nothing session-shaped is ever reused across user turns.
  *
- * Tools: caller tools are NOT forwarded (the agent runs its own toolset
- * server-side), same class as Trae.
+ * Tools: the agent runs its own toolset SERVER-SIDE — FUNCTION_CALL_START /
+ * _PARAMS_APPEND / _END frames carry `toolUse:[{id,name,input}]` (params
+ * stream in as per-key string fragments, concatenated, see
+ * appendParamContent in dist/zulu-cli). We translate those into OpenAI
+ * `tool_calls` / Anthropic `tool_use`, and the results the client executes
+ * come back in the request's `toolUseResults` field — the upstream's own
+ * channel, on the SAME conversation+task with query:"" and isFirstQuery:false
+ * (that is what the IDE kernel does). Frame names are Claude vocabulary
+ * (Write/Read/Bash); TOOL_ALIASES below maps them to the canonical snake_case
+ * names the CLI uses when reporting results (V10_TOOL_ALIASES in the bundle).
  *
  *   node relay.mjs [--port 18774] [--host 127.0.0.1]
  */
@@ -51,6 +60,11 @@ const argOf = (name, fallback) => {
 };
 const PORT = Number(process.env.COMATE_RELAY_PORT || argOf("--port", 18774));
 const HOST = process.env.COMATE_RELAY_HOST || argOf("--host", "127.0.0.1");
+// What the cloud agent is told about the caller's workspace (sysInfo). The
+// tools run CLIENT-side, so this is cosmetic — but a wrong root makes the
+// agent probe with absolute paths it cannot know. Point it at the ZCode
+// workspace when that differs from the relay's own cwd.
+const WORKSPACE = process.env.COMATE_RELAY_WORKSPACE || argOf("--workspace", process.cwd());
 
 const SETTINGS_FILE = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
@@ -127,6 +141,81 @@ function cliHeaders(license) {
   };
 }
 
+// ------------------------------------------------------------------ tool loop
+// Frame tool names are the Claude-style vocabulary the cloud agent speaks;
+// results are reported back under the canonical names below (mirrors
+// V10_TOOL_ALIASES for agentVersion>=10 in the IDE's zulu-cli bundle).
+const TOOL_ALIASES = {
+  Bash: "run_command", Read: "read_file", Write: "write_file", Edit: "edit_file",
+  Grep: "grep_content", Glob: "glob_path", Agent: "delegate_subagent", Skill: "skill",
+  WebFetch: "web_fetch", WebSearch: "web_search", RealtimeSearch: "web_search",
+  TodoWrite: "todo_write", ListDir: "list_dir", Delete: "delete_file",
+  CodebaseSearch: "codebase_search", UseMcpTool: "use_mcp_tool", StopTask: "stop_task",
+  AskUserQuestion: "ask_user_question", SendUserMessage: "send_user_message",
+  CreatePlan: "create_plan", DocRead: "doc_read", DocList: "doc_list", DocSearch: "doc_search",
+  GetGoal: "get_goal", CreateGoal: "create_goal", UpdateGoal: "update_goal",
+  TaskCreate: "create_task", TaskUpdate: "update_task", TaskGet: "get_task", TaskList: "list_task",
+  SetVMEnv: "setup_vm_environment",
+};
+function canonicalToolName(name) {
+  return TOOL_ALIASES[name] || name || "";
+}
+
+// The IDE kernel answers these itself and never bothers the model caller
+// (buildMergedParams filters them out of toolUseResults). Same here: they are
+// answered relay-side so they never reach the client, which has no handler.
+const INTERNAL_TOOL_NAMES = new Set(["compress_message", "task_complete", "memory_extract"]);
+
+// Tool results must go back to the SAME conversation+task that produced the
+// call, so the mapping call-id -> conversation/task has to survive between two
+// HTTP requests. Bounded + TTL'd + only ever holds ids this relay handed out:
+// a routing table, not a conversation pool. A miss (restart, expiry) degrades
+// to the plain stateless path instead of failing.
+const TOOL_ROUTING_TTL_MS = 30 * 60 * 1000;
+const TOOL_ROUTING_MAX = 256;
+const toolRouting = new Map();
+
+function rememberToolRouting(calls, conversationId, taskId) {
+  const now = Date.now();
+  for (const [k, v] of toolRouting) if (now - v.at > TOOL_ROUTING_TTL_MS) toolRouting.delete(k);
+  while (toolRouting.size + calls.length > TOOL_ROUTING_MAX && toolRouting.size)
+    toolRouting.delete(toolRouting.keys().next().value);
+  for (const c of calls) {
+    const prev = toolRouting.get(c.id);
+    toolRouting.set(c.id, {
+      conversationId, taskId, at: now,
+      name: c.name || prev?.name || "",
+      params: c.params || prev?.params,
+      internal: !!c.internal,
+      internalResult: c.internalResult || prev?.internalResult,
+    });
+  }
+}
+function lookupToolRouting(ids) {
+  for (const id of ids) {
+    const e = toolRouting.get(id);
+    if (e) return e;
+  }
+  return null;
+}
+function forgetToolRouting(ids) {
+  for (const id of ids) toolRouting.delete(id);
+}
+
+// PARAMS_APPEND frames carry per-key FRAGMENTS: strings concatenate, anything
+// else replaces/merges (appendParamContent in the CLI bundle only handles the
+// string case and drops the rest; keeping the rest beats losing parameters).
+function mergeToolParams(params, patch) {
+  for (const [k, v] of Object.entries(patch || {})) {
+    const prev = params[k];
+    if (typeof prev === "string" && typeof v === "string") params[k] = prev + v;
+    else if (v && typeof v === "object" && !Array.isArray(v) && prev && typeof prev === "object" && !Array.isArray(prev))
+      params[k] = { ...prev, ...v };
+    else params[k] = v;
+  }
+  return params;
+}
+
 // ------------------------------------------------------------------- catalog
 let catalogCache = { at: 0, models: [] };
 
@@ -168,16 +257,27 @@ async function createTask(license, conversationId, trace) {
 function flattenQuery(messages) {
   // Stateless flatten, same spirit as trae/: system becomes a bracketed
   // transcript header so the agent sees it as instructions, not its own.
+  // Tool turns from the caller's history are rendered as readable lines so a
+  // replay (or a fallback after the routing cache misses) still makes sense.
   const parts = [];
   for (const m of messages) {
-    const role = m?.role === "assistant" ? "Assistant" : m?.role === "system" ? "System instructions" : "User";
+    const role = m?.role === "assistant" ? "Assistant" : m?.role === "system" ? "System instructions" : m?.role === "tool" ? "Tool result" : "User";
     const text = typeof m?.content === "string" ? m.content : "";
     if (text.trim()) parts.push(`[${role}]\n${text.trim()}`);
+    if (m?.toolCalls?.length) {
+      parts.push("[Assistant tool call]\n" + m.toolCalls.map((c) => `${c.name}(${c.arguments || "{}"})`).join("\n"));
+    }
+    if (m?.toolResult) {
+      const body = String(m.toolResult.text || "").trim();
+      parts.push(`[Tool result${m.toolResult.name ? " " + m.toolResult.name : ""}]\n${body || "(empty)"}`);
+    }
   }
   return parts.join("\n\n") || "hello";
 }
 
-async function executeSync(license, conversationId, taskId, query, modelKey) {
+async function executeSync(license, conversationId, taskId, query, modelKey, opts = {}) {
+  const toolUseResults = opts.toolUseResults || [];
+  const isFirstQuery = opts.isFirstQuery !== false;
   const body = {
     username: license, ide: "zulucli", ideVersion: CLI_VERSION, pluginVersion: PLUGIN_VERSION,
     taskId, conversationId, agentId: 1,
@@ -190,11 +290,11 @@ async function executeSync(license, conversationId, taskId, query, modelKey) {
     sysInfo: {
       os: "Windows 10", defaultShell: "cmd.exe", homeDir: homedir(),
       installedCommands: ["node", "npm", "python"], notInstalledCommands: [],
-      workspacePath: process.cwd(), workspaceRoots: [process.cwd()],
+      workspacePath: WORKSPACE, workspaceRoots: [WORKSPACE],
     },
-    skillInfos: [], hasMcp: false, isUserQuery: true, isMockQuery: false,
-    localIndex: false, contexts: [], toolUseResults: [], subAgents: [],
-    agentVersion: "12", isFirstQuery: true, enableMemory: false, systemReminder: "",
+    skillInfos: [], hasMcp: false, isUserQuery: opts.isUserQuery !== false, isMockQuery: false,
+    localIndex: false, contexts: [], toolUseResults, subAgents: [],
+    agentVersion: "12", isFirstQuery, enableMemory: false, systemReminder: "",
     extendUserQueryInfo: { commands: [], skills: [], subagents: [], rules: [] },
     extend: { isMultiWorkspace: false, useWorkflow: false },
     sendMode: "normal", queryId: randomUUID(), langfuseTraceId: "", langfuseTraceparent: "",
@@ -207,21 +307,33 @@ async function executeSync(license, conversationId, taskId, query, modelKey) {
   if (Array.isArray(j?.detail) || j?.detail?.exceptionMsg || j?.type === "EXCEPTION") {
     throw new Error(`execute-sync rejected: ${r.text.slice(0, 240)}`);
   }
-  let text = "", reasoning = "", end = false, usage = null;
-  for (const raw of j?.frames || []) {
+  return reduceFrames(j?.frames);
+}
+
+// Pure frame reduction (split out so it can be regression-tested offline).
+function reduceFrames(frames) {
+  let text = "", reasoning = "", end = false, usage = null, rollbackMessageId = "";
+  const toolMap = new Map();
+  // content.detail is the frame payload (content.text is the same object
+  // stringified); toolUse rides on FUNCTION_CALL_* AND on ANSWER frames.
+  const detailOf = (c) => {
+    if (c && typeof c.detail === "object" && c.detail) return c.detail;
+    try { const d = JSON.parse(c?.text || "{}"); return d.detail || d; } catch { return {}; }
+  };
+  for (const raw of frames || []) {
     let f;
     try { f = JSON.parse(raw); } catch { continue; }
     const c = f?.content || {};
+    const d = detailOf(c);
     if (c.type === "ANSWER") {
-      const d = (() => { try { return JSON.parse(c.text || "{}"); } catch { return {}; } })();
-      const dd = d.detail || d;
-      text += dd.delta || "";
-      reasoning += dd.reasoningDelta || "";
-      if (dd.end || f.end) end = true;
+      text += d.delta || "";
+      reasoning += d.reasoningDelta || "";
+      if (d.end || c.end) end = true;
     } else if (c.type === "TOKEN_USAGE") {
       try {
-        const u = JSON.parse(c.text || "{}");
-        const num = (...keys) => { for (const k of keys) { const v = u?.[k] ?? u?.data?.[k]; if (Number.isFinite(v)) return v; } return undefined; };
+        const u = (typeof c.detail === "object" && c.detail) || JSON.parse(c.text || "{}");
+        const src = u?.usage || u?.data || u;
+        const num = (...keys) => { for (const k of keys) { const v = src?.[k]; if (Number.isFinite(v)) return v; } return undefined; };
         usage = {
           input_tokens: num("input_tokens", "prompt_tokens", "inputTokens", "promptTokens") ?? 0,
           output_tokens: num("output_tokens", "completion_tokens", "outputTokens", "completionTokens") ?? 0,
@@ -229,34 +341,129 @@ async function executeSync(license, conversationId, taskId, query, modelKey) {
         };
       } catch {}
     }
+    if (d.rollbackMessageId) rollbackMessageId = d.rollbackMessageId;
+    for (const tu of d.toolUse || []) {
+      if (!tu || !tu.id) continue;
+      let cur = toolMap.get(tu.id);
+      if (!cur) { cur = { id: tu.id, name: tu.name || "", params: {} }; toolMap.set(tu.id, cur); }
+      if (tu.name && !cur.name) cur.name = tu.name;
+      mergeToolParams(cur.params, tu.input);
+    }
   }
-  return { text, reasoning, end, usage };
+  return { text, reasoning, end, usage, rollbackMessageId, toolCalls: [...toolMap.values()].filter((t) => t.name) };
 }
 
-async function comateChat({ messages, modelKey }) {
+// One upstream turn, plus the relay-side answer loop for control tools the
+// client cannot execute (bounded: at most 2 extra hops per client request).
+async function runTurn({ license, conversationId, taskId, query, toolUseResults, isFirstQuery, isUserQuery, modelKey }) {
+  let out = await executeSync(license, conversationId, taskId, query, modelKey, { toolUseResults, isFirstQuery, isUserQuery });
+  for (let hop = 0; hop < 2; hop++) {
+    const internal = out.toolCalls.filter((t) => INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
+    if (!internal.length || internal.length !== out.toolCalls.length) break;
+    log(`internal call answered relay-side: ${internal.map((t) => t.name).join(",")}`);
+    out = await executeSync(license, conversationId, taskId, "", modelKey, {
+      toolUseResults: internal.map((t) => ({
+        id: t.id, name: canonicalToolName(t.name), success: true, params: t.params, message: "ok",
+      })),
+      isFirstQuery: false, isUserQuery: false,
+    });
+  }
+  const internalCalls = out.toolCalls.filter((t) => INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
+  const clientCalls = out.toolCalls.filter((t) => !INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
+  // Calls the client must answer: remember where to deliver their results.
+  // Internal ones (mixed into the same batch) get a pre-built result so the
+  // next continuation can hand them over together with the client's.
+  rememberToolRouting(
+    clientCalls.map((t) => ({ id: t.id, name: canonicalToolName(t.name), params: t.params })),
+    conversationId, taskId,
+  );
+  if (internalCalls.length) {
+    rememberToolRouting(internalCalls.map((t) => ({
+      id: t.id, internal: true,
+      internalResult: { id: t.id, name: canonicalToolName(t.name), success: true, params: t.params, message: "ok" },
+    })), conversationId, taskId);
+  }
+  return { ...out, toolCalls: clientCalls };
+}
+
+async function comateChat({ messages, modelKey, pending }) {
   const cred = readCredentials();
   const license = cred.license;
+  const model = modelKey || "auto";
+
+  if (pending?.results?.length) {
+    // The client is answering tool calls: continue the SAME conversation+task
+    // (upstream keeps the agent state; query stays empty, like the IDE).
+    const route = lookupToolRouting(pending.results.map((r) => r.id));
+    if (route) {
+      const ids = pending.results.map((r) => r.id);
+      const results = pending.results.map((r) => {
+        const e = toolRouting.get(r.id);
+        return {
+          id: r.id,
+          name: canonicalToolName(r.name) || e?.name || "",
+          success: r.isError ? false : true,
+          params: r.params || e?.params || {},
+          message: String(r.text ?? ""),
+        };
+      });
+      const internal = ids.map((id) => toolRouting.get(id)).filter((e) => e?.internalResult).map((e) => e.internalResult);
+      forgetToolRouting(ids);
+      const all = [...results, ...internal];
+      log(`tool-loop continue conv=${route.conversationId} task=${route.taskId} results=${all.length} (${all.map((r) => r.name).join(",")})`);
+      return await runTurn({
+        license, conversationId: route.conversationId, taskId: route.taskId,
+        query: "", toolUseResults: all, isFirstQuery: false, isUserQuery: false, modelKey: model,
+      });
+    }
+    log(`tool-loop miss for [${pending.results.map((r) => r.id).join(",")}] — cache expired or relay restarted, flattening instead`);
+  }
+
   const trace = randomUUID();
   const conversationId = await createConversation(license, trace);
   const taskId = await createTask(license, conversationId, trace);
   const query = flattenQuery(messages);
-  const out = await executeSync(license, conversationId, taskId, query, modelKey || "auto");
-  log(`chat model=${modelKey || "auto"} conv=${conversationId} task=${taskId} chars=${out.text.length}`);
+  const out = await runTurn({
+    license, conversationId, taskId, query, toolUseResults: [], isFirstQuery: true, isUserQuery: true, modelKey: model,
+  });
+  log(`chat model=${model} conv=${conversationId} task=${taskId} chars=${out.text.length} tools=${out.toolCalls.length}${out.toolCalls.length ? " [" + out.toolCalls.map((t) => t.name).join(",") + "]" : ""}`);
   return out;
 }
 
+
 // -------------------------------------------------------------------- flatten helpers for OpenAI/Anthropic
+// Normalized message shape: {role, content, toolCalls?:[{id,name,arguments,params}],
+// toolResult?:{id,name,text,isError}}. Only text + tool bookkeeping survives —
+// images etc. have nowhere to go in the upstream's text `query`.
+function textOfContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content))
+    return content.filter((p) => p && (p.type === "text" || typeof p.text === "string"))
+      .map((p) => p.text || "").join("\n");
+  return "";
+}
+
 function normalizeOpenAIMessages(messages) {
   const out = [];
   for (const m of messages || []) {
     if (!m || !m.role) continue;
-    let text = "";
-    if (typeof m.content === "string") text = m.content;
-    else if (Array.isArray(m.content)) {
-      text = m.content.filter((p) => p?.type === "text" || typeof p?.text === "string")
-        .map((p) => p.text || "").join("\n");
+    const text = textOfContent(m.content);
+    if (m.role === "tool") {
+      out.push({ role: "tool", content: "", toolResult: {
+        id: m.tool_call_id || "", name: m.name || "", text,
+      } });
+      continue;
     }
-    if (text.trim()) out.push({ role: m.role, content: text });
+    const toolCalls = Array.isArray(m.tool_calls)
+      ? m.tool_calls.map((c) => ({
+          id: c?.id || "",
+          name: c?.function?.name || c?.name || "",
+          arguments: typeof c?.function?.arguments === "string" ? c.function.arguments
+            : JSON.stringify(c?.function?.arguments ?? {}),
+        })).filter((c) => c.id || c.name)
+      : [];
+    if (!text.trim() && !toolCalls.length) continue;
+    out.push({ role: m.role, content: text, ...(toolCalls.length ? { toolCalls } : {}) });
   }
   return out;
 }
@@ -269,23 +476,94 @@ function normalizeAnthropicMessages(body) {
     if (s.trim()) out.push({ role: "system", content: s });
   }
   for (const m of body?.messages || []) {
-    const text = Array.isArray(m.content)
-      ? m.content.filter((p) => p?.type === "text" || typeof p === "string")
-          .map((p) => (typeof p === "string" ? p : p.text || "")).join("\n")
-      : m.content || "";
-    if (String(text).trim()) out.push({ role: m.role === "assistant" ? "assistant" : "user", content: String(text) });
+    const role = m?.role === "assistant" ? "assistant" : "user";
+    if (typeof m?.content === "string") {
+      if (m.content.trim()) out.push({ role, content: m.content });
+      continue;
+    }
+    const blocks = Array.isArray(m?.content) ? m.content : [];
+    const text = blocks.filter((b) => b?.type === "text").map((b) => b.text || "").join("\n");
+    const toolCalls = blocks.filter((b) => b?.type === "tool_use")
+      .map((b) => ({ id: b.id || "", name: b.name || "", arguments: JSON.stringify(b.input ?? {}), params: b.input }))
+      .filter((c) => c.id || c.name);
+    if (text.trim() || toolCalls.length) out.push({ role, content: text, ...(toolCalls.length ? { toolCalls } : {}) });
+    for (const b of blocks.filter((b) => b?.type === "tool_result")) {
+      const c = Array.isArray(b.content) ? b.content.map((p) => (typeof p === "string" ? p : p?.text || "")).join("\n")
+        : typeof b.content === "string" ? b.content : "";
+      out.push({ role: "tool", content: "", toolResult: { id: b.tool_use_id || "", name: "", text: c, isError: !!b.is_error } });
+    }
   }
   return out;
 }
+
+// A request is a tool continuation iff it ENDS with tool results (the batch
+// the client just executed for the assistant turn right before them).
+function extractPending(msgs) {
+  const results = [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.toolResult) { results.unshift(msgs[i].toolResult); continue; }
+    break;
+  }
+  if (!results.length) return null;
+  const calls = msgs[msgs.length - results.length - 1]?.toolCalls || [];
+  return { results, calls };
+}
+
 
 // ---------------------------------------------------------------------- SSE
 function sseChunk(res, model, text, reasoning, opts) {
   const d = { id: "chatcmpl-" + randomUUID(), object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: null }] };
   if (reasoning) d.choices[0].delta.reasoning_content = reasoning;
   if (text) d.choices[0].delta.content = text;
+  if (opts?.toolCalls) d.choices[0].delta.tool_calls = opts.toolCalls;
   if (opts?.usage) d.usage = opts.usage;
-  if (opts?.finish) { d.choices[0].delta = {}; d.choices[0].finish_reason = "stop"; }
+  if (opts?.finish) { d.choices[0].delta = {}; d.choices[0].finish_reason = opts.finishReason || "stop"; }
   res.write(`data: ${JSON.stringify(d)}\n\n`);
+}
+
+// Caller's declared tools -> Map(name -> Set(property names) | null). The
+// property set lets us drop upstream-only extras (e.g. Bash's prefix_rule /
+// description) that a strict client schema would reject.
+function clientToolIndex(tools, shape) {
+  const idx = new Map();
+  for (const t of tools || []) {
+    const name = shape === "anthropic" ? t?.name : t?.function?.name || t?.name;
+    const schema = shape === "anthropic" ? t?.input_schema : t?.function?.parameters || t?.parameters;
+    const props = Object.keys(schema?.properties || {});
+    if (name) idx.set(name, props.length ? new Set(props) : null);
+  }
+  return idx;
+}
+
+// Upstream frame names (Claude vocabulary) vs. the names the caller declared.
+// Prefer the caller's own spelling so its tool router recognises the call;
+// fall back to the upstream name when the canonical forms don't match either.
+function toolNameForClient(rawName, clientTools) {
+  if (!clientTools || !clientTools.size) return rawName;
+  if (clientTools.has(rawName)) return rawName;
+  const canon = canonicalToolName(rawName);
+  for (const n of clientTools.keys()) if (canonicalToolName(n) === canon) return n;
+  return rawName;
+}
+
+function clientToolCall(c, clientTools) {
+  const name = toolNameForClient(c.name, clientTools);
+  const props = clientTools?.get?.(name);
+  if (!props) return { id: c.id, name, params: c.params || {} };
+  const kept = {};
+  for (const [k, v] of Object.entries(c.params || {})) if (props.has(k)) kept[k] = v;
+  return { id: c.id, name, params: Object.keys(kept).length ? kept : c.params || {} };
+}
+
+function clientToolCalls(out, clientTools) {
+  return out.toolCalls.map((c) => clientToolCall(c, clientTools));
+}
+
+function openaiToolCalls(out, clientTools) {
+  return clientToolCalls(out, clientTools).map((c, i) => ({
+    index: i, id: c.id, type: "function",
+    function: { name: c.name, arguments: JSON.stringify(c.params) },
+  }));
 }
 
 function splitChunks(text, n = 24) {
@@ -307,6 +585,8 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         ok, service: "comate-relay", mode: "stateless",
+        tool_loop: "conversation-continuation (bounded routing cache)",
+        tool_routing_cached: toolRouting.size,
         credential: ok ? `ok (${user})` : "missing (Comate not logged in)",
         models_cached: catalogCache.models.length,
       }));
@@ -329,8 +609,12 @@ const server = createServer(async (req, res) => {
       // Anthropic shape
       const model = payload.model || "auto";
       const msgs = normalizeAnthropicMessages(payload);
+      const clientTools = clientToolIndex(payload.tools, "anthropic");
+      const pending = extractPending(msgs);
       const wantStream = !!payload.stream;
-      const out = await comateChat({ messages: msgs, modelKey: model });
+      const out = await comateChat({ messages: msgs, modelKey: model, pending });
+      const outTokens = out.usage?.output_tokens || Math.ceil(out.text.length / 4);
+      const stopReason = out.toolCalls.length ? "tool_use" : "end_turn";
       if (wantStream) {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         res.write(`data: ${JSON.stringify({ type: "message_start", message: { id: "msg_" + randomUUID(), type: "message", role: "assistant", model, content: [] } })}\n\n`);
@@ -338,16 +622,27 @@ const server = createServer(async (req, res) => {
         for (const piece of splitChunks(out.text)) {
           res.write(`data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: piece } })}\n\n`);
         }
-        res.write(`data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: Math.ceil(out.text.length / 4) } })}\n\n`);
+        out.toolCalls.forEach((c0, i) => {
+          const c = clientToolCall(c0, clientTools);
+          res.write(`data: ${JSON.stringify({ type: "content_block_start", index: i, content_block: { type: "tool_use", id: c.id, name: c.name, input: {} } })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: "content_block_delta", index: i, delta: { type: "input_json_delta", partial_json: JSON.stringify(c.params) } })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: "content_block_stop", index: i })}\n\n`);
+        });
+        res.write(`data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outTokens } })}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
       } else {
+        const content = [];
+        if (out.text) content.push({ type: "text", text: out.text });
+        for (const c of clientToolCalls(out, clientTools)) {
+          content.push({ type: "tool_use", id: c.id, name: c.name, input: c.params });
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           id: "msg_" + randomUUID(), type: "message", role: "assistant", model,
-          content: [{ type: "text", text: out.text }],
-          stop_reason: "end_turn",
-          usage: { input_tokens: out.usage?.input_tokens || 0, output_tokens: out.usage?.output_tokens || Math.ceil(out.text.length / 4) },
+          content: content.length ? content : [{ type: "text", text: "" }],
+          stop_reason: stopReason,
+          usage: { input_tokens: out.usage?.input_tokens || 0, output_tokens: outTokens },
         }));
       }
       return;
@@ -356,8 +651,10 @@ const server = createServer(async (req, res) => {
     if (p === "/v1/chat/completions" || p === "/chat/completions") {
       const model = payload.model || "auto";
       const msgs = normalizeOpenAIMessages(payload.messages);
+      const clientTools = clientToolIndex(payload.tools, "openai");
+      const pending = extractPending(msgs);
       const wantStream = !!payload.stream;
-      const out = await comateChat({ messages: msgs, modelKey: model });
+      const out = await comateChat({ messages: msgs, modelKey: model, pending });
       const usage = {
         prompt_tokens: out.usage?.input_tokens || 0,
         completion_tokens: out.usage?.output_tokens || Math.ceil(out.text.length / 4),
@@ -366,14 +663,17 @@ const server = createServer(async (req, res) => {
       if (wantStream) {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         for (const piece of splitChunks(out.text)) sseChunk(res, model, piece, "");
-        sseChunk(res, model, "", "", { finish: true, usage });
+        if (out.toolCalls.length) sseChunk(res, model, "", "", { toolCalls: openaiToolCalls(out, clientTools) });
+        sseChunk(res, model, "", "", { finish: true, finishReason: out.toolCalls.length ? "tool_calls" : "stop", usage });
         res.write("data: [DONE]\n\n");
         res.end();
       } else {
+        const message = { role: "assistant", content: out.text || (out.toolCalls.length ? null : "") };
+        if (out.toolCalls.length) message.tool_calls = openaiToolCalls(out, clientTools).map(({ index, ...c }) => c);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           id: "chatcmpl-" + randomUUID(), object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
-          choices: [{ index: 0, message: { role: "assistant", content: out.text }, finish_reason: "stop" }],
+          choices: [{ index: 0, message, finish_reason: out.toolCalls.length ? "tool_calls" : "stop" }],
           usage,
           comate: { mode: "stateless" },
         }));
@@ -390,8 +690,9 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  log(`comate-relay listening on http://${HOST}:${PORT} (mode: stateless)`);
+const LISTEN = !process.env.COMATE_RELAY_NO_LISTEN;
+if (LISTEN) server.listen(PORT, HOST, () => {
+  log(`comate-relay listening on http://${HOST}:${PORT} (mode: stateless, tool loop: relay-side continuation)`);
   try {
     const c = readCredentials();
     log(`credential ok: ${c.username}`);
@@ -399,3 +700,10 @@ server.listen(PORT, HOST, () => {
     log(`credential MISSING: ${e.message}`);
   }
 });
+
+export {
+  server, TOOL_ALIASES, INTERNAL_TOOL_NAMES, canonicalToolName, mergeToolParams,
+  toolRouting, rememberToolRouting, lookupToolRouting, forgetToolRouting,
+  reduceFrames, extractPending, flattenQuery, normalizeOpenAIMessages, normalizeAnthropicMessages,
+  clientToolIndex, toolNameForClient, clientToolCalls, openaiToolCalls,
+};

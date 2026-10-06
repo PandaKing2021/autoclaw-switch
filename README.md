@@ -10,12 +10,13 @@
 | **WorkBuddy**（腾讯 CodeBuddy） | Free 档每月 100 + 每日 30 积分 | 本地 Go 网关（wb2api） | openai | **原生 chat completions**（body 原样透传） | 7863 | 46 | ✅ 结构化 |
 | **Trae SOLO CN**（字节） | 免费会话额度 | 离线解密客户端凭证 → 驱动其远端 agent 会话 | openai + anthropic | agent 会话协议（历史拍平成文本） | 18768 | 27 | ❌ 仅文本 |
 | **豆包工作**（字节 DoubaoWork） | 客户端内置额度 | CDP 取登录 cookie → 直连 `/chat/completion` | openai + anthropic | 网页 IM 协议（历史拍平成文本） | 18770 | 2（合成） | ❌ 仅文本 |
-| **Comate 文心快码**（百度） | Comate IDE 内置额度 | 读 settings.json 里的 license → 驱动其云端 agent 三步链 | openai + anthropic | agent 三步链（历史拍平成文本） | 18774 | 15 | ❌ 仅文本 |
+| **Comate 文心快码**（百度） | Comate IDE 内置额度 | 读 settings.json 里的 license → 驱动其云端 agent 三步链 | openai + anthropic | agent 三步链（历史拍平、**工具走 `toolUseResults` 同会话续跑**） | 18774 | 15 | ✅ 会话续跑‡ |
 | **Qoder CN**（阿里） | 客户端内置额度（Free 档 Qwen3.8 系可用） | vendored 社区网关（COSY 签名）+ 本机凭证入池 | openai + responses | COSY 信封 agent SSE（历史拍平、**工具真列表**） | 8791 | 14 | ✅ 透传 |
 | **千问办公**（QoderWork CN） | 同 Qoder 平台，独立网关 | 同 COSY 体系，多一处形态声明（见千问办公一节） | openai + responses | 同上（qwork 场景 + 工作台形态声明） | 8791 | 3 | ✅ 透传 |
 
 \* 模型目录随账号动态拉取，表中为 2026-10 本机实测值；豆包的目录在服务端且不可枚举，网关只能给出两个合成条目。
 † 这是**上游**真实说话的方式，与"网关对外暴露什么"是两回事——七条链路的入口全都是 chat completions，但只有前两家上游本身就是 chat completions。逐家证据与对使用体感的影响见[上游协议保真度](#上游协议保真度谁是真的-chat-completions)。
+‡ Comate 的"会话续跑"是指工具循环：上游 agent 发起的调用（`Write`/`Read`/`Bash`…）翻译成调用方协议里的工具调用，执行结果经 `toolUseResults` 在**同一个 conversation+task** 上续跑交付。工具集是上游 agent 自己的，不是调用方声明的——调用方需要有同名（或 canonical 同名）的工具才能执行，详见 [Comate 一节](#comate-文心快码settingsjson-里的-license--云端-agent-三步链)。
 
 所有组件都跑在 `127.0.0.1`，凭证不离开你的电脑；七个平台在 ZCode 里是并列供应商（`autoclaw-glm-provider` / `workbuddy-openai-provider` / `trae-openai-provider` / `doubao-openai-provider` / `comate-openai-provider` / `qoder-openai-provider` / `qwenwork-openai-provider`），模型名不冲突，同一个会话里可以自由切换。
 
@@ -43,13 +44,14 @@ Qoder CN 与千问办公共用 `8791` 这**一个**网关进程（同一份账�
 **B 档 · 自定义协议里带真工具语义（翻译得出工具调用，但历史要拍平）**
 
 - **Qoder CN / 千问办公**：上行 body 是官方 `baseprompt.json` 的深拷贝，里面**确实有 `messages` 数组**——但那是 `[{role:"system"}, ...拍平后的历史]`，`flatten_messages()` 会把 assistant 历史里的 `tool_calls` 序列化成文本标记。唯一"真结构化"的是工具声明：客户端给的 `tools` 被原样塞进信封（`body["tools"] = tools`），上游按自己的工具语义解析并回 `finish_reason:tool_calls`。所以它是**"工具真透传、历史假 messages"的混合体**。
-- **Comate / Trae**：连工具都没有容身之处——Comate 的 `execute-sync` 只有一个文本 `query` 字段（文件头注释写明 *caller tools are NOT forwarded*），Trae 的 `initial_message.query` 是 `JSON.stringify(prompt(text))`，协议里没有接收 `tools` 的字段。不是"我们没转"，是"没地方放"。
+- **Comate**：调用方的 `tools` 不转发（`execute-sync` 只有一个文本 `query` 字段），但工具**下行**带真语义：`FUNCTION_CALL_START/_PARAMS_APPEND/_END` 帧里挂着 `toolUse:[{id,name,input}]`，参数按 key 逐片累加（`appendParamContent` 的字符串拼接语义）；执行结果回程走的是上游自己的 `toolUseResults` 字段，在**同一个 conversation+task** 上用 `query:""`、`isFirstQuery:false` 续跑（即 IDE 内核的做法）。所以它是"**工具闭环，但工具集是上游 agent 自己的**"——帧里的名字（`Write`/`Read`/`Bash`，Claude 词汇）按 `V10_TOOL_ALIASES` 映射回调用方声明的工具名，调用方没声明就执行不了。
+- **Trae**：连工具都没有容身之处——`initial_message.query` 是 `JSON.stringify(prompt(text))`，协议里既没有接收 `tools` 的字段，也没有回传工具调用的通道。不是"我们没转"，是"没地方放"。
 
 **C 档 · 网页/产品对话接口（只能模拟）**
 
 - **豆包工作**：走网页端 `POST www.doubao.com/chat/completion` 的 SSE，消息体是编辑器块结构（`messages[0].content_block[0].content.text_block.text`），与 chat completions 的距离最远。
 
-**这件事的实际影响**：按"能不能进 agent 工具循环"排，**WorkBuddy ≈ AutoClaw（结构保真、工具闭环）> Qoder CN ≈ 千问办公（工具能通，但历史被拍平、每轮重发全量文本，同一个工具反复触发的多轮往返保真度明显低于前两家）> Comate ≈ Trae（自带 agent 替你干活，看不到调用方的工具）> 豆包（纯聊天额度）**。现象上，文本拍平的链路容易"第一轮很准、后面开始跑偏"，根因就在这里。
+**这件事的实际影响**：按"能不能进 agent 工具循环"排，**WorkBuddy ≈ AutoClaw（结构保真、工具闭环）> Comate ≈ Qoder CN ≈ 千问办公（工具都能闭环，短板互补：Comate 的循环是原生续跑、但工具集是上游 agent 自己的；Qoder/千问办公的调用方工具是真透传、但历史每轮重拍，同一个工具反复触发的多轮往返保真度明显低于前两家）> Trae（自带 agent 替你干活，看不到调用方的工具）> 豆包（纯聊天额度）**。现象上，文本拍平的链路容易"第一轮很准、后面开始跑偏"，根因就在这里。
 
 ## 快速开始
 
@@ -94,7 +96,7 @@ Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + 日志 + 顶
 - **WorkBuddy 网关卡片**：网关状态 / 积分 / 账号 / 模型目录；启动、停止、连通性测试
 - **Trae 平台卡片**：网关状态 / 账号 / 凭证到期 / 运行模式（无状态）/ 模型目录；启动、停止、连通性测试
 - **豆包工作卡片**：网关状态 / cookie 健康度 / 固定会话（仅作传输通道）/ 运行模式（无状态）/ 模型目录；启动、停止、连通性测试、**同步登录态**、**重启客户端并同步**
-- **Comate 文心快码卡片**：网关状态 / 登录态（license）/ 运行模式（无状态）/ 模型目录；启动、停止、连通性测试
+- **Comate 文心快码卡片**：网关状态 / 登录态（license）/ 运行模式（无状态 + 工具循环：会话续跑，含路由表条数）/ 模型目录；启动、停止、连通性测试
 - **Qoder CN 卡片**：网关状态 / 账号池（可用数）/ 出口（`cn`）/ 监听 / 模型目录（只列账号可用的）；启动、停止、连通性测试、**同步账号**
 - **千问办公卡片**：与 Qoder CN **同一个网关进程的另一个出口**（卡片上标 `出口 qworkcn (qwenwork.cn)` 与共用端口）；模型目录只显示 `qwork` 场景里那三个；同样的四个按钮（启停/连通性测试/同步账号）
 - **ZCode 供应商注册卡片**：注册状态 / 七家接入地址与模型数 / 模型清单 / 一键注册（同步模型目录）/ **配置体检**（只读检查 `provider_config.json` 的枚举与必需字段）
@@ -107,18 +109,18 @@ Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + 日志 + 顶
 
 ```
 cd app && npm start                     # 启动（等价于 npx electron .）
-ASWITCH_SELFTEST=1 npx electron .       # 26 项功能自检（七家连通性 + 七家注册 + 体检 + 闸门断言 + 日志 + relay 停复）
+ASWITCH_SELFTEST=1 npx electron .       # 27 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 闸门断言 + 日志 + relay 停复）
 ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # 只跑指定处理器
 node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，14 条用例）
 ```
 
-自测覆盖：`env:check` 体检、`status:query`、`points:refresh`、`credential:sync`、同步器启停、七家的 `*:smoke`（真实推理/真实响应，不是探活）、`all:start`、`zcode:register`（含逐家断言 `zcode:register:*`）、`zcode:realm-keys`（两把出口 Key 是否就位）、`zcode:register:未被闸门拦下`（写入真被接受）、`zcode:check`、`logs:tail`、`relay:stop/start`（失联与恢复）。结果落盘在 `~/.autoclaw-relay/selftest-result.txt`（含逐项通过与否），同目录的 `selftest-progress.txt` 是过程日志。**从 exe 跑全量自测时看不到 stdout**——Electron 是 GUI 子系统进程，重定向到文件也是空的，直接读那个 JSON 结果文件即可。
+自测覆盖：`env:check` 体检、`status:query`、`points:refresh`、`credential:sync`、同步器启停、七家的 `*:smoke`（真实推理/真实响应，不是探活）、`comate:tool-loop`（读 `/health` 断言这版 relay 自报工具循环——不花额度就能认出"跑着旧代码的 relay"）、`all:start`、`zcode:register`（含逐家断言 `zcode:register:*`）、`zcode:realm-keys`（两把出口 Key 是否就位）、`zcode:register:未被闸门拦下`（写入真被接受）、`zcode:check`、`logs:tail`、`relay:stop/start`（失联与恢复）。结果落盘在 `~/.autoclaw-relay/selftest-result.txt`（含逐项通过与否），同目录的 `selftest-progress.txt` 是过程日志。**从 exe 跑全量自测时看不到 stdout**——Electron 是 GUI 子系统进程，重定向到文件也是空的，直接读那个 JSON 结果文件即可。
 
 两个注意点：① 全量自测会重启 relay（`relay:stop/start` 两项就是在验这个），改单个按钮时用定向自测；定向自测必须同时给 `ASWITCH_SELFTEST=1` 和 `ASWITCH_SELFTEST_ONLY=...`，只给后者不触发。② 改完 `app/main.js` 或 `preload.js` 必须重启 electron 进程——运行中的窗口不会热更新，打包版还要重新打包重装。
 
 ## 各条链路各自的原理
 
-**七条链路统一是「无状态」网关，语义对齐 AutoClaw 的 relay。** 网关不保存任何会话：每次请求都独立地去完成一次上游调用，历史由调用方（ZCode）在 `messages` 里全量带来，回答只取决于本次请求内容。AutoClaw 链路本来就长这样（`bridge/server_2x.mjs` 里没有任何会话/会话池代码）；Trae 链路每请求新建一个远端会话再把历史拍平进去，用完即弃；豆包链路没有"新建会话"这个接口，于是把固定会话当作**传输草稿纸**——每次请求都把完整历史拍平成一条消息发进去，不复用服务端上下文；Comate 链路复刻的是 IDE 内核到云端 agent 的三步链，同样是每请求一次完整往返；Qoder CN 与千问办公（同一个 COSY 网关的两个出口）把 `messages` 拍平成纯文本转录塞进信封的 `messages` 数组后走各自的 `agent_chat_generation` 流（工具声明相反，是真列表照发）。这样做的收益是行为可预测：同一份 `messages` 无论何时发、上一轮发生过什么，结果都一致，也不存在会话池串味/污染的可能；代价分两层——**协议层**的保真度损失（谁保真谁拍平见上一节），以及各自的**每轮固定开销**（Trae 每轮都要重付 agent system prompt、豆包每轮都要重发全量历史）。
+**七条链路统一是「无状态」网关，语义对齐 AutoClaw 的 relay。** 网关不保存任何会话：每次请求都独立地去完成一次上游调用，历史由调用方（ZCode）在 `messages` 里全量带来，回答只取决于本次请求内容。AutoClaw 链路本来就长这样（`bridge/server_2x.mjs` 里没有任何会话/会话池代码）；Trae 链路每请求新建一个远端会话再把历史拍平进去，用完即弃；豆包链路没有"新建会话"这个接口，于是把固定会话当作**传输草稿纸**——每次请求都把完整历史拍平成一条消息发进去，不复用服务端上下文；Comate 链路复刻的是 IDE 内核到云端 agent 的三步链，新提问同样是每请求一次完整往返（唯一的例外是同一轮提问内的工具续跑，见下一节：它复用同一条 conversation+task，但跨提问不复用任何东西）；Qoder CN 与千问办公（同一个 COSY 网关的两个出口）把 `messages` 拍平成纯文本转录塞进信封的 `messages` 数组后走各自的 `agent_chat_generation` 流（工具声明相反，是真列表照发）。这样做的收益是行为可预测：同一份 `messages` 无论何时发、上一轮发生过什么，结果都一致，也不存在会话池串味/污染的可能；代价分两层——**协议层**的保真度损失（谁保真谁拍平见上一节），以及各自的**每轮固定开销**（Trae 每轮都要重付 agent system prompt、豆包每轮都要重发全量历史）。
 
 ### AutoClaw：凭证桥接 + 2.x 网关契约
 
@@ -215,7 +217,11 @@ Comate（`D:\Comate`，VS Code fork v1.108）是「扩展 → 本地内核（com
 - **三步链路**：`POST /api/aidevops/autocomate/rest/autowork/v2/conversation`（建会话，返回 `data.id`）→ `POST …/v2/task`（建任务，body 必须带 `agentInfo`，否则 400"conversationId and agentInfo can not null"，返回 `data.taskId`）→ `POST …/v2/execute-sync`（带着真实 id 执行）。**execute-sync 必须用真实 conversationId/taskId**：官方 CLI 用 `-1/-1` 占位会被 OpenRASP 以"无法操作其它账户创建的会话"403 拦下。
 - **传输指纹有 WAF**：python-urllib 的 TLS 指纹会被 406 拒掉（与 AutoClaw 2.x 的 undici 拦截同款坑）；用 node:https + axios 同款头（`User-Agent: axios/1.16.1`、带 br 的 Accept-Encoding）即可通过。
 - **响应是一帧数组**：execute-sync（同步）返回 `{"frames":[...]}`，每帧是 JSON 字符串；ANSWER 帧的 `detail.delta` 拼出正文、`reasoningDelta` 是思考增量、末帧 `end:true`，另有一帧 `TOKEN_USAGE` 带用量。relay 在本地把这些拼好再按 OpenAI/Anthropic 的 SSE 语义回放。
-- **无状态**：每请求新建 conversation+task，调用方带来的完整历史拍平成 `[System instructions]/[User]/[Assistant]` 转录塞进 `query`；上游的 agent 自己决定是否用它的内置工具，调用方的 `tools` 不透传（与 Trae 同类）。
+- **无状态**：每**个新提问**新建 conversation+task，调用方带来的完整历史拍平成 `[System instructions]/[User]/[Assistant]` 转录塞进 `query`；调用方的 `tools` 声明不透传（与 Trae 同类）。唯一的例外是下面的工具续跑——它复用"同一轮提问内的" conversation+task，跨用户提问不复用任何东西。
+- **工具循环（2026-10-06 补齐，此前"任务跑到一半就断"的根因）**：云端 agent 的调用以 `FUNCTION_CALL_START/_PARAMS_APPEND/_END` 帧下发（`toolUse:[{id,name,input}]`，参数按 key 分片累加），relay 拼装成 OpenAI 的 `tool_calls`（`finish_reason:"tool_calls"`）或 Anthropic 的 `tool_use`（`stop_reason:"tool_use"`）；调用方执行完把结果发回来（`role:"tool"` / `tool_result` 块），relay 翻成上游自己的 `toolUseResults`（条目形如 `{id, name, success, params, message}`），在**同一个 conversation+task** 上以 `query:""`、`isFirstQuery:false`、`isUserQuery:false` 续跑——这就是 IDE 内核的做法。`compress_message`/`task_complete`/`memory_extract` 这类控制工具调用方没有处理器，由 relay 就地应答（每轮最多补 2 跳），不下发。
+- **工具名的两个词汇表 + 参数过滤**：帧里是 Claude 词汇（`Write`/`Read`/`Bash`），回报结果要 canonical 名（`write_file`/`read_file`/`run_command`，对应 bundle 里的 `V10_TOOL_ALIASES`）；回给调用方时按"调用方自己的拼写优先 → canonical 同名匹配 → 原样透传"三级映射，并按调用方声明的 schema 属性过滤参数（上游会多塞 `prefix_rule`/`description`）。
+- **续跑靠一张有界路由表**：结果必须回到产出该调用的 conversation+task，所以 relay 存一张 `tool_call_id → {conversationId, taskId}` 的路由表（上限 256 条、TTL 30 分钟，条数见 `/health` 的 `tool_routing_cached`）。它是**路由表不是会话池**：新提问照旧每请求新建会话；未命中（relay 重启、过期）时降级成"把工具轮拍平进历史"的老路径，不报错、不 5xx。
+- **工作区提示可配**：`sysInfo.workspacePath` 默认取 relay 的 cwd；用 `COMATE_RELAY_WORKSPACE=<路径>`（或 `--workspace <路径>`）指到真实工作区，云端 agent 才不会拿着错的根去探路径。
 - **模型目录**：`POST /api/v2/api/models/available`（body 里 username/key 都填 license），15 个模型、id 带官方后缀（如 `glm-5.3_37c550fc…`），modelKey 直接用该 id（实测 `auto` 之外的真实模型 key 同样可用）。
 
 ### Qoder CN / 千问办公：COSY 签名（vendored 社区网关）
@@ -288,7 +294,7 @@ curl -X POST http://127.0.0.1:18770/v1/chat/completions \
 
 # Comate 网关（:18774，openai，另有 /v1/messages）
 node comate/relay.mjs &
-curl http://127.0.0.1:18774/health        # 登录态（Comate IDE settings.json 的 license）、模式（stateless）
+curl http://127.0.0.1:18774/health        # 登录态（settings.json 的 license）、模式（stateless）、工具循环与会话续跑路由表条数
 curl -X POST http://127.0.0.1:18774/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"auto","messages":[{"role":"user","content":"reply OK"}]}'
@@ -306,7 +312,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 #     若网关侧开了校验，就用 realm-keys 里那一对 Key 走 Authorization: Bearer
 ```
 
-回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node app/test_zcode_config.js`（配置写入闸门，14 条）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）。Comate 与 Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `comate:smoke` / `qoder:smoke` / `qwenwork:smoke`。
+回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node app/test_zcode_config.js`（配置写入闸门，14 条）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
 
 注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
 
@@ -341,7 +347,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 
 **豆包的固有限制**：同样不支持工具调用；模型目录只有两个合成条目（服务端不可枚举）；请求内容会留在本机豆包工作的固定会话里。
 
-**Comate 的固有限制**：不支持工具透传（云端 agent 自己决定工具）；每轮 8-40 秒的三步链延迟；上游 agent 的自我认知是它自己的系统提示词（自称 Cursor 系助手），不是 ZCode。
+**Comate 的固有限制**：工具集不由调用方决定（云端 agent 用自己的工具集，调用方只有声明了同名/canonical 同名的工具才执行得了；没声明就没有工具可调）；每轮 8-40 秒的三步链延迟（同步接口，回答整段返回后再由 relay 切片回放，不是真流式）；上游 agent 的自我认知是它自己的系统提示词（自称 Cursor 系助手），不是 ZCode。
 
 **Qoder 的固有限制**：Free 账号多数模型在付费墙后（`/v1/models` 里 `enabled:false`，注册时已过滤）；能用的模型也都受"历史拍平成文本"影响——工具调用能闭环，但同一个工具反复触发的多轮往返保真度低于 WorkBuddy / AutoClaw。千问办公的模型目录只有三档且**不通用**——它只认自己那套 key，所以在 qworkcn 出口下 CN 的模型名一个也用不了（反之亦然），这是上游的封闭目录决定的，不是网关的过滤。
 
@@ -374,7 +380,9 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 │   ├── test-relay.mjs / test-zcode-shape.mjs  回归测试
 │   └── t-*.mjs                    协议实验脚本（会话、ACK、多轮、深思考对照）
 ├── comate/                        ← Comate（文心快码）反代
-│   ├── relay.mjs                  ★ 网关本体（openai + anthropic，license 凭证 + 云端 agent 三步链 + 无状态）
+│   ├── relay.mjs                  ★ 网关本体（openai + anthropic，license 凭证 + 云端 agent 三步链 + 工具循环续跑）
+│   ├── test_relay.mjs             工具循环契约的离线回归（34 条，不花额度）
+│   ├── e2e_tool_loop.mjs          真机多跳工具循环 E2E（COMATE_E2E=1 才跑，消耗额度）
 │   └── decrypt_auth.py            凭证读取（settings.json 的 license；附早期 DPAPI 弯路记录）
 ├── qoder/                         ← Qoder CN / 千问办公网关（vendored qoder2api-hub + 本地补丁）
 │   ├── qoder_proxy.py             ★ 网关本体（纯标准库 Python；COSY 签名、账号池、看板、两条出口）
