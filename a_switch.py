@@ -1131,8 +1131,7 @@ def _autoclaw_roots():
     if env:
         roots.append(Path(env))
     for drive in ("C:", "D:", "E:", "F:"):
-        roots.append(Path(drive) / "AutoClaw")
-        roots.append(Path(drive) / "Program Files" / "AutoClaw")
+        roots.append(Path(drive + "\\") / "AutoClaw")          # Path("C:")/"x" 是盘符相对路径（无分隔符），必须补 \n        roots.append(Path(drive + "\\") / "Program Files" / "AutoClaw")
     roots.append(Path.home() / "AppData" / "Local" / "AutoClaw")
     return roots
 
@@ -1151,7 +1150,8 @@ def _running_autoclaw_exes():
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-Process AutoClaw* -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path"],
-            capture_output=True, text=True, timeout=10).stdout
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
     except Exception:
         return []
     return [Path(p) for p in (l.strip() for l in out.splitlines()) if p.lower().endswith(".exe")]
