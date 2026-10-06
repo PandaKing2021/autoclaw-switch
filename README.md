@@ -172,4 +172,4 @@ autoclaw-to-zcode/                 ← 工作区根目录
 └── TEST_REPORT.md                 完整测试报告（根因分析、实验记录、证据链）
 ```
 
-运行时数据（自动生成）：`~/.autoclaw-relay/`（部署的反代、persona.txt、日志、dumps）、`~/.openclaw-autoclaw/`（凭证源）、`~/.zcode/v2/provider_config.json`（ZCode 供应商注册，备份为 .bak-autoclaw）。
+运行时数据（自动生成）：`~/.autoclaw-relay/`（部署的反代、persona.txt、日志、dumps）、`~/.openclaw-autoclaw/`（凭证源）、`~/.zcode/v2/provider_config.json`（ZCode 供应商注册，备份为 .bak-autoclaw）。 
