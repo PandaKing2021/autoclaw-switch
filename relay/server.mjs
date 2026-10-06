@@ -960,6 +960,10 @@ const authFp = (auth) => createHash("sha256").update(String(auth || "")).digest(
 //              表现为"池子 7 个号全冷却、一个都接不了请求"。
 const pstate = { byUid: {}, byRoute: {}, lastPick: {}, loaded: false };
 let poolLastReject = { detail: "", at: 0 };   // 最近一次账号级拒绝的原文（全池等不起时用它回话）
+// 410004 终态封禁集合：撞到一次就永久排除该号，不再自动复选（封禁不会自愈，12h 冷却
+// 到了还会再撞，每次白烧一发请求；且反复撞死号本身是异常流量特征）。可人工从
+// pool_state.json 的 bannedUids 数组摘除解封。
+const bannedUids = new Set();
 
 function loadPoolState() {
   if (pstate.loaded) return;
@@ -969,6 +973,7 @@ function loadPoolState() {
     pstate.byUid = j.byUid || {};
     pstate.byRoute = j.byRoute || {};
     pstate.lastPick = j.lastPick || {};
+    (j.bannedUids || []).forEach((u) => bannedUids.add(String(u)));
     // 日预算恢复（09-22）：以前 dailyWin 只在内存，每次部署/重启把 24h 预算洗白 ——
     // 某号 死于重启窗口 pile-on 的放大器。加载时按窗口裁掉过期时间戳。
     const now = Date.now(), cutoff = now - DAILY_WINDOW_MS;
@@ -999,7 +1004,7 @@ function savePoolState() {
   try {
     fs.writeFileSync(POOL_STATE_FILE, JSON.stringify({
       at: Date.now(), byUid: pstate.byUid, byRoute: pstate.byRoute, lastPick: pstate.lastPick,
-      dailyWin: Object.fromEntries(dailyWin),
+      dailyWin: Object.fromEntries(dailyWin), bannedUids: [...bannedUids],
     }));
   } catch (e) { log(`pool_state 写盘失败（不影响选号，只是重启后冷却清零）: ${e.message}`); }
 }
@@ -1106,6 +1111,7 @@ function poolCandidates(route) {
   const cooling = [];
   for (const a of p.accounts) {
     if (!a || !a.auth) continue;
+    if (bannedUids.has(String(a.uid))) continue;   // 410004 终态封禁：永久排除（人工摘除 bannedUids 才恢复）
     if (a.access_expires_at && a.access_expires_at * 1000 <= now + 30_000) continue;
     // ⚠ 不要按 is_live 过滤（我 2026-09-24 一度这么改过，是错的，已回退）。
     // is_live 的语义是"A-SWITCH 活动目录里的那个号"（appdata_dir == Roaming\autoclaw），
@@ -1361,8 +1367,15 @@ async function callCloudPool(route, payload, opts) {
       // 410004 = 账号级终态封禁（推理面被切断，钱包/签到面照常）。它和"票被轮换掉"不是一回事：
       // 票会随 A-SWITCH 刷新换新（届时自动解除冷却），封禁不会。混在一起会让每个请求重撞死号。
       const isBan = /410004/.test(detail) || /been banned/i.test(detail);
-      poolMark(acc.uid, isBan ? "banned" : "auth", detail, acc.auth, route);
-      log(`pool ${acc.name} ${isBan ? "已封禁(410004) → 隔离 12h，不再进入选号" : `票失效/账号受限 ${resp.status} → 换下一个号`}`);
+      if (isBan) {
+        // 终态封禁：写进永久黑名单，永不自动复选（冷却到了还会再撞，白烧请求且是异常流量特征）
+        bannedUids.add(String(acc.uid));
+        poolStateDirty = true;
+        log(`pool ${acc.name} 终态封禁(410004) → 永久拉黑，不再选号（人工从 pool_state.json 的 bannedUids 摘除可解封）`);
+        continue;
+      }
+      poolMark(acc.uid, "auth", detail, acc.auth, route);
+      log(`pool ${acc.name} 票失效/账号受限 ${resp.status} → 换下一个号`);
       continue;
     }
     if (resp.status === 429 || resp.status >= 500) {
@@ -1467,6 +1480,9 @@ function poolSnapshot() {
     // 两个维度都报：账号级（票失效/限流/发不出去）与模型级（额度按模型分）。
     // scope 字段让调用方一眼分清这条冷却会不会连坐该号的其它模型。
     cooling: [
+      ...[...bannedUids].map((uid) => ({ uid: String(uid).slice(0, 8), scope: "uid",
+                                         kind: "banned-permanent", until_s: 0,
+                                         reason: "410004 终态封禁（永久拉黑，人工摘除 bannedUids 解封）" })),
       ...Object.entries(pstate.byUid)
         .filter(([, v]) => (v.until || 0) > now)
         .map(([uid, v]) => ({ uid: String(uid).slice(0, 8), scope: "uid", kind: v.kind,
