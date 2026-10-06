@@ -75,9 +75,14 @@ function collectAnthropic(events) {
 // MSYS 风格路径归一（agent 可能给 /d/xxx，Windows 侧要 D:\xxx）
 function normPath(p) {
   if (typeof p !== "string" || !p) return p;
-  const m = /^\/?([a-zA-Z])\/(.*)$/.exec(p);
-  if (p.startsWith("/") && m) return m[1].toUpperCase() + ":\\" + m[2].replace(/\//g, "\\");
-  return p;
+  const s = p.replace(/\\/g, "/");
+  // "/c/Users/x" -> "C:\Users\x"（MSYS 盘符写法）
+  if (/^\/[a-zA-Z]\//.test(s)) return s[1].toUpperCase() + ":\\" + s.slice(3).replace(/\//g, "\\");
+  // Git Bash 的 /tmp 就是 %TEMP%；不映射的话 path.resolve 会把它当成当前盘根目录（D:\tmp）
+  if (s.startsWith("/tmp/")) return path.join(os.tmpdir(), s.slice(5));
+  // 其余绝对路径按工作区相对路径处理，保证 Write 与后面 A2 的校验落在同一处
+  if (s.startsWith("/")) return s.slice(1);
+  return s;
 }
 
 function execTool(call) {

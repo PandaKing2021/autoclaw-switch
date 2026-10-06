@@ -742,6 +742,9 @@ function setupIpc() {
         // relay 自报的工具体系：会话续跑（同 conversation+task 交付 toolUseResults）
         toolLoop: comateH.tool_loop || null,
         toolRoutingCached: comateH.tool_routing_cached || 0,
+        // 上游取法：默认 /v2/execute（SSE 真流式），建不起来才降级 execute-sync
+        upstream: comateH.upstream || null,
+        streamFallbacks: comateH.stream_fallbacks || 0,
         modelsCached: comateH.models_cached || 0,
         models: comateH.running ? await comateModels().then((ms) => ms.map((m) => m.display_name || m.id)).catch(() => []) : [],
       },

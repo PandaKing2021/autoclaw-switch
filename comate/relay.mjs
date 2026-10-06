@@ -2,7 +2,9 @@
 /**
  * Comate(文心快码) agent -> OpenAI/Anthropic compatible relay.
  *
- * Shape of the upstream (reversed 2026-10-06, see comate/probe_*.mjs):
+ * Shape of the upstream (reversed 2026-10-06 from the zulu-cli bundle; the
+ * live behaviour is documented by comate/probe_stream.mjs and pinned offline
+ * by comate/test_stream.mjs against a fake upstream):
  * Comate's Zulu agent runs SERVER-SIDE. The IDE/CLI drives it through
  * three calls against https://comate.baidu.com, auth = the license UUID the
  * IDE stores in %APPDATA%\Comate\User\settings.json (baidu.comate.license;
@@ -11,15 +13,28 @@
  *   GET  /api/key/valid/:license                              preflight
  *   POST /api/aidevops/autocomate/rest/autowork/v2/conversation  -> data.id
  *   POST /api/aidevops/autocomate/rest/autowork/v2/task          -> data.taskId
+ *   POST /api/aidevops/autocomate/rest/autowork/v2/execute       -> text/event-stream
  *   POST /api/aidevops/autocomate/rest/autowork/v2/execute-sync  -> {frames:[...]}
  *
- * execute-sync returns the WHOLE answer as a JSON array of stringified
- * "frames"; ANSWER frames carry detail.delta / reasoningDelta, the last one
- * ends with end:true, and a TOKEN_USAGE frame carries usage.
+ * Two execution endpoints, same body, same frame vocabulary (the CLI has
+ * `execute` and `executeNonStream` for exactly this pair):
+ *   execute-sync  whole answer in one JSON array of stringified "frames";
+ *                 ANSWER frames carry detail.delta / reasoningDelta, the last
+ *                 ends with end:true, a TOKEN_USAGE frame carries usage.
+ *   execute       SSE. One JSON frame per `data:` line (heartbeat lines start
+ *                 with ":heartbeat"); frames are pushed as the agent produces
+ *                 them. Content types EXCEPTION / DOWNGRADE / QUOTA_EXCEED /
+ *                 NEED_RETRY_EXCEPTION are terminal errors; NOTIFICATION
+ *                 frames are progress chatter the CLI drops on the floor.
+ * We stream by default and only fall back to execute-sync when the streaming
+ * call cannot be established, so the client sees reasoning and text at the
+ * pace the agent produces them instead of a finished blob cut into pieces.
  *
  * Transport matters: Baidu's WAF 406s python-urllib TLS fingerprints. The
  * CLI is Node/axios, so we speak node:https with the same header set
  * (User-Agent axios/1.16.1, Accept-Encoding with br, Connection keep-alive).
+ * Responses can be brotli/gzip'd; both the JSON and the SSE readers decode
+ * that themselves.
  *
  * Stateless like trae/ and doubao/: every NEW question creates a fresh
  * conversation+task, the caller re-sends the full history flattened into
@@ -40,13 +55,19 @@
  *   node relay.mjs [--port 18774] [--host 127.0.0.1]
  */
 import { request as httpsRequest } from "node:https";
+import { request as httpRequest, createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync, mkdirSync, writeFileSync, statSync } from "node:fs";
-import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  gunzipSync, inflateSync, inflateRawSync, brotliDecompressSync,
+  createGunzip, createInflate, createBrotliDecompress,
+} from "node:zlib";
 
-const BASE = "https://comate.baidu.com";
+// Overridable so offline tests can point the whole chain at a local fake
+// upstream (comate/test_stream.mjs); production always talks to Baidu.
+const BASE = process.env.COMATE_RELAY_BASE || "https://comate.baidu.com";
 const API = BASE + "/api/aidevops/autocomate/rest/autowork";
 const CLI_VERSION = "1.8.1";
 const PLUGIN_VERSION = "4.13.0";
@@ -101,19 +122,48 @@ function deviceId() {
 }
 
 // ------------------------------------------------------------------- transport
+// The same header set on every outbound call: the WAF fingerprints the client
+// (axios), so a diff here is what turns a 200 into a 406.
+const BASE_HEADERS = {
+  "Content-Type": "application/json",
+  "X-Source": "COMATE",
+  "User-Agent": "axios/1.16.1",
+  "Accept-Encoding": "gzip, compress, deflate, br",
+  Connection: "keep-alive",
+  "Accept-Language": "zh-CN,zh",
+};
+
+function transportFor(url) {
+  return url.startsWith("http://") ? httpRequest : httpsRequest;
+}
+
+function decodeBody(buf, headers) {
+  const enc = String(headers?.["content-encoding"] || "").toLowerCase();
+  const tries = enc.includes("br") ? [brotliDecompressSync]
+    : enc.includes("gzip") ? [gunzipSync]
+    : enc.includes("deflate") ? [inflateSync, inflateRawSync] : [];
+  for (const fn of tries) {
+    try { return fn(buf); } catch {}
+  }
+  return buf;
+}
+
+function decodeStream(res) {
+  const enc = String(res.headers["content-encoding"] || "").toLowerCase();
+  if (enc.includes("br")) return res.pipe(createBrotliDecompress());
+  if (enc.includes("gzip")) return res.pipe(createGunzip());
+  if (enc.includes("deflate")) return res.pipe(createInflate());
+  return res;
+}
+
 function httpsJson(method, url, body, headers = {}, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const data = body == null ? null : Buffer.from(JSON.stringify(body), "utf8");
-    const req = httpsRequest(url, {
+    const req = transportFor(url)(url, {
       method,
       headers: {
-        "Content-Type": "application/json",
-        "X-Source": "COMATE",
-        "User-Agent": "axios/1.16.1",
+        ...BASE_HEADERS,
         Accept: "application/json, text/plain, */*",
-        "Accept-Encoding": "gzip, compress, deflate, br",
-        Connection: "keep-alive",
-        "Accept-Language": "zh-CN,zh",
         ...(data ? { "Content-Length": data.length } : {}),
         ...headers,
       },
@@ -121,7 +171,7 @@ function httpsJson(method, url, body, headers = {}, timeoutMs = 60000) {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
-        const text = Buffer.concat(chunks).toString("utf8");
+        const text = decodeBody(Buffer.concat(chunks), res.headers).toString("utf8");
         resolve({ status: res.statusCode, text, headers: res.headers });
       });
     });
@@ -130,6 +180,59 @@ function httpsJson(method, url, body, headers = {}, timeoutMs = 60000) {
     if (data) req.write(data);
     req.end();
   });
+}
+
+// POST that expects a `text/event-stream` back. Resolves as soon as the
+// headers are in — the body is consumed by parseSseFrames() below, so the
+// caller sees frames while the agent is still producing them.
+function ssePost(url, body, headers = {}, timeoutMs = 3_600_000) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(body), "utf8");
+    const req = transportFor(url)(url, {
+      method: "POST",
+      headers: {
+        ...BASE_HEADERS,
+        Accept: "text/event-stream",
+        "Content-Length": data.length,
+        ...headers,
+      },
+    }, (res) => {
+      resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        stream: decodeStream(res),
+        abort: () => { try { res.destroy(); } catch {} try { req.destroy(); } catch {} },
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`comate stream timeout after ${timeoutMs}ms`)));
+    req.write(data);
+    req.end();
+  });
+}
+
+// The CLI's SSEProcessor: split on "\n", drop ":heartbeat" keep-alives, strip
+// the "data:" prefix, JSON.parse each remaining line. One deliberate
+// difference: the CLI aborts the whole stream on a line it cannot parse, we
+// skip that line — a bad frame must not cost the caller the rest of an answer
+// (same rule the offline tests pin for the sync path).
+async function* parseSseFrames(stream) {
+  const dec = new TextDecoder();
+  let buf = "";
+  const drain = function* (line) {
+    const s = line.trim();
+    if (!s || s.startsWith(":") || !s.startsWith("data:")) return;
+    const payload = s.slice(5).trim();
+    if (!payload) return;
+    try { yield JSON.parse(payload); } catch {}
+  };
+  for await (const chunk of stream) {
+    buf += dec.decode(chunk, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) yield* drain(line);
+  }
+  yield* drain(buf);
 }
 
 function cliHeaders(license) {
@@ -275,10 +378,11 @@ function flattenQuery(messages) {
   return parts.join("\n\n") || "hello";
 }
 
-async function executeSync(license, conversationId, taskId, query, modelKey, opts = {}) {
-  const toolUseResults = opts.toolUseResults || [];
-  const isFirstQuery = opts.isFirstQuery !== false;
-  const body = {
+// The body both execution endpoints take — `execute` and `execute-sync` are
+// the same call with a different delivery (the CLI passes one arg object to
+// both), so building it once keeps the two paths from drifting apart.
+function buildExecuteBody({ license, conversationId, taskId, query, modelKey, toolUseResults, isFirstQuery, isUserQuery }) {
+  return {
     username: license, ide: "zulucli", ideVersion: CLI_VERSION, pluginVersion: PLUGIN_VERSION,
     taskId, conversationId, agentId: 1,
     uploadBaseInfo: {
@@ -292,14 +396,27 @@ async function executeSync(license, conversationId, taskId, query, modelKey, opt
       installedCommands: ["node", "npm", "python"], notInstalledCommands: [],
       workspacePath: WORKSPACE, workspaceRoots: [WORKSPACE],
     },
-    skillInfos: [], hasMcp: false, isUserQuery: opts.isUserQuery !== false, isMockQuery: false,
-    localIndex: false, contexts: [], toolUseResults, subAgents: [],
-    agentVersion: "12", isFirstQuery, enableMemory: false, systemReminder: "",
+    skillInfos: [], hasMcp: false, isUserQuery: isUserQuery !== false, isMockQuery: false,
+    localIndex: false, contexts: [], toolUseResults: toolUseResults || [], subAgents: [],
+    agentVersion: "12", isFirstQuery: isFirstQuery !== false, enableMemory: false, systemReminder: "",
     extendUserQueryInfo: { commands: [], skills: [], subagents: [], rules: [] },
     extend: { isMultiWorkspace: false, useWorkflow: false },
     sendMode: "normal", queryId: randomUUID(), langfuseTraceId: "", langfuseTraceparent: "",
     agentInfo: { agentName: "Agent", isProjectAgent: false, canInvokeAgents: true, isCustomAgent: false },
   };
+}
+
+// Thrown when the streaming endpoint cannot be used (not SSE, HTTP error,
+// transport refusal). The caller then degrades to execute-sync — but only if
+// nothing has been emitted yet, which is why the check happens before the
+// first frame is read.
+class StreamUnavailable extends Error {}
+
+async function executeSync(license, conversationId, taskId, query, modelKey, opts = {}) {
+  const body = buildExecuteBody({
+    license, conversationId, taskId, query, modelKey,
+    toolUseResults: opts.toolUseResults, isFirstQuery: opts.isFirstQuery, isUserQuery: opts.isUserQuery,
+  });
   const r = await httpsJson("POST", API + "/v2/execute-sync", body,
     { ...cliHeaders(license), "X-Trace-Id": randomUUID() }, 240000);
   let j;
@@ -310,69 +427,109 @@ async function executeSync(license, conversationId, taskId, query, modelKey, opt
   return reduceFrames(j?.frames);
 }
 
-// Pure frame reduction (split out so it can be regression-tested offline).
-function reduceFrames(frames) {
-  let text = "", reasoning = "", end = false, usage = null, rollbackMessageId = "";
-  const toolMap = new Map();
-  // content.detail is the frame payload (content.text is the same object
-  // stringified); toolUse rides on FUNCTION_CALL_* AND on ANSWER frames.
-  const detailOf = (c) => {
-    if (c && typeof c.detail === "object" && c.detail) return c.detail;
-    try { const d = JSON.parse(c?.text || "{}"); return d.detail || d; } catch { return {}; }
-  };
-  for (const raw of frames || []) {
-    let f;
-    try { f = JSON.parse(raw); } catch { continue; }
-    const c = f?.content || {};
-    const d = detailOf(c);
-    if (c.type === "ANSWER") {
-      text += d.delta || "";
-      reasoning += d.reasoningDelta || "";
-      if (d.end || c.end) end = true;
-    } else if (c.type === "TOKEN_USAGE") {
-      try {
-        const u = (typeof c.detail === "object" && c.detail) || JSON.parse(c.text || "{}");
-        const src = u?.usage || u?.data || u;
-        const num = (...keys) => { for (const k of keys) { const v = src?.[k]; if (Number.isFinite(v)) return v; } return undefined; };
-        usage = {
-          input_tokens: num("input_tokens", "prompt_tokens", "inputTokens", "promptTokens") ?? 0,
-          output_tokens: num("output_tokens", "completion_tokens", "outputTokens", "completionTokens") ?? 0,
-          raw: u,
-        };
-      } catch {}
-    }
-    if (d.rollbackMessageId) rollbackMessageId = d.rollbackMessageId;
-    for (const tu of d.toolUse || []) {
-      if (!tu || !tu.id) continue;
-      let cur = toolMap.get(tu.id);
-      if (!cur) { cur = { id: tu.id, name: tu.name || "", params: {} }; toolMap.set(tu.id, cur); }
-      if (tu.name && !cur.name) cur.name = tu.name;
-      mergeToolParams(cur.params, tu.input);
-    }
+// One upstream turn over SSE. Yields raw frames; terminal frame types raise
+// (a "the agent gave up" notice must not look like an empty answer).
+async function* executeStreamHop({ license, conversationId, taskId, query, modelKey,
+  toolUseResults, isFirstQuery, isUserQuery, registerAbort }) {
+  const body = buildExecuteBody({ license, conversationId, taskId, query, modelKey, toolUseResults, isFirstQuery, isUserQuery });
+  const up = await ssePost(API + "/v2/execute", body, { ...cliHeaders(license), "X-Trace-Id": randomUUID() });
+  registerAbort?.(up.abort);
+  const ctype = String(up.headers["content-type"] || "");
+  if (up.status !== 200 || !ctype.includes("text/event-stream")) {
+    let seen = "";
+    try { for await (const c of up.stream) seen += Buffer.from(c).toString("utf8"); } catch {}
+    throw new StreamUnavailable(`execute stream unavailable (${up.status} ${ctype || "no content-type"}): ${seen.slice(0, 200)}`);
   }
-  return { text, reasoning, end, usage, rollbackMessageId, toolCalls: [...toolMap.values()].filter((t) => t.name) };
+  for await (const frame of parseSseFrames(up.stream)) {
+    const c = frame?.content || {};
+    const d = detailOf(c);
+    if (c.type === "EXCEPTION") throw new Error(`comate exception: ${d?.exceptionMsg || JSON.stringify(d).slice(0, 200)}`);
+    if (c.type === "DOWNGRADE" || c.type === "QUOTA_EXCEED") throw new Error(`comate quota exceeded: ${JSON.stringify(d).slice(0, 200)}`);
+    if (c.type === "NEED_RETRY_EXCEPTION") throw new Error(`comate retry requested: ${d?.exceptionMsg || "no detail"}`);
+    if (c.type === "NOTIFICATION") continue;   // progress chatter, same as the CLI
+    yield frame;
+  }
 }
 
-// One upstream turn, plus the relay-side answer loop for control tools the
-// client cannot execute (bounded: at most 2 extra hops per client request).
-async function runTurn({ license, conversationId, taskId, query, toolUseResults, isFirstQuery, isUserQuery, modelKey }) {
-  let out = await executeSync(license, conversationId, taskId, query, modelKey, { toolUseResults, isFirstQuery, isUserQuery });
-  for (let hop = 0; hop < 2; hop++) {
-    const internal = out.toolCalls.filter((t) => INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
-    if (!internal.length || internal.length !== out.toolCalls.length) break;
-    log(`internal call answered relay-side: ${internal.map((t) => t.name).join(",")}`);
-    out = await executeSync(license, conversationId, taskId, "", modelKey, {
-      toolUseResults: internal.map((t) => ({
-        id: t.id, name: canonicalToolName(t.name), success: true, params: t.params, message: "ok",
-      })),
-      isFirstQuery: false, isUserQuery: false,
-    });
+// content.detail is the frame payload (content.text is the same object
+// stringified); toolUse rides on FUNCTION_CALL_* AND on ANSWER frames.
+function detailOf(c) {
+  if (c && typeof c.detail === "object" && c.detail) return c.detail;
+  try { const d = JSON.parse(c?.text || "{}"); return d.detail || d; } catch { return {}; }
+}
+
+function newTurnState() {
+  return { text: "", reasoning: "", end: false, usage: null, rollbackMessageId: "", toolMap: new Map() };
+}
+
+// One frame in, one delta out. Mutates `state`; the returned {text, reasoning}
+// are the pieces that just arrived, which is what lets the streaming paths
+// forward them the moment the upstream produces them instead of slicing a
+// finished string.
+function applyFrame(state, frame) {
+  let f = frame;
+  if (typeof f === "string") { try { f = JSON.parse(f); } catch { return {}; } }
+  const c = f?.content || {};
+  const d = detailOf(c);
+  const out = {};
+  if (c.type === "ANSWER") {
+    if (d.delta) { state.text += d.delta; out.text = d.delta; }
+    if (d.reasoningDelta) { state.reasoning += d.reasoningDelta; out.reasoning = d.reasoningDelta; }
+    if (d.end || c.end) state.end = true;
+  } else if (c.type === "TOKEN_USAGE") {
+    try {
+      const u = (typeof c.detail === "object" && c.detail) || JSON.parse(c.text || "{}");
+      const src = u?.usage || u?.data || u;
+      const num = (...keys) => { for (const k of keys) { const v = src?.[k]; if (Number.isFinite(v)) return v; } return undefined; };
+      state.usage = {
+        input_tokens: num("input_tokens", "prompt_tokens", "inputTokens", "promptTokens") ?? 0,
+        output_tokens: num("output_tokens", "completion_tokens", "outputTokens", "completionTokens") ?? 0,
+        raw: u,
+      };
+    } catch {}
   }
-  const internalCalls = out.toolCalls.filter((t) => INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
-  const clientCalls = out.toolCalls.filter((t) => !INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
-  // Calls the client must answer: remember where to deliver their results.
-  // Internal ones (mixed into the same batch) get a pre-built result so the
-  // next continuation can hand them over together with the client's.
+  if (d.rollbackMessageId) state.rollbackMessageId = d.rollbackMessageId;
+  for (const tu of d.toolUse || []) {
+    if (!tu || !tu.id) continue;
+    let cur = state.toolMap.get(tu.id);
+    if (!cur) { cur = { id: tu.id, name: tu.name || "", params: {} }; state.toolMap.set(tu.id, cur); }
+    if (tu.name && !cur.name) cur.name = tu.name;
+    mergeToolParams(cur.params, tu.input);
+    out.call = cur;
+  }
+  return out;
+}
+
+// Pure frame reduction (split out so it can be regression-tested offline).
+function reduceFrames(frames) {
+  const state = newTurnState();
+  for (const raw of frames || []) applyFrame(state, raw);
+  return {
+    text: state.text, reasoning: state.reasoning, end: state.end,
+    usage: state.usage, rollbackMessageId: state.rollbackMessageId,
+    toolCalls: [...state.toolMap.values()].filter((t) => t.name),
+  };
+}
+
+// The agent sometimes ends a turn on a control tool the caller has no handler
+// for (compress_message / task_complete / ...). The IDE kernel answers those
+// itself; we do the same, which costs one extra upstream hop (bounded to 2).
+function splitCalls(calls) {
+  const internal = calls.filter((t) => INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
+  const client = calls.filter((t) => !INTERNAL_TOOL_NAMES.has(canonicalToolName(t.name)));
+  return { internal, client, allInternal: internal.length > 0 && client.length === 0 };
+}
+function internalAnswers(calls) {
+  return calls.map((t) => ({
+    id: t.id, name: canonicalToolName(t.name), success: true, params: t.params, message: "ok",
+  }));
+}
+
+// Record where each call's result has to be delivered. Client calls: so the
+// next request can continue the same conversation+task. Internal ones (mixed
+// into a batch with client calls): with a pre-built result, so that
+// continuation hands both over together.
+function routeCalls(clientCalls, internalCalls, conversationId, taskId) {
   rememberToolRouting(
     clientCalls.map((t) => ({ id: t.id, name: canonicalToolName(t.name), params: t.params })),
     conversationId, taskId,
@@ -383,14 +540,31 @@ async function runTurn({ license, conversationId, taskId, query, toolUseResults,
       internalResult: { id: t.id, name: canonicalToolName(t.name), success: true, params: t.params, message: "ok" },
     })), conversationId, taskId);
   }
-  return { ...out, toolCalls: clientCalls };
 }
 
-async function comateChat({ messages, modelKey, pending }) {
-  const cred = readCredentials();
-  const license = cred.license;
-  const model = modelKey || "auto";
+// One upstream turn, plus the relay-side answer loop for control tools the
+// client cannot execute (bounded: at most 2 extra hops per client request).
+async function runTurn({ license, conversationId, taskId, query, toolUseResults, isFirstQuery, isUserQuery, modelKey }) {
+  let out = await executeSync(license, conversationId, taskId, query, modelKey, { toolUseResults, isFirstQuery, isUserQuery });
+  for (let hop = 0; hop < 2; hop++) {
+    const { internal, allInternal } = splitCalls(out.toolCalls);
+    if (!allInternal) break;
+    log(`internal call answered relay-side: ${internal.map((t) => t.name).join(",")}`);
+    out = await executeSync(license, conversationId, taskId, "", modelKey, {
+      toolUseResults: internalAnswers(internal), isFirstQuery: false, isUserQuery: false,
+    });
+  }
+  const { internal, client } = splitCalls(out.toolCalls);
+  routeCalls(client, internal, conversationId, taskId);
+  return { ...out, toolCalls: client };
+}
 
+// Everything a turn needs, resolved the same way for the streaming and the
+// non-streaming path: which conversation+task to talk to, what to send, and
+// whether this is a first query (a tool continuation is not).
+async function planTurn({ messages, modelKey, pending }) {
+  const license = readCredentials().license;
+  const model = modelKey || "auto";
   if (pending?.results?.length) {
     // The client is answering tool calls: continue the SAME conversation+task
     // (upstream keeps the agent state; query stays empty, like the IDE).
@@ -411,22 +585,59 @@ async function comateChat({ messages, modelKey, pending }) {
       forgetToolRouting(ids);
       const all = [...results, ...internal];
       log(`tool-loop continue conv=${route.conversationId} task=${route.taskId} results=${all.length} (${all.map((r) => r.name).join(",")})`);
-      return await runTurn({
-        license, conversationId: route.conversationId, taskId: route.taskId,
-        query: "", toolUseResults: all, isFirstQuery: false, isUserQuery: false, modelKey: model,
-      });
+      return {
+        license, model, modelKey: model, conversationId: route.conversationId, taskId: route.taskId,
+        query: "", toolUseResults: all, isFirstQuery: false, isUserQuery: false,
+      };
     }
     log(`tool-loop miss for [${pending.results.map((r) => r.id).join(",")}] — cache expired or relay restarted, flattening instead`);
   }
-
   const trace = randomUUID();
   const conversationId = await createConversation(license, trace);
   const taskId = await createTask(license, conversationId, trace);
-  const query = flattenQuery(messages);
-  const out = await runTurn({
-    license, conversationId, taskId, query, toolUseResults: [], isFirstQuery: true, isUserQuery: true, modelKey: model,
-  });
-  log(`chat model=${model} conv=${conversationId} task=${taskId} chars=${out.text.length} tools=${out.toolCalls.length}${out.toolCalls.length ? " [" + out.toolCalls.map((t) => t.name).join(",") + "]" : ""}`);
+  return {
+    license, model, modelKey: model, conversationId, taskId,
+    query: flattenQuery(messages), toolUseResults: [], isFirstQuery: true, isUserQuery: true,
+  };
+}
+
+// Streaming turn: same hop logic as runTurn, but every delta is yielded the
+// moment it arrives, so the caller can forward it immediately.
+async function* streamTurn(plan, { registerAbort } = {}) {
+  const total = newTurnState();
+  let query = plan.query, toolUseResults = plan.toolUseResults;
+  let isFirstQuery = plan.isFirstQuery, isUserQuery = plan.isUserQuery;
+  let calls = [];
+  for (let hop = 0; hop <= 2; hop++) {
+    const state = newTurnState();
+    for await (const frame of executeStreamHop({
+      license: plan.license, conversationId: plan.conversationId, taskId: plan.taskId,
+      query, modelKey: plan.modelKey, toolUseResults, isFirstQuery, isUserQuery, registerAbort,
+    })) {
+      const d = applyFrame(state, frame);
+      if (d.reasoning) { total.reasoning += d.reasoning; yield { type: "reasoning", text: d.reasoning }; }
+      if (d.text) { total.text += d.text; yield { type: "text", text: d.text }; }
+    }
+    total.usage = state.usage || total.usage;
+    total.rollbackMessageId = state.rollbackMessageId || total.rollbackMessageId;
+    calls = [...state.toolMap.values()].filter((t) => t.name);
+    const { internal, allInternal } = splitCalls(calls);
+    if (!allInternal || hop === 2) break;
+    log(`internal call answered relay-side: ${internal.map((t) => t.name).join(",")}`);
+    query = ""; toolUseResults = internalAnswers(internal);
+    isFirstQuery = false; isUserQuery = false;
+  }
+  const { internal, client } = splitCalls(calls);
+  routeCalls(client, internal, plan.conversationId, plan.taskId);
+  log(`chat(stream) model=${plan.model} conv=${plan.conversationId} task=${plan.taskId} chars=${total.text.length} think=${total.reasoning.length} tools=${client.length}${client.length ? " [" + client.map((t) => t.name).join(",") + "]" : ""}`);
+  yield { type: "tool_calls", calls: client };
+  yield { type: "done", usage: total.usage, text: total.text, reasoning: total.reasoning };
+}
+
+async function comateChat({ messages, modelKey, pending }) {
+  const plan = await planTurn({ messages, modelKey, pending });
+  const out = await runTurn(plan);
+  log(`chat model=${plan.model} conv=${plan.conversationId} task=${plan.taskId} chars=${out.text.length} tools=${out.toolCalls.length}${out.toolCalls.length ? " [" + out.toolCalls.map((t) => t.name).join(",") + "]" : ""}`);
   return out;
 }
 
@@ -511,15 +722,135 @@ function extractPending(msgs) {
 
 
 // ---------------------------------------------------------------------- SSE
+function writeSse(res, payload) {
+  if (res.writableEnded || res.destroyed) return false;
+  try { res.write(payload); return true; } catch { return false; }
+}
 function sseChunk(res, model, text, reasoning, opts) {
   const d = { id: "chatcmpl-" + randomUUID(), object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: null }] };
+  if (opts?.role) d.choices[0].delta.role = "assistant";
   if (reasoning) d.choices[0].delta.reasoning_content = reasoning;
   if (text) d.choices[0].delta.content = text;
   if (opts?.toolCalls) d.choices[0].delta.tool_calls = opts.toolCalls;
   if (opts?.usage) d.usage = opts.usage;
   if (opts?.finish) { d.choices[0].delta = {}; d.choices[0].finish_reason = opts.finishReason || "stop"; }
-  res.write(`data: ${JSON.stringify(d)}\n\n`);
+  writeSse(res, `data: ${JSON.stringify(d)}\n\n`);
 }
+
+// Upstream can think for a while before the first frame; without traffic the
+// client may time out on a stream that is actually healthy. SSE comments are
+// ignored by every parser.
+function startHeartbeat(res, line = ": ping\n\n", ms = 15000) {
+  const t = setInterval(() => writeSse(res, line), ms);
+  if (t.unref) t.unref();
+  return () => clearInterval(t);
+}
+
+// Client hung up? Kill the upstream call too — a zombie agent turn still
+// burns the account's quota.
+function bindAbort(res) {
+  let fn = null;
+  res.on("close", () => {
+    if (!res.writableEnded && fn) { try { fn(); } catch {} }
+  });
+  return (f) => { fn = f; };
+}
+
+// Protocol-neutral event stream for a turn: reasoning / text as they arrive,
+// then the tool calls the client has to execute, then done. When the SSE
+// upstream cannot be established, this degrades to the execute-sync path —
+// legal because nothing has been emitted yet at that point.
+let streamFallbacks = 0;
+async function* turnEvents(plan, { registerAbort } = {}) {
+  let started = false;
+  try {
+    for await (const ev of streamTurn(plan, { registerAbort })) { started = true; yield ev; }
+    return;
+  } catch (e) {
+    if (!(e instanceof StreamUnavailable) || started) throw e;
+    streamFallbacks++;
+    log(`stream unavailable (${e.message}) — degrading to execute-sync for this turn`);
+  }
+  const out = await runTurn(plan);
+  if (out.reasoning) yield { type: "reasoning", text: out.reasoning };
+  for (const piece of splitChunks(out.text)) yield { type: "text", text: piece };
+  yield { type: "tool_calls", calls: out.toolCalls };
+  yield { type: "done", usage: out.usage, text: out.text, reasoning: out.reasoning };
+}
+
+async function anthropicStream(res, { model, clientTools, plan, registerAbort }) {
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  const stopBeat = startHeartbeat(res, ": ping\n\n");
+  const w = (o) => writeSse(res, `data: ${JSON.stringify(o)}\n\n`);
+  w({ type: "message_start", message: { id: "msg_" + randomUUID(), type: "message", role: "assistant", model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } });
+  let index = -1, open = null, calls = [], usage = null, textLen = 0;
+  const closeBlock = () => { if (open) { w({ type: "content_block_stop", index }); open = null; } };
+  const openBlock = (kind, start) => {
+    if (open === kind) return;
+    closeBlock(); index++;
+    w({ type: "content_block_start", index, content_block: start });
+    open = kind;
+  };
+  try {
+    for await (const ev of turnEvents(plan, { registerAbort })) {
+      if (ev.type === "reasoning") {
+        openBlock("thinking", { type: "thinking", thinking: "" });
+        w({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: ev.text } });
+      } else if (ev.type === "text") {
+        openBlock("text", { type: "text", text: "" });
+        textLen += ev.text.length;
+        w({ type: "content_block_delta", index, delta: { type: "text_delta", text: ev.text } });
+      } else if (ev.type === "tool_calls") calls = ev.calls;
+      else if (ev.type === "done") usage = ev.usage;
+    }
+  } finally { stopBeat(); }
+  closeBlock();
+  if (index < 0 && !calls.length) {   // never leave the caller with zero blocks
+    index = 0;
+    w({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
+    w({ type: "content_block_stop", index });
+  }
+  for (const c0 of calls) {
+    const c = clientToolCall(c0, clientTools);
+    index++;
+    w({ type: "content_block_start", index, content_block: { type: "tool_use", id: c.id, name: c.name, input: {} } });
+    w({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(c.params) } });
+    w({ type: "content_block_stop", index });
+  }
+  const outTokens = usage?.output_tokens || Math.ceil(textLen / 4);
+  w({ type: "message_delta", delta: { stop_reason: calls.length ? "tool_use" : "end_turn" }, usage: { output_tokens: outTokens } });
+  w({ type: "message_stop" });
+  writeSse(res, "data: [DONE]\n\n");
+  res.end();
+}
+
+async function openaiStream(res, { model, clientTools, plan, registerAbort }) {
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+  const stopBeat = startHeartbeat(res, ": keep-alive\n\n");
+  sseChunk(res, model, "", "", { role: true });
+  let calls = [], usage = null, textLen = 0;
+  try {
+    for await (const ev of turnEvents(plan, { registerAbort })) {
+      if (ev.type === "reasoning") sseChunk(res, model, "", ev.text);
+      else if (ev.type === "text") { textLen += ev.text.length; sseChunk(res, model, ev.text, ""); }
+      else if (ev.type === "tool_calls") calls = ev.calls;
+      else if (ev.type === "done") usage = ev.usage;
+    }
+  } finally { stopBeat(); }
+  if (calls.length) sseChunk(res, model, "", "", { toolCalls: openaiToolCalls({ toolCalls: calls }, clientTools) });
+  const completion = usage?.output_tokens || Math.ceil(textLen / 4);
+  sseChunk(res, model, "", "", {
+    finish: true, finishReason: calls.length ? "tool_calls" : "stop",
+    usage: {
+      prompt_tokens: usage?.input_tokens || 0,
+      completion_tokens: completion,
+      total_tokens: (usage?.input_tokens || 0) + completion,
+    },
+  });
+  writeSse(res, "data: [DONE]\n\n");
+  res.end();
+}
+
 
 // Caller's declared tools -> Map(name -> Set(property names) | null). The
 // property set lets us drop upstream-only extras (e.g. Bash's prefix_rule /
@@ -585,6 +916,8 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         ok, service: "comate-relay", mode: "stateless",
+        upstream: "v2/execute (text/event-stream), execute-sync fallback",
+        stream_fallbacks: streamFallbacks,
         tool_loop: "conversation-continuation (bounded routing cache)",
         tool_routing_cached: toolRouting.size,
         credential: ok ? `ok (${user})` : "missing (Comate not logged in)",
@@ -611,40 +944,29 @@ const server = createServer(async (req, res) => {
       const msgs = normalizeAnthropicMessages(payload);
       const clientTools = clientToolIndex(payload.tools, "anthropic");
       const pending = extractPending(msgs);
-      const wantStream = !!payload.stream;
+      if (payload.stream) {
+        await anthropicStream(res, {
+          model, clientTools, registerAbort: bindAbort(res),
+          plan: await planTurn({ messages: msgs, modelKey: model, pending }),
+        });
+        return;
+      }
       const out = await comateChat({ messages: msgs, modelKey: model, pending });
       const outTokens = out.usage?.output_tokens || Math.ceil(out.text.length / 4);
       const stopReason = out.toolCalls.length ? "tool_use" : "end_turn";
-      if (wantStream) {
-        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-        res.write(`data: ${JSON.stringify({ type: "message_start", message: { id: "msg_" + randomUUID(), type: "message", role: "assistant", model, content: [] } })}\n\n`);
-        if (out.reasoning) res.write(`data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "thinking_delta", thinking: out.reasoning } })}\n\n`);
-        for (const piece of splitChunks(out.text)) {
-          res.write(`data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: piece } })}\n\n`);
-        }
-        out.toolCalls.forEach((c0, i) => {
-          const c = clientToolCall(c0, clientTools);
-          res.write(`data: ${JSON.stringify({ type: "content_block_start", index: i, content_block: { type: "tool_use", id: c.id, name: c.name, input: {} } })}\n\n`);
-          res.write(`data: ${JSON.stringify({ type: "content_block_delta", index: i, delta: { type: "input_json_delta", partial_json: JSON.stringify(c.params) } })}\n\n`);
-          res.write(`data: ${JSON.stringify({ type: "content_block_stop", index: i })}\n\n`);
-        });
-        res.write(`data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outTokens } })}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      } else {
-        const content = [];
-        if (out.text) content.push({ type: "text", text: out.text });
-        for (const c of clientToolCalls(out, clientTools)) {
-          content.push({ type: "tool_use", id: c.id, name: c.name, input: c.params });
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          id: "msg_" + randomUUID(), type: "message", role: "assistant", model,
-          content: content.length ? content : [{ type: "text", text: "" }],
-          stop_reason: stopReason,
-          usage: { input_tokens: out.usage?.input_tokens || 0, output_tokens: outTokens },
-        }));
+      const content = [];
+      if (out.reasoning) content.push({ type: "thinking", thinking: out.reasoning, signature: "" });
+      if (out.text) content.push({ type: "text", text: out.text });
+      for (const c of clientToolCalls(out, clientTools)) {
+        content.push({ type: "tool_use", id: c.id, name: c.name, input: c.params });
       }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "msg_" + randomUUID(), type: "message", role: "assistant", model,
+        content: content.length ? content : [{ type: "text", text: "" }],
+        stop_reason: stopReason,
+        usage: { input_tokens: out.usage?.input_tokens || 0, output_tokens: outTokens },
+      }));
       return;
     }
 
@@ -653,31 +975,29 @@ const server = createServer(async (req, res) => {
       const msgs = normalizeOpenAIMessages(payload.messages);
       const clientTools = clientToolIndex(payload.tools, "openai");
       const pending = extractPending(msgs);
-      const wantStream = !!payload.stream;
+      if (payload.stream) {
+        await openaiStream(res, {
+          model, clientTools, registerAbort: bindAbort(res),
+          plan: await planTurn({ messages: msgs, modelKey: model, pending }),
+        });
+        return;
+      }
       const out = await comateChat({ messages: msgs, modelKey: model, pending });
       const usage = {
         prompt_tokens: out.usage?.input_tokens || 0,
         completion_tokens: out.usage?.output_tokens || Math.ceil(out.text.length / 4),
         total_tokens: (out.usage?.input_tokens || 0) + (out.usage?.output_tokens || Math.ceil(out.text.length / 4)),
       };
-      if (wantStream) {
-        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-        for (const piece of splitChunks(out.text)) sseChunk(res, model, piece, "");
-        if (out.toolCalls.length) sseChunk(res, model, "", "", { toolCalls: openaiToolCalls(out, clientTools) });
-        sseChunk(res, model, "", "", { finish: true, finishReason: out.toolCalls.length ? "tool_calls" : "stop", usage });
-        res.write("data: [DONE]\n\n");
-        res.end();
-      } else {
-        const message = { role: "assistant", content: out.text || (out.toolCalls.length ? null : "") };
-        if (out.toolCalls.length) message.tool_calls = openaiToolCalls(out, clientTools).map(({ index, ...c }) => c);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          id: "chatcmpl-" + randomUUID(), object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
-          choices: [{ index: 0, message, finish_reason: out.toolCalls.length ? "tool_calls" : "stop" }],
-          usage,
-          comate: { mode: "stateless" },
-        }));
-      }
+      const message = { role: "assistant", content: out.text || (out.toolCalls.length ? null : "") };
+      if (out.reasoning) message.reasoning_content = out.reasoning;
+      if (out.toolCalls.length) message.tool_calls = openaiToolCalls(out, clientTools).map(({ index, ...c }) => c);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-" + randomUUID(), object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
+        choices: [{ index: 0, message, finish_reason: out.toolCalls.length ? "tool_calls" : "stop" }],
+        usage,
+        comate: { mode: "stateless" },
+      }));
       return;
     }
 
@@ -685,7 +1005,17 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify({ error: { message: `no route ${p}` } }));
   } catch (e) {
     log("error:", e.message);
-    res.writeHead(502, { "Content-Type": "application/json" });
+    // Upstream refusals keep their meaning: an exhausted account is a 402 to
+    // the caller, not an opaque 502 (the console's 401/402/406 cheat-sheet).
+    const status = /quota|额度|积分|QUOTA_EXCEED/i.test(e.message) ? 402
+      : /license|login-name|unauthor|forbidden|credential/i.test(e.message) ? 401 : 502;
+    if (res.headersSent) {
+      // Streaming already started: end it in a shape the client can parse.
+      if (p.includes("chat/completions")) writeSse(res, `data: ${JSON.stringify({ error: { message: `comate-relay: ${e.message}` } })}\n\ndata: [DONE]\n\n`);
+      try { res.end(); } catch {}
+      return;
+    }
+    res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: `comate-relay: ${e.message}` } }));
   }
 });
@@ -704,6 +1034,8 @@ if (LISTEN) server.listen(PORT, HOST, () => {
 export {
   server, TOOL_ALIASES, INTERNAL_TOOL_NAMES, canonicalToolName, mergeToolParams,
   toolRouting, rememberToolRouting, lookupToolRouting, forgetToolRouting,
-  reduceFrames, extractPending, flattenQuery, normalizeOpenAIMessages, normalizeAnthropicMessages,
-  clientToolIndex, toolNameForClient, clientToolCalls, openaiToolCalls,
+  reduceFrames, applyFrame, newTurnState, detailOf, extractPending, flattenQuery,
+  normalizeOpenAIMessages, normalizeAnthropicMessages, buildExecuteBody, splitCalls, internalAnswers,
+  clientToolIndex, toolNameForClient, clientToolCall, clientToolCalls, openaiToolCalls,
+  parseSseFrames, StreamUnavailable,
 };
