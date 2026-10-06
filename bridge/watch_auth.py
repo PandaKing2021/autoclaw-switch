@@ -12,10 +12,16 @@ import time
 from pathlib import Path
 
 APPDATA = Path(os.environ["APPDATA"])
-SRC = APPDATA / "AutoClaw-official"
 OUT = Path.home() / ".autoclaw-relay" / "auth-compat"
 STATE_DIR = Path.home() / ".openclaw-autoclaw"
 HERE = Path(__file__).resolve().parent
+# 双安装源：国内官方版(AutoClaw-official→CN 线) + 国际 2.x 版(AutoClaw-oversea-official→海外线)。
+# 每个源带自己的 lane 与输出文件，谁登录了就同步谁（互不覆盖）。
+SOURCES = [
+    (APPDATA / "AutoClaw-official", "cn", OUT / "auth-cn.json"),
+    (APPDATA / "AutoClaw-oversea-official", "oversea", OUT / "auth-oversea.json"),
+]
+SRC = SOURCES[0][0]  # 兼容旧引用
 
 sys.argv = ["x"]
 import importlib.util
@@ -28,41 +34,40 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 def sync():
-    key = m._os_crypt_key(SRC)
-    for acc_dir in (SRC / "accounts").iterdir():
-        enc = acc_dir / "account-credentials.enc"
-        if not enc.is_file():
+    any_ok = False
+    for src_dir, lane, out_file in SOURCES:
+        if not (src_dir / "Local State").is_file():
             continue
-        blob = enc.read_bytes()
-        if blob[:3] != b"v10":
+        key = m._os_crypt_key(src_dir)
+        acc_root = src_dir / "accounts"
+        if not acc_root.is_dir():
             continue
-        plain = AESGCM(key).decrypt(blob[3:15], blob[15:], None)
-        cred = json.loads(plain.decode("utf-8"))
-        prof_p = acc_dir / "account-profile.json"
-        prof = json.loads(prof_p.read_text(encoding="utf-8")).get("profile", {}) if prof_p.is_file() else {}
-        auth = {
-            "token": cred.get("accessToken"),
-            "refreshToken": cred.get("refreshToken"),
-            "deviceId": cred.get("deviceId") or "",
-            "userInfo": {
-                "user_id": cred.get("userId") or prof.get("numericUserId"),
-                "user_name": cred.get("nickname") or prof.get("displayName"),
-                "email": cred.get("email") or prof.get("email") or "",
-            },
-        }
-        OUT.mkdir(parents=True, exist_ok=True)
-        (OUT / "auth.json").write_text(json.dumps(auth, ensure_ascii=False, indent=2), encoding="utf-8")
-        (OUT / "Local State").write_bytes((SRC / "Local State").read_bytes())
-        (OUT / "channel.json").write_bytes((SRC / "channel.json").read_bytes())
-        # 同步 relay 凭证（relay 每请求重读，写完即生效）
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tok = auth["token"]
-        tok = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
-        (STATE_DIR / "request-headers.json").write_text(
-            json.dumps({"headers": {"X-Authorization": tok, "X-Client-Type": "pc"}}, ensure_ascii=False, indent=2),
-            encoding="utf-8")
-        return True
-    return False
+        for acc_dir in acc_root.iterdir():
+            enc = acc_dir / "account-credentials.enc"
+            if not enc.is_file():
+                continue
+            blob = enc.read_bytes()
+            if blob[:3] != b"v10":
+                continue
+            plain = AESGCM(key).decrypt(blob[3:15], blob[15:], None)
+            cred = json.loads(plain.decode("utf-8"))
+            prof_p = acc_dir / "account-profile.json"
+            prof = json.loads(prof_p.read_text(encoding="utf-8")).get("profile", {}) if prof_p.is_file() else {}
+            auth = {
+                "lane": lane,
+                "token": cred.get("accessToken"),
+                "refreshToken": cred.get("refreshToken"),
+                "deviceId": cred.get("deviceId") or "",
+                "userInfo": {
+                    "user_id": cred.get("userId") or prof.get("numericUserId"),
+                    "user_name": cred.get("nickname") or prof.get("displayName"),
+                    "email": cred.get("email") or prof.get("email") or "",
+                },
+            }
+            OUT.mkdir(parents=True, exist_ok=True)
+            out_file.write_text(json.dumps(auth, ensure_ascii=False, indent=2), encoding="utf-8")
+            any_ok = True
+    return any_ok
 
 
 def fingerprint():

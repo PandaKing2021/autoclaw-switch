@@ -1037,12 +1037,16 @@ function readPool() {
     // 1.x 形状写到 auth-compat/auth.json（跟随客户端轮换自动刷新，写完即生效）。
     // 该文件缺失 = 没装 2.x 客户端/没跑同步器，静默跳过，海外线不受影响。
     try {
-      const cj = JSON.parse(fs.readFileSync(CN_POOL_FILE, "utf8"));
-      const uid = String(cj.userInfo?.user_id || cj.deviceId || "cn-local");
-      if (cj.token && uid && uid !== "cn-local") {
+      // 双源：auth-cn.json（国内版 2.x）→ lane=cn；auth-oversea.json（国际 2.x）→ lane=oversea。
+      // 旧格式单文件 auth.json（无 lane 字段）按 cn 兼容。
+      for (const f of ["auth-cn.json", "auth-oversea.json", "auth.json"]) {
+      const cj = JSON.parse(fs.readFileSync(path.join(path.dirname(CN_POOL_FILE), f), "utf8"));
+      const lane = cj.lane === "oversea" ? "oversea" : "cn";
+      const uid = String(cj.userInfo?.user_id || cj.deviceId || lane + "-local");
+      if (cj.token && uid && !uid.endsWith("-local")) {
         const existed = pool.accounts.find((a) => a.uid === uid);
         const entry = {
-          uid, lane: "cn",
+          uid, lane,
           name: `[CN]${cj.userInfo?.user_name || cj.userInfo?.nickname || uid.slice(0, 8)}`,
           auth: String(cj.token).toLowerCase().startsWith("bearer ") ? cj.token : `Bearer ${cj.token}`,
           refresh_token: cj.refreshToken || "",
@@ -1051,6 +1055,7 @@ function readPool() {
         };
         if (existed) Object.assign(existed, entry);
         else pool.accounts.push(entry);
+      }
       }
     } catch { /* 没有国内凭证源：纯海外池，正常 */ }
     pool.mtime = st.mtimeMs;
