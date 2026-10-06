@@ -25,3 +25,7 @@ app/node_modules/
 relay_outbound.json
 selftest-result.txt
 app/*.png
+qoder/accounts/
+qoder/*.pyc
+qoder/__pycache__/
+qoder/usage/

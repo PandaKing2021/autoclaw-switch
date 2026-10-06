@@ -2,7 +2,7 @@
 
 [中文](README.md) · [English](README.en.md) · [1.x 单账号工具发布页](../../releases/latest)
 
-**这个项目做一件事：把四个 AI 客户端的内置额度，变成你本地 IDE 里可以直接选用的模型。**
+**这个项目做一件事：把七个 AI 客户端/平台的内置额度，变成你本地 IDE 里可以直接选用的模型。**
 
 | 平台 | 额度来源 | 接入方式 | 协议 | 端口 | 模型数* | 工具调用 |
 |---|---|---|---|---|---|---|
@@ -10,10 +10,13 @@
 | **WorkBuddy**（腾讯 CodeBuddy） | Free 档每月 100 + 每日 30 积分 | 本地 Go 网关（wb2api） | openai | 7863 | 46 | ✅ 透传 |
 | **Trae SOLO CN**（字节） | 免费会话额度 | 离线解密客户端凭证 → 驱动其远端 agent 会话 | openai + anthropic | 18768 | 27 | ❌ 仅文本 |
 | **豆包工作**（字节 DoubaoWork） | 客户端内置额度 | CDP 取登录 cookie → 直连 `/chat/completion` | openai（+anthropic） | 18770 | 2（合成） | ❌ 仅文本 |
+| **Comate 文心快码**（百度） | Comate IDE 内置额度 | 读 settings.json 里的 license → 驱动其云端 agent 三步链 | openai（+anthropic） | 18774 | 15 | ❌ 仅文本 |
+| **Qoder CN**（阿里） | 客户端内置额度（Free 档 Qwen3.8 系可用） | vendored 社区网关（COSY 签名）+ 本机凭证入池 | openai | 8791 | 14 | ✅ 透传 |
+| **千问办公**（QoderWork CN） | 同 Qoder 平台，独立网关 | 同 COSY 体系（见千问办公一节，chat 链路收尾中） | openai | 8791 | 3* | ❌ 仅文本 |
 
 \* 模型目录随账号动态拉取，表中为 2026-10 本机实测值；豆包的目录在服务端且不可枚举，网关只能给出两个合成条目。
 
-所有组件都跑在 `127.0.0.1`，凭证不离开你的电脑；四个平台在 ZCode 里是四个并列供应商（`autoclaw-glm-provider` / `workbuddy-openai-provider` / `trae-openai-provider` / `doubao-openai-provider`），模型名不冲突，同一个会话里可以自由切换。
+所有组件都跑在 `127.0.0.1`，凭证不离开你的电脑；七个平台在 ZCode 里是并列供应商（`autoclaw-glm-provider` / `workbuddy-openai-provider` / `trae-openai-provider` / `doubao-openai-provider` / `comate-openai-provider` / `qoder-openai-provider`），模型名不冲突，同一个会话里可以自由切换。
 
 ## 这是什么 / 不是什么
 
@@ -166,6 +169,26 @@ plaintext = sha512(body)(64) || body        # PKCS7 填充，头部哈希用于�
 - **注意**：反代的调用会真实出现在你本机的豆包工作会话列表里（就是那个固定会话）。不想要痕迹就在客户端里另建一个专用会话，再用 `POST /admin/conversation` 指过去。
 - **工具调用不支持**（与 Trae 同为仅文本），`tools` 字段会被忽略而不是报错。
 
+### Comate 文心快码：settings.json 里的 license + 云端 agent 三步链
+
+Comate（`D:\Comate`，VS Code fork v1.108）是「扩展 → 本地内核（comate-engine）→ 云端 agent」三层架构，真正的对话发生在百度服务端的 agent 沙箱里。`comate/relay.mjs` 复刻的是内核到云端那一段：
+
+- **凭证出乎意料地明文**：IDE 登录后把真正的 license（UUID 形）写进 `%APPDATA%\Comate\User\settings.json` 的 `baidu.comate.license`，用户名在 `baidu.comate.username`。注意 globalStorage 里那枚 32 位 hex 的 `comate_login_ID` **不是**有效 license（`GET /api/key/valid/{id}` 会明确拒绝），别走 DPAPI/AES-GCM 解密那条弯路（那是早期探路的死胡同，过程见 comate/decrypt_auth.py 的注释）。
+- **三步链路**：`POST /api/aidevops/autocomate/rest/autowork/v2/conversation`（建会话，返回 `data.id`）→ `POST …/v2/task`（建任务，body 必须带 `agentInfo`，否则 400"conversationId and agentInfo can not null"，返回 `data.taskId`）→ `POST …/v2/execute-sync`（带着真实 id 执行）。**execute-sync 必须用真实 conversationId/taskId**：官方 CLI 用 `-1/-1` 占位会被 OpenRASP 以"无法操作其它账户创建的会话"403 拦下。
+- **传输指纹有 WAF**：python-urllib 的 TLS 指纹会被 406 拒掉（与 AutoClaw 2.x 的 undici 拦截同款坑）；用 node:https + axios 同款头（`User-Agent: axios/1.16.1`、带 br 的 Accept-Encoding）即可通过。
+- **响应是一帧数组**：execute-sync（同步）返回 `{"frames":[...]}`，每帧是 JSON 字符串；ANSWER 帧的 `detail.delta` 拼出正文、`reasoningDelta` 是思考增量、末帧 `end:true`，另有一帧 `TOKEN_USAGE` 带用量。relay 在本地把这些拼好再按 OpenAI/Anthropic 的 SSE 语义回放。
+- **无状态**：每请求新建 conversation+task，调用方带来的完整历史拍平成 `[System instructions]/[User]/[Assistant]` 转录塞进 `query`；上游的 agent 自己决定是否用它的内置工具，调用方的 `tools` 不透传（与 Trae 同类）。
+- **模型目录**：`POST /api/v2/api/models/available`（body 里 username/key 都填 license），15 个模型、id 带官方后缀（如 `glm-5.3_37c550fc…`），modelKey 直接用该 id（实测 `auto` 之外的真实模型 key 同样可用）。
+
+### Qoder CN / 千问办公：COSY 签名（vendored 社区网关）
+
+Qoder CN（`D:\Qoder CN`，`com.qodercn.app.stable`）与千问办公（QwenWork CN，`D:\QwenWorkCN`）同属阿里的 Qoder 平台，上游是 **COSY 签名体系**：RSA 包裹 AES 会话密钥 + MD5 请求签名 + 自定义 Base64 请求体编码（qoder_encode）。这一条我们没有自研——vendored 了社区的 [qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（MIT，纯标准库 Python，`qoder/` 目录；本地补丁：新增 qworkcn 区域、chat/models 前缀分离），以 `qoder/qoder_proxy.py --port 8791` 长驻运行：
+
+- **凭证入池**：桌面 App 的 `%APPDATA%\com.qodercn.app.stable\auth.v1.dat`（v10+AES-GCM，密钥在 Local State）；千问办公是 `%APPDATA%\QwenWorkCN\auth-v2.dat`（schemaVersion=2，Ory JWT + `ory_rt_` 刷新令牌）。控制台「同步账号」= 面板登录（默认密码 admin，仅回环）+ `/accounts/import/desktop` 两步确认。
+- **Qoder CN 全链路已通**：模型目录动态跟随官方（`/algo/api/v2/model/list`，GET 也要带同款签名 body 否则 403），对话走 `POST {gateway}/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`，**tools 透传已实测**（finish_reason:tool_calls）。Free 档只有 Qwen3.8-Max/Flash 计 0 credits，其余模型上游 403 code 112（要付费套餐），网关的 `/v1/models` 会带 `enabled` 标志，注册时过滤。
+- **千问办公（收尾中）**：网关独立（`gateway.qwenwork.cn`）、模型列表路径无 `/algo` 前缀而 chat 路径**带** `/algo`（CLI 日志 + 二进制字符串实证）；凭证解密、COSY 签名、模型目录（flash/pro/qwen3.8-max-preview 三档，1M 上下文）全部打通，但 chat 的业务层对「非 host 铸造的令牌」返回 503 `Model catalog unavailable`——jobToken 由客户端内 `qoder-auth-wasm` 现签、绑定会话，直接用 auth-v2.dat 的 Ory JWT 会被业务层拒绝。收尾方向：worker 运行时（`qoder-worker-runtime.obf.mjs`，undici 传输）的 dispatcher 级 hook，或复刻 wasm 的令牌铸造。
+- **账号池与签到**：网关自带多账号轮询、设备指纹派生（同号固定同虚拟设备）、每日签到/活动领取（官方幂等）。账号池文件在 `~/.qoder-relay/accounts/`（控制台启动时以 `--accounts-dir` 指定），**不入库**。
+
 ## ZCode 供应商注册：写入安全边界（重要）
 
 `~/.zcode/v2/provider_config.json` 是 **ZCode 自己的配置文件**，控制台只被允许增量修改自己注册的三个供应商。历史上这里踩过两次同一个根因的坑：写入非法的 `api.type`（把内部 kind `openai-compatible` 当成合法值，导致整个供应商加载失败），以及"规范化成我认识的集合"把别人的条目删掉（丢掉必填的 `manualProviderModelRules`；又把 AutoClaw 目录削成 4 个模型）。现在的规则写死在 `app/zcode-config.js` 里：
@@ -209,6 +232,18 @@ curl http://127.0.0.1:18770/health        # cookie 健康度、固定会话、�
 curl -X POST http://127.0.0.1:18770/v1/chat/completions \
   -H 'Content-Type: application/json' -H 'Authorization: Bearer doubao-local-key' \
   --data-binary @req.json                  # {"model":"doubao","messages":[...]}，中文务必走文件
+
+# Comate 网关（:18774，openai，另有 /v1/messages）
+node comate/relay.mjs &
+curl http://127.0.0.1:18774/health        # 登录态（Comate IDE settings.json 的 license）、模式（stateless）
+curl -X POST http://127.0.0.1:18774/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"reply OK"}]}'
+
+# Qoder CN 网关（:8791，openai；需 Python 3.9+）
+python qoder/qoder_proxy.py --port 8791 --accounts-dir ~/.qoder-relay/accounts &
+curl http://127.0.0.1:8791/health         # 账号池数量、当前区域
+curl http://127.0.0.1:8791/v1/models      # enabled=false 的项是付费墙模型，Free 账号调用会 403
 ```
 
 回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）。注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
@@ -233,6 +268,10 @@ curl -X POST http://127.0.0.1:18770/v1/chat/completions \
 **Trae 的固有限制**：工具调用不透传（agent 自行决定，OpenAI 的 `tools` 字段被忽略，模型只回文本）；每轮固定开销约 17.6k prompt token（Trae 自己的 agent system prompt），短问答不划算，更适合长任务、长上下文场景。
 
 **豆包的固有限制**：同样不支持工具调用；模型目录只有两个合成条目（服务端不可枚举）；请求内容会留在本机豆包工作的固定会话里。
+
+**Comate 的固有限制**：不支持工具透传（云端 agent 自己决定工具）；每轮 8-40 秒的三步链延迟；上游 agent 的自我认知是它自己的系统提示词（自称 Cursor 系助手），不是 ZCode。
+
+**Qoder 的固有限制**：Free 账号多数模型在付费墙后（`/v1/models` 里 `enabled:false`，注册时已过滤）；千问办公（qworkcn）的 chat 链路在收尾中（目录与鉴权已通，见上文）。
 
 ## 目录结构
 
@@ -263,6 +302,14 @@ autoclaw-to-zcode/                 ← 工作区根目录
 │   ├── probe.mjs / im.mjs / raw.mjs        协议探针（SSE 事件、IM cmd 协议、任意端点）
 │   ├── test-relay.mjs / test-zcode-shape.mjs  回归测试
 │   └── t-*.mjs                    协议实验脚本（会话、ACK、多轮、深思考对照）
+├── comate/                        ← Comate（文心快码）反代
+│   ├── relay.mjs                  ★ 网关本体（openai + anthropic，license 凭证 + 云端 agent 三步链 + 无状态）
+│   └── decrypt_auth.py            凭证读取（settings.json 的 license；附早期 DPAPI 弯路记录）
+├── qoder/                         ← Qoder CN / 千问办公网关（vendored qoder2api-hub + 本地补丁）
+│   ├── qoder_proxy.py             ★ 网关本体（纯标准库 Python；COSY 签名、账号池、看板）
+│   ├── qoder_sign.py              COSY 签名/加解密（RSA+AES+MD5+qoder_encode，纯 Python）
+│   ├── qoder_accounts.py          账号池/桌面凭证入池/OAuth 设备流（qworkcn 区为本地补丁）
+│   └── qoder_catalog_qworkcn.json 千问办公模型目录快照（本地新增）
 ├── autoclaw-switch/               ← A-SWITCH 1.x（上游：多账号管理 + 暖号 + 老版反代）
 │   ├── a_switch.py                后端：账号管理、签到、DPAPI 解密、一键反代、暖号
 │   ├── a_switch_app.py            GUI（pywebview）
@@ -271,7 +318,7 @@ autoclaw-to-zcode/                 ← 工作区根目录
 └── TEST_REPORT.md                 完整测试报告（根因分析、实验记录、证据链）
 ```
 
-运行时数据（自动生成，均带敏感信息，不入库）：`~/.autoclaw-relay/`（部署的反代、persona、日志）、`~/.openclaw-autoclaw/`（凭证源）、`~/.trae-relay/`（Trae 日志与会话转储）、`~/.doubao-relay/`（豆包 cookie、固定会话、日志）、`~/.zcode/v2/provider_config.json`（ZCode 注册，备份为 `.bak-autoclaw`）。
+运行时数据（自动生成，均带敏感信息，不入库）：`~/.autoclaw-relay/`（部署的反代、persona、日志）、`~/.openclaw-autoclaw/`（凭证源）、`~/.trae-relay/`（Trae 日志与会话转储）、`~/.doubao-relay/`（豆包 cookie、固定会话、日志）、`~/.comate-relay/`（Comate 日志与设备指纹）、`~/.qoder-relay/`（Qoder 账号池与网关日志，含真实令牌，绝不外传）、`~/.zcode/v2/provider_config.json`（ZCode 注册，备份为 `.bak-autoclaw`）。
 
 ## 免责声明
 

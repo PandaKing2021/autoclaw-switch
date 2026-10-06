@@ -111,6 +111,45 @@
         <div id="doubao-smoke-result" class="note"></div>
       </div>
 
+      <!-- Comate（文心快码） -->
+      <div class="card">
+        <div class="card-head"><h2>Comate 文心快码</h2><span id="comate-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>网关状态</label><span id="comate-status">-</span></div>
+          <div><label>登录态</label><span id="comate-cred">-</span></div>
+          <div><label>模式</label><span id="comate-mode">-</span></div>
+          <div><label>监听</label><span class="mono">127.0.0.1:18774 · openai + anthropic</span></div>
+        </div>
+        <div class="sec">模型目录（<span id="comate-model-count">-</span> 个，随官方目录动态拉取）</div>
+        <div class="models" id="comate-models"></div>
+        <div class="btns">
+          <button id="btn-comate-start" class="btn ok">启动</button>
+          <button id="btn-comate-stop" class="btn danger">停止</button>
+          <button id="btn-comate-smoke" class="btn">连通性测试</button>
+        </div>
+        <div id="comate-smoke-result" class="note"></div>
+      </div>
+
+      <!-- Qoder CN（含千问办公账号池） -->
+      <div class="card">
+        <div class="card-head"><h2>Qoder CN</h2><span id="qoder-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>网关状态</label><span id="qoder-status">-</span></div>
+          <div><label>账号池</label><span id="qoder-accounts">-</span></div>
+          <div><label>当前区域</label><span id="qoder-realm">-</span></div>
+          <div><label>监听</label><span class="mono">127.0.0.1:8791 · openai · COSY 签名</span></div>
+        </div>
+        <div class="sec">模型目录（<span id="qoder-model-count">-</span> 个，仅显示账号可用项）</div>
+        <div class="models" id="qoder-models"></div>
+        <div class="btns">
+          <button id="btn-qoder-start" class="btn ok">启动</button>
+          <button id="btn-qoder-stop" class="btn danger">停止</button>
+          <button id="btn-qoder-smoke" class="btn">连通性测试</button>
+          <button id="btn-qoder-sync" class="btn">同步账号</button>
+        </div>
+        <div id="qoder-smoke-result" class="note"></div>
+      </div>
+
     </section>
 
     <section class="grid">
@@ -123,6 +162,8 @@
           <div><label>WorkBuddy（openai）</label><span class="mono">:7863 · <span id="zcode-wb-count">-</span> 模型</span></div>
           <div><label>Trae（openai）</label><span class="mono">:18768 · <span id="zcode-trae-count">-</span> 模型</span></div>
           <div><label>豆包工作（openai）</label><span class="mono">:18770 · <span id="zcode-doubao-count">-</span> 模型</span></div>
+          <div><label>Comate（openai）</label><span class="mono">:18774 · <span id="zcode-comate-count">-</span> 模型</span></div>
+          <div><label>Qoder CN（openai）</label><span class="mono">:8791 · <span id="zcode-qoder-count">-</span> 模型</span></div>
           <div><label>生效方式</label><span>注册后重启 ZCode</span></div>
         </div>
         <div class="sec">ZCode 侧模型清单</div>
@@ -147,6 +188,8 @@
           <button class="tab" data-log="workbuddy">WorkBuddy</button>
           <button class="tab" data-log="trae">Trae</button>
           <button class="tab" data-log="doubao">豆包工作</button>
+          <button class="tab" data-log="comate">Comate</button>
+          <button class="tab" data-log="qoder">Qoder</button>
           <button class="tab" data-log="console">控制台</button>
           <label class="auto"><input type="checkbox" id="autorefresh" checked /> 自动刷新</label>
         </div>

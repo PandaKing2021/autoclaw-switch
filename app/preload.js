@@ -24,5 +24,12 @@ contextBridge.exposeInMainWorld("api", {
   doubaoStop: () => ipcRenderer.invoke("doubao:stop"),
   doubaoSmoke: () => ipcRenderer.invoke("doubao:smoke"),
   doubaoSyncCookies: (opts) => ipcRenderer.invoke("doubao:sync-cookies", opts),
+  comateStart: () => ipcRenderer.invoke("comate:start"),
+  comateStop: () => ipcRenderer.invoke("comate:stop"),
+  comateSmoke: () => ipcRenderer.invoke("comate:smoke"),
+  qoderStart: () => ipcRenderer.invoke("qoder:start"),
+  qoderStop: () => ipcRenderer.invoke("qoder:stop"),
+  qoderSmoke: () => ipcRenderer.invoke("qoder:smoke"),
+  qoderSyncAccounts: () => ipcRenderer.invoke("qoder:sync-accounts"),
   tailLog: (which) => ipcRenderer.invoke("logs:tail", which),
 });

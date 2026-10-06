@@ -71,6 +71,22 @@ async function refreshStatus() {
     $("doubao-model-count").textContent = dbModels.length || "-";
     $("doubao-models").innerHTML = dbModels.map((m) => `<span>${m}</span>`).join("");
 
+    // Comate（登录态 = IDE settings.json 的 license，relay 运行时自读）
+    const cm = s.comate || { running: false, ok: false };
+    setPill("comate-pill", cm.running && cm.ok ? "ok" : cm.running ? "warn" : "err",
+      cm.running && cm.ok ? "运行中" : cm.running ? "登录态缺失" : "已停止");
+    $("comate-status").textContent = cm.ok ? "ok" : cm.running ? "未登录 Comate IDE" : "未运行";
+    $("comate-cred").textContent = cm.credential || "-";
+    $("comate-mode").textContent = cm.running ? (cm.mode === "stateless" ? "无状态（每请求新建会话）" : cm.mode || "-") : "-";
+
+    // Qoder CN（账号池来自桌面凭证导入）
+    const qd = s.qoder || { running: false, ok: false };
+    setPill("qoder-pill", qd.running && qd.ok ? "ok" : qd.running ? "warn" : "err",
+      qd.running && qd.ok ? "运行中" : qd.running ? "账号池为空" : "已停止");
+    $("qoder-status").textContent = qd.ok ? "ok" : qd.running ? "待同步账号" : "未运行";
+    $("qoder-accounts").textContent = qd.running ? String(qd.accounts ?? "-") : "-";
+    $("qoder-realm").textContent = qd.realm || "-";
+
     // token / credential（并入 AutoClaw 卡）
     $("token-exp").textContent = fmtExp(s.token.exp);
     $("credential").textContent = s.credential || "-";
@@ -88,10 +104,12 @@ async function refreshStatus() {
     $("zcode-wb-count").textContent = zc.wbModels != null ? zc.wbModels : "-";
     $("zcode-trae-count").textContent = zc.traeModels != null ? zc.traeModels : "-";
     $("zcode-doubao-count").textContent = zc.doubaoModels != null ? zc.doubaoModels : "-";
+    $("zcode-comate-count").textContent = zc.comateModels != null ? zc.comateModels : "-";
+    $("zcode-qoder-count").textContent = zc.qoderModels != null ? zc.qoderModels : "-";
 
 
     // overall
-    updateBootNote({ relay: !!s.relay.running, workbuddy: !!s.workbuddy.running, trae: !!tr.running, doubao: !!db.running, watcher: !!s.watcher.running });
+    updateBootNote({ relay: !!s.relay.running, workbuddy: !!s.workbuddy.running, trae: !!tr.running, doubao: !!db.running, comate: !!cm.running, qoder: !!qd.running, watcher: !!s.watcher.running });
     const msLeft2 = s.token.exp * 1000 - Date.now();
     const all = relayOk && zcOk && msLeft2 > 6 * 3600000;
     setPill("overall", all ? "ok" : "warn", all ? "链路正常" : "部分异常");
@@ -207,6 +225,43 @@ $("btn-doubao-restart").onclick = async () => {
   } catch (e) { $("doubao-smoke-result").textContent = "❌ 异常：" + e.message; }
   btn.disabled = false; refreshStatus();
 };
+$("btn-comate-start").onclick = async () => { $("btn-comate-start").disabled = true; await window.api.comateStart(); $("btn-comate-start").disabled = false; refreshStatus(); };
+$("btn-comate-stop").onclick = async () => { $("btn-comate-stop").disabled = true; await window.api.comateStop(); $("btn-comate-stop").disabled = false; refreshStatus(); };
+$("btn-comate-smoke").onclick = async () => {
+  const btn = $("btn-comate-smoke"); btn.disabled = true;
+  $("comate-smoke-result").textContent = "测试中（Comate 走云端 agent 三步链，通常 10-40 秒）…";
+  try {
+    const r = await window.api.comateSmoke();
+    $("comate-smoke-result").textContent = r.ok
+      ? `✅ 连通正常（${r.status}）${r.model} 回复：${r.reply}`
+      : `❌ 失败（${r.status || "-"}）：${r.reply || r.error || "无响应"}`;
+  } catch (e) { $("comate-smoke-result").textContent = "❌ 异常：" + e.message; }
+  btn.disabled = false; refreshStatus();
+};
+$("btn-qoder-start").onclick = async () => { $("btn-qoder-start").disabled = true; await window.api.qoderStart(); $("btn-qoder-start").disabled = false; refreshStatus(); };
+$("btn-qoder-stop").onclick = async () => { $("btn-qoder-stop").disabled = true; await window.api.qoderStop(); $("btn-qoder-stop").disabled = false; refreshStatus(); };
+$("btn-qoder-smoke").onclick = async () => {
+  const btn = $("btn-qoder-smoke"); btn.disabled = true;
+  $("qoder-smoke-result").textContent = "测试中（COSY 签名链路，通常 3-15 秒）…";
+  try {
+    const r = await window.api.qoderSmoke();
+    $("qoder-smoke-result").textContent = r.ok
+      ? `✅ 连通正常（${r.status}）${r.model} 回复：${r.reply}`
+      : `❌ 失败（${r.status || "-"}）：${r.reply || r.error || "无响应"}`;
+  } catch (e) { $("qoder-smoke-result").textContent = "❌ 异常：" + e.message; }
+  btn.disabled = false; refreshStatus();
+};
+$("btn-qoder-sync").onclick = async () => {
+  const btn = $("btn-qoder-sync"); btn.disabled = true;
+  $("qoder-smoke-result").textContent = "扫描本机 Qoder/千问办公登录态并导入账号池…";
+  try {
+    const r = await window.api.qoderSyncAccounts();
+    $("qoder-smoke-result").textContent = r.ok
+      ? `✅ 已导入：${(r.imported || []).join("、")}`
+      : "❌ " + (r.error || "未发现可导入的凭证");
+  } catch (e) { $("qoder-smoke-result").textContent = "❌ 异常：" + e.message; }
+  btn.disabled = false; refreshStatus();
+};
 $("btn-register").onclick = async () => {
   const btn = $("btn-register"); btn.disabled = true;
   $("register-note").textContent = "注册中…";
@@ -216,6 +271,8 @@ $("btn-register").onclick = async () => {
     if (r.workbuddy) note += r.workbuddy.registered ? ` · WorkBuddy：已写入 ${r.workbuddy.models.length} 个模型` : ` · WorkBuddy 未同步：${r.workbuddy.error}`;
     if (r.trae) note += r.trae.registered ? ` · Trae：已写入 ${r.trae.models.length} 个模型` : ` · Trae 未同步：${r.trae.error}`;
     if (r.doubao) note += r.doubao.registered ? ` · 豆包工作：已写入 ${r.doubao.models.length} 个模型` : ` · 豆包工作未同步：${r.doubao.error}`;
+    if (r.comate) note += r.comate.registered ? ` · Comate：已写入 ${r.comate.models.length} 个模型` : ` · Comate 未同步：${r.comate.error}`;
+    if (r.qoder) note += r.qoder.registered ? ` · Qoder：已写入 ${r.qoder.models.length} 个模型` : ` · Qoder 未同步：${r.qoder.error}`;
     if (r.backup) note += ` · 备份 ${r.backup}`;
     if (r.registerError) note += `\n⚠️ 写入被闸门拦下，配置未改动：${r.registerError}`;
     $("register-note").textContent = note;
@@ -244,7 +301,7 @@ function setBootNote(text) {
   el.style.display = text ? "block" : "none";
 }
 function updateBootNote(svc) {
-  const names = { relay: "AutoClaw relay", workbuddy: "WorkBuddy 网关", trae: "Trae 网关", doubao: "豆包工作网关", watcher: "凭证同步器" };
+  const names = { relay: "AutoClaw relay", workbuddy: "WorkBuddy 网关", trae: "Trae 网关", doubao: "豆包工作网关", comate: "Comate 网关", qoder: "Qoder 网关", watcher: "凭证同步器" };
   const down = Object.keys(names).filter((k) => !svc[k]);
   if (!down.length) { startAllRan = false; setBootNote(""); return; }
   if (startAllRan) return;   // 保留「一键启动」的结果说明，等补齐后自动收掉
@@ -271,7 +328,7 @@ $("btn-envcheck").onclick = runEnvCheck;
 $("btn-startall").onclick = async () => {
   const btn = $("btn-startall"); btn.disabled = true;
   startAllRan = true;
-  setBootNote("正在按顺序启动：AutoClaw relay → WorkBuddy → Trae → 豆包工作 → 凭证同步器（各自独立，缺前置只影响自己）…");
+  setBootNote("正在按顺序启动：AutoClaw relay → WorkBuddy → Trae → 豆包工作 → Comate → Qoder → 凭证同步器（各自独立，缺前置只影响自己）…");
   try {
     const r = await window.api.startAll();
     setBootNote((r.ok ? "✅ 全部就绪：" : "⚠️ 部分未启动：") +

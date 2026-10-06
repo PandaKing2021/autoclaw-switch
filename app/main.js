@@ -55,6 +55,19 @@ const DOUBAO_CDP = path.join(RES_ROOT, "doubao", "cdp.js");
 const DOUBAO_CDP_PORT = 9222;
 const DOUBAO_PORT = 18770;
 const DOUBAO_API_KEY = "doubao-local-key";
+// --- Comate（文心快码，comate/relay.mjs）：凭证由 relay 自行从 Comate IDE settings.json 读取 ---
+const COMATE_PROVIDER_ID = "comate-openai-provider";
+const COMATE_RELAY = path.join(RES_ROOT, "comate", "relay.mjs");
+const COMATE_LOG = path.join(HOME, ".comate-relay", "relay.log");
+const COMATE_PORT = 18774;
+const COMATE_SETTINGS = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"),
+  "Comate", "User", "settings.json");
+// --- Qoder CN（vendored 社区网关 qoder/qoder_proxy.py，COSY 签名；另含千问办公 qworkcn 区）---
+const QODER_PROVIDER_ID = "qoder-openai-provider";
+const QODER_PROXY = path.join(RES_ROOT, "qoder", "qoder_proxy.py");
+const QODER_LOG = path.join(HOME, ".qoder-relay", "gateway.log");
+const QODER_PORT = 8791;
+const QODER_PANEL_PASSWORD = "admin";   // 社区网关面板默认密码，仅绑定 127.0.0.1 使用
 const BRIDGE_DIR = path.join(RES_ROOT, "bridge");
 const RELAY_SRC = path.join(BRIDGE_DIR, "server_2x.mjs");   // relay 源码随项目走，首次运行部署到 RELAY_DIR
 const PERSONA_SRC = path.join(BRIDGE_DIR, "persona.txt");    // 同上：2.x 闸门要求的应用 persona
@@ -366,6 +379,105 @@ async function doubaoModels() {
   return m.j?.data || [];
 }
 
+// --- Comate（comate/relay.mjs；登录态 = Comate IDE settings.json 里的 license，relay 运行时自行读取）---
+let comateProc = null;
+
+function comateAlive() {
+  try {
+    const out = execSync(`netstat -ano | findstr :${COMATE_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+    return /LISTENING/.test(out);
+  } catch { return false; }
+}
+
+function comateHttp(method, apiPath, body, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = http.request({
+      host: "127.0.0.1", port: COMATE_PORT, path: apiPath, method,
+      headers: { "Content-Type": "application/json", ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
+      timeout: timeoutMs,
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => { try { resolve({ ok: res.statusCode === 200, status: res.statusCode, j: JSON.parse(d) }); } catch { resolve({ ok: res.statusCode < 400, status: res.statusCode, raw: d.slice(0, 200) }); } });
+    });
+    req.on("error", () => resolve({ ok: false, status: 0 }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false, status: 0 }); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function comateHealth() {
+  if (!comateAlive()) return { running: false, ok: false };
+  const h = await comateHttp("GET", "/health", null, 10000);
+  if (!h.j) return { running: true, ok: false };
+  return { running: true, ok: h.ok && h.j.credential?.startsWith?.("ok"), ...h.j };
+}
+
+async function comateModels() {
+  const m = await comateHttp("GET", "/v1/models", null, 20000);
+  return m.j?.data || [];
+}
+
+// --- Qoder CN（vendored 社区网关 qoder/qoder_proxy.py；Python 长驻进程，双区+千问办公账号池）---
+let qoderProc = null;
+
+function qoderAlive() {
+  try {
+    const out = execSync(`netstat -ano | findstr :${QODER_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+    return /LISTENING/.test(out);
+  } catch { return false; }
+}
+
+function qoderHttp(method, apiPath, body, timeoutMs = 8000, headers = {}) {
+  return new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = http.request({
+      host: "127.0.0.1", port: QODER_PORT, path: apiPath, method,
+      headers: { "Content-Type": "application/json", ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}), ...headers },
+      timeout: timeoutMs,
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => { try { resolve({ ok: res.statusCode === 200, status: res.statusCode, j: JSON.parse(d) }); } catch { resolve({ ok: res.statusCode < 400, status: res.statusCode, raw: d.slice(0, 200) }); } });
+    });
+    req.on("error", () => resolve({ ok: false, status: 0 }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false, status: 0 }); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function qoderHealth() {
+  if (!qoderAlive()) return { running: false, ok: false };
+  const h = await qoderHttp("GET", "/health", null, 10000);
+  if (!h.j) return { running: true, ok: false };
+  return { running: true, ok: h.ok && (h.j.accounts_ready || 0) > 0, accounts: h.j.accounts || 0, realm: h.j.realm || "" };
+}
+
+async function qoderModels() {
+  const m = await qoderHttp("GET", "/v1/models", null, 20000);
+  return (m.j?.data || []).filter((x) => x && x.id && x.enabled !== false);
+}
+
+/** 把本机已登录的 Qoder/千问办公桌面凭证导入网关账号池（面板两步确认流程的自动化） */
+async function qoderSyncAccounts() {
+  const l = await qoderHttp("POST", "/panel/login", { password: QODER_PANEL_PASSWORD }, 10000);
+  const token = l.j?.token || "";
+  if (!token) return { ok: false, error: "面板登录失败（默认密码 admin 被改过？在网关看板里改回或同步此处的密码）" };
+  const scan = await qoderHttp("POST", "/accounts/import/desktop", {}, 60000, { "X-Panel-Token": token });
+  const detected = scan.j?.detected || [];
+  const valid = detected.filter((c) => c.valid);
+  if (!valid.length) {
+    return { ok: false, error: "本机未发现已登录的 Qoder/千问办公凭证（先装客户端并登录一次）", detected: detected.map((d) => d.realm) };
+  }
+  const imp = await qoderHttp("POST", "/accounts/import/desktop", { all: true }, 120000, { "X-Panel-Token": token });
+  if (imp.j?.error) return { ok: false, error: typeof imp.j.error === "string" ? imp.j.error : JSON.stringify(imp.j.error).slice(0, 200) };
+  const imported = (imp.j?.imported || []).map((a) => `${a.nickname || a.uid?.slice(0, 8)}(${a.realm})`);
+  return { ok: imported.length > 0, imported, validRealms: valid.map((v) => v.realm) };
+}
+
 /** 豆包工作客户端的可执行文件：默认装在 D:\DoubaoWork，也认 %LOCALAPPDATA% 下的用户级安装 */
 function findDoubaoExe() {
   const candidates = [
@@ -397,7 +509,8 @@ function readZcodeRegistration() {
     const rule = rules.find((r) => r.providerId === PROVIDER_ID);
     // 卡片要显示的是“ZCode 侧已注册多少模型”（配置文件为准），不是网关当前存活多少
     const countOf = (pid) => (rules.find((r) => r.providerId === pid)?.config?.personalModelIds || []).length;
-    const counts = { wbModels: countOf(WB_PROVIDER_ID), traeModels: countOf(TRAE_PROVIDER_ID), doubaoModels: countOf(DOUBAO_PROVIDER_ID) };
+    const counts = { wbModels: countOf(WB_PROVIDER_ID), traeModels: countOf(TRAE_PROVIDER_ID), doubaoModels: countOf(DOUBAO_PROVIDER_ID),
+      comateModels: countOf(COMATE_PROVIDER_ID), qoderModels: countOf(QODER_PROVIDER_ID) };
     if (!rule) return { registered: false, ...counts };
     return {
       registered: true,
@@ -522,6 +635,8 @@ function setupIpc() {
     } catch {}
     const traeH = await traeHealth();
     const doubaoH = await doubaoHealth();
+    const comateH = await comateHealth();
+    const qoderH = await qoderHealth();
     return {
       doubao: {
         running: doubaoH.running,
@@ -538,6 +653,19 @@ function setupIpc() {
         models: traeH.models || [],
         credential: traeH.credential || null,
         mode: traeH.mode || "stateless",
+      },
+      comate: {
+        running: comateH.running,
+        ok: comateH.ok,
+        credential: comateH.credential || null,
+        mode: comateH.mode || "stateless",
+        modelsCached: comateH.models_cached || 0,
+      },
+      qoder: {
+        running: qoderH.running,
+        ok: qoderH.ok,
+        accounts: qoderH.accounts || 0,
+        realm: qoderH.realm || "",
       },
       workbuddy: {
         running: wbH.running,
@@ -643,7 +771,7 @@ function setupIpc() {
     // provider_config.json 归 ZCode 自己所有：只允许增量修改自己的供应商，
     // 任何“整体重建”的写法都会丢字段（2026-10-05 丢掉 manualProviderModelRules 的教训），
     // 任何“统一修正目录”的写法都会删掉别人注册的模型（同日删掉两个 DeepSeek 的教训）。
-    const CATALOG_ALLOW = [PROVIDER_ID, WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID]
+    const CATALOG_ALLOW = [PROVIDER_ID, WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID]
       .map((p) => `config.modelConfigRules.providerModelRules[${p}/`);   // 模型目录由各家实时目录重写
     // 网关目录各自单独取：某个网关没启动，只跳过它的目录刷新，不牵连同一次注册
     let wbCatalog = [];
@@ -655,6 +783,12 @@ function setupIpc() {
     let doubaoCatalog = [];
     try { doubaoCatalog = await doubaoModels(); }
     catch (e) { res.doubaoCatalogError = String((e && e.message) || e); }
+    let comateCatalog = [];
+    try { comateCatalog = await comateModels(); }
+    catch (e) { res.comateCatalogError = String((e && e.message) || e); }
+    let qoderCatalog = [];
+    try { qoderCatalog = await qoderModels(); }
+    catch (e) { res.qoderCatalogError = String((e && e.message) || e); }
 
     try {
       const prevRaw = fs.readFileSync(ZCODE_CFG, "utf8");
@@ -721,8 +855,34 @@ function setupIpc() {
         res.doubao = { error: "豆包工作网关未运行，模型目录未刷新（已注册条目保持不变）" };
       }
 
+      // ⑤ Comate（文心快码）：目录来自 relay（/api/v2/api/models/available 实时目录）
+      if (comateCatalog.length) {
+        const ids = comateCatalog.map((m) => m.id);
+        ZC.upsertProviderRule(rules, { providerId: COMATE_PROVIDER_ID, providerName: "Comate 文心快码", enabled: true,
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: "comate-local" },
+            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${COMATE_PORT}/v1` },
+            personalModelIds: ids } });
+        ZC.upsertModelEntries(entries, COMATE_PROVIDER_ID, comateCatalog.map((m) => modelEntry(COMATE_PROVIDER_ID, m.id, 200000)));
+        res.comate = { registered: true, models: ids };
+      } else {
+        res.comate = { error: "Comate 网关未运行，模型目录未刷新（已注册条目保持不变）" };
+      }
+
+      // ⑥ Qoder CN（含千问办公 qworkcn 区的模型；已过滤掉账号不可用的付费项）
+      if (qoderCatalog.length) {
+        const ids = qoderCatalog.map((m) => m.id);
+        ZC.upsertProviderRule(rules, { providerId: QODER_PROVIDER_ID, providerName: "Qoder CN", enabled: true,
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: "qoder-local" },
+            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${QODER_PORT}/v1` },
+            personalModelIds: ids } });
+        ZC.upsertModelEntries(entries, QODER_PROVIDER_ID, qoderCatalog.map((m) => modelEntry(QODER_PROVIDER_ID, m.id, m.max_input_tokens || 200000)));
+        res.qoder = { registered: true, models: ids };
+      } else {
+        res.qoder = { error: "Qoder 网关未运行或账号池为空，模型目录未刷新（已注册条目保持不变）" };
+      }
+
       const order = conf.providerOrder || (conf.providerOrder = []);
-      for (const p of [WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID]) if (!order.includes(p)) order.push(p);
+      for (const p of [WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID]) if (!order.includes(p)) order.push(p);
 
       // 单次落盘：枚举 + 结构丢失 + 原子写 + 读回校验，任一道不过就整体拒绝
       res.backup = path.basename(writeZcodeConfig(cfg, prevRaw, { allowRemovedPaths: CATALOG_ALLOW }));
@@ -763,6 +923,10 @@ function setupIpc() {
     file("豆包工作网关", DOUBAO_RELAY, "项目自带（doubao/relay.mjs）");
     file("豆包登录态", DOUBAO_COOKIES, "需安装并登录豆包工作客户端；点「同步登录态」从客户端抓 cookie（客户端需带调试端口，控制台可代重启）");
     file("豆包工作客户端", findDoubaoExe(), "默认装在 D:\\DoubaoWork，装好后登录一次即可");
+    file("Comate 网关", COMATE_RELAY, "项目自带（comate/relay.mjs）");
+    file("Comate 登录态", COMATE_SETTINGS, "需安装并登录 Comate IDE（文心快码）；relay 从 settings.json 读 license，重新登录后无需重启");
+    file("Qoder 网关", QODER_PROXY, "项目自带（qoder/qoder_proxy.py，社区 COSY 网关，需 Python）");
+    file("Qoder 登录态", path.join(process.env.APPDATA || "", "com.qodercn.app.stable", "auth.v1.dat"), "需安装并登录 Qoder CN 客户端；点「同步账号」把本机凭证导入网关账号池（千问办公同理）");
     file("AutoClaw 凭证", REQ_HEADERS, "需安装并登录 AutoClaw 桌面客户端；同步器把登录态搬成反代凭证");
     file("ZCode 配置", ZCODE_CFG, "需先安装并运行过一次 ZCode，注册才有落点");
     return { ok: items.every((i) => i.ok), items };
@@ -781,6 +945,8 @@ function setupIpc() {
     await run("WorkBuddy 网关", "workbuddy:start");
     await run("Trae 网关", "trae:start");
     await run("豆包工作网关", "doubao:start");
+    await run("Comate 网关", "comate:start");
+    await run("Qoder 网关", "qoder:start");
     await run("凭证同步器", "watcher:start");
     return { ok: steps.every((s) => s.ok), steps };
   });
@@ -1010,12 +1176,123 @@ function setupIpc() {
     return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model };
   });
 
+  // --- Comate（文心快码）：relay 在项目目录内（comate/relay.mjs），凭证由 relay 自行读取 Comate IDE settings.json ---
+  handle("comate:start", async () => {
+    if (comateAlive()) return { ok: true, already: true };
+    if (!fs.existsSync(COMATE_RELAY)) return { ok: false, error: `未找到 comate/relay.mjs（${COMATE_RELAY}）` };
+    fs.mkdirSync(path.dirname(COMATE_LOG), { recursive: true });
+    const nd = findNode();
+    const st = trySpawn(nd.cmd, [COMATE_RELAY], {
+      cwd: path.dirname(COMATE_RELAY), env: { ...process.env, ...nd.env }, windowsHide: true, detached: true,
+      stdio: ["ignore", fs.openSync(COMATE_LOG, "a"), fs.openSync(COMATE_LOG, "a")],
+    });
+    if (!st.proc) return { ok: false, error: `${st.error || "无法启动 Node 运行时"}（${nd.source}）` };
+    comateProc = st.proc;
+    comateProc.unref();
+    comateProc.on("exit", (code) => { log("comate relay exited", code); comateProc = null; });
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (comateAlive()) {
+        const h = await comateHealth();
+        if (!h.ok) return { ok: true, warn: `网关已启动，但 Comate 登录态不可用（${h.credential || "settings.json 缺 license"}）；安装并登录 Comate IDE 后即可用` };
+        return { ok: true };
+      }
+    }
+    return { ok: false, error: st.error || `10 秒内未就绪（运行时：${nd.source}），查看 ~/.comate-relay/relay.log` };
+  });
+
+  handle("comate:stop", async () => {
+    try {
+      const out = execSync(`netstat -ano | findstr :${COMATE_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+      const pid = out.trim().split(/\s+/).pop();
+      if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
+      if (comateProc) { try { comateProc.kill(); } catch {} comateProc = null; }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  handle("comate:smoke", async () => {
+    // Comate 走云端 agent 三步链（conversation→task→execute-sync），首字延迟 8-40 秒
+    const model = (await comateModels())[0]?.id || "auto";
+    const r = await comateHttp("POST", "/v1/chat/completions", {
+      model, max_tokens: 64,
+      messages: [{ role: "user", content: "请只回复OK" }],
+    }, 240000);
+    let reply = "", stop = "";
+    try {
+      const j = r.j;
+      const msg = j.choices?.[0]?.message || {};
+      reply = (msg.content || "").slice(0, 120);
+      stop = j.choices?.[0]?.finish_reason || "";
+    } catch { reply = r.raw || ""; }
+    return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model };
+  });
+
+  // --- Qoder CN（vendored 社区网关；Python 长驻进程，双区+千问办公账号池）---
+  handle("qoder:start", async () => {
+    if (qoderAlive()) return { ok: true, already: true };
+    if (!fs.existsSync(QODER_PROXY)) return { ok: false, error: `未找到 qoder/qoder_proxy.py（${QODER_PROXY}）` };
+    fs.mkdirSync(path.dirname(QODER_LOG), { recursive: true });
+    const st = trySpawn(PYTHON, [QODER_PROXY, "--port", String(QODER_PORT),
+      // 账号池落用户目录（打包版资源目录只读，且凭证绝不随安装包分发）
+      "--accounts-dir", path.join(HOME, ".qoder-relay", "accounts")], {
+      cwd: path.dirname(QODER_PROXY), env: { ...process.env }, windowsHide: true, detached: true,
+      stdio: ["ignore", fs.openSync(QODER_LOG, "a"), fs.openSync(QODER_LOG, "a")],
+    });
+    if (!st.proc) return { ok: false, error: `${st.error || "无法启动 Python 运行时"}（需要 Python 3.9+ 在 PATH 中）` };
+    qoderProc = st.proc;
+    qoderProc.unref();
+    qoderProc.on("exit", (code) => { log("qoder gateway exited", code); qoderProc = null; });
+    for (let i = 0; i < 24; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (qoderAlive()) {
+        const h = await qoderHealth();
+        if (!h.ok) return { ok: true, warn: `网关已启动，但账号池为空：点「同步账号」导入本机已登录的 Qoder/千问办公凭证` };
+        return { ok: true };
+      }
+    }
+    return { ok: false, error: st.error || "12 秒内未就绪，查看 ~/.qoder-relay/gateway.log" };
+  });
+
+  handle("qoder:stop", async () => {
+    try {
+      const out = execSync(`netstat -ano | findstr :${QODER_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+      const pid = out.trim().split(/\s+/).pop();
+      if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
+      if (qoderProc) { try { qoderProc.kill(); } catch {} qoderProc = null; }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  handle("qoder:smoke", async () => {
+    // 只用 enabled 的模型（Free 账号多数模型要付费，403 是终态；冒烟选第一个可用项）
+    const models = (await qoderModels()).map((m) => m.id);
+    if (!models.length) return { ok: false, error: "模型目录为空（网关账号池为空或未同步？）" };
+    const model = models.includes("Qwen3.8-Flash") ? "Qwen3.8-Flash" : models[0];
+    const r = await qoderHttp("POST", "/v1/chat/completions", {
+      model, max_tokens: 64,
+      messages: [{ role: "user", content: "请只回复OK" }],
+    }, 240000);
+    let reply = "", stop = "";
+    try {
+      const j = r.j;
+      const msg = j.choices?.[0]?.message || {};
+      reply = (msg.content || "").slice(0, 120);
+      stop = j.choices?.[0]?.finish_reason || "";
+    } catch { reply = r.raw || ""; }
+    return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model, available: models };
+  });
+
+  handle("qoder:sync-accounts", async () => qoderSyncAccounts());
+
   handle("logs:tail", async (_e, which) => {
     if (which === "watch") return tailFile(WATCH_LOG, 120);
     if (which === "console") return tailFile(path.join(RELAY_DIR, "console.log"), 120);
     if (which === "workbuddy") return tailFile(WB_LOG, 150);
     if (which === "trae") return tailFile(TRAE_LOG, 150);
     if (which === "doubao") return tailFile(DOUBAO_LOG, 150);
+    if (which === "comate") return tailFile(COMATE_LOG, 150);
+    if (which === "qoder") return tailFile(QODER_LOG, 150);
     return tailFile(RELAY_LOG, 200);
   });
 }
