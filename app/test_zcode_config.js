@@ -14,6 +14,7 @@ const os = require("os");
 const path = require("path");
 const {
   ZCODE_API, readConfig, writeZcodeConfig, upsertProviderRule, upsertModelEntries, checkZcodeConfig,
+  removeProviders, removedProviderAllowPaths,
 } = require("./zcode-config.js");
 
 const results = [];
@@ -278,6 +279,75 @@ t("F3 其它供应商的条目位置不动", () => {
   ];
   upsertModelEntries(arr, "p1", [{ providerId: "p1", modelId: "new" }]);
   assert(arr.map((x) => x.modelId).join() === "a1,new,b1", `位置应保持 a1,new,b1，实际 ${arr.map((x) => x.modelId).join()}`);
+});
+
+// ---- H. 注销（动态增删的“删”半边：链路关 → 供应商从 ZCode 摘除） ----
+t("H1 removeProviders 摘除 rule/entries/order，别家的原样保留", () => {
+  const cfg = registeredConfig(seed);
+  const removed = removeProviders(cfg, [WB]);
+  assert(removed >= 1 + 1 + 1, `应至少摘除 rule+entry+order 共 3 处，实际 ${removed}`);
+  const rules = cfg.config.providerConfigRules.providerRules;
+  const entries = cfg.config.modelConfigRules.providerModelRules;
+  assert(!rules.some((r) => r.providerId === WB), "WB rule 应被摘除");
+  assert(!entries.some((e) => e.providerId === WB), "WB 模型条目应被摘除");
+  assert(!cfg.config.providerOrder.includes(WB), "providerOrder 应摘除 WB");
+  // 别家毫发无损
+  assert(rules.some((r) => r.providerId === AC), "AutoClaw 应保留");
+  assert(rules.some((r) => r.providerId === "someone-else"), "别家供应商应保留");
+  assert(entries.some((e) => e.providerId === TRAE), "Trae 模型条目应保留");
+  assert(cfg.config.modelConfigRules.manualProviderModelRules !== undefined, "manualProviderModelRules 应保留");
+  assert(cfg.config.modelConfigRules.someFutureSibling?.keep === true, "未知兄弟键应保留");
+});
+
+t("H2 注销落盘：白名单放行被摘结构，其余结构丢失仍被闸门拦截", () => {
+  reset();
+  // 先注册三个平台再注销 WB（模拟“链路开启过、然后关闭”）
+  const regd = registeredConfig(seed);
+  writeZcodeConfig(cfgPath, regd, prevRaw, { allowRemovedPaths: CATALOG_ALLOW });
+  const rawAfterReg = fs.readFileSync(cfgPath, "utf8");
+  const cfg = JSON.parse(rawAfterReg);
+  removeProviders(cfg, [WB]);
+  writeZcodeConfig(cfgPath, cfg, rawAfterReg, { allowRemovedPaths: removedProviderAllowPaths([WB]) });
+  const after = readConfig(cfgPath);
+  assert(!after.config.providerConfigRules.providerRules.some((r) => r.providerId === WB), "落盘后 WB rule 应消失");
+  assert(after.config.providerConfigRules.providerRules.some((r) => r.providerId === AC), "AutoClaw 应仍在");
+  // 反向：不加白名单，同样的注销必须被闸门整单拒绝（文件保持注销前状态）。
+  // 先把 WB 完整注册回盘（rule + entries 都落盘），再用「盘上含 WB 的状态」当 prevRaw。
+  const rawNoWb = fs.readFileSync(cfgPath, "utf8");
+  const cfg2 = JSON.parse(rawNoWb);
+  upsertProviderRule(cfg2.config.providerConfigRules.providerRules, {
+    providerId: WB, providerName: "WorkBuddy", enabled: true,
+    config: { group: "standard-personal", access: { type: "api-key", apiKey: "wb-local-key" },
+      api: { type: ZCODE_API.OPENAI_CHAT, baseUrl: "http://127.0.0.1:7863/v1" },
+      personalModelIds: ["cn:auto"] } });
+  upsertModelEntries(cfg2.config.modelConfigRules.providerModelRules, WB,
+    [{ providerId: WB, modelId: "cn:auto", config: { enabled: true, properties: { contextWindow: 200000 } } }]);
+  writeZcodeConfig(cfgPath, cfg2, rawNoWb, { allowRemovedPaths: CATALOG_ALLOW });
+  const rawWithWb = fs.readFileSync(cfgPath, "utf8");
+  const cfg3 = JSON.parse(rawWithWb);
+  removeProviders(cfg3, [WB]);
+  throws(() => writeZcodeConfig(cfgPath, cfg3, rawWithWb, {}),
+    "丢失既有结构", "无白名单的注销应被拒绝");
+  assert(readConfig(cfgPath).config.providerConfigRules.providerRules.some((r) => r.providerId === WB),
+    "被拒绝的注销不应改动文件");
+});
+
+t("H3 注销不存在的供应商：计数为 0（调用方据此免写盘）", () => {
+  const cfg = registeredConfig(seed);
+  const before = JSON.stringify(cfg);
+  assert(removeProviders(cfg, ["never-registered-provider"]) === 0, "应返回 0");
+  assert(JSON.stringify(cfg) === before, "配置不应有任何变化");
+});
+
+t("H4 白名单前缀不越界：注销 qoder 不会放行 qoder-openai-provider-v2 这类前缀兄弟", () => {
+  const pid = "qoder-openai-provider";
+  const allow = removedProviderAllowPaths([pid]);
+  const p1 = `config.modelConfigRules.providerModelRules[${pid}]`;
+  const p2 = `config.modelConfigRules.providerModelRules[${pid}/m1]`;
+  const p3 = `config.modelConfigRules.providerModelRules[${pid}-v2]`;
+  assert(allow.some((a) => p1.startsWith(a)), "[pid] 形态应放行");
+  assert(allow.some((a) => p2.startsWith(a)), "[pid/m] 形态应放行");
+  assert(!allow.some((a) => p3.startsWith(a)), "前缀兄弟（-v2）不应被放行");
 });
 
 // ---- G. 主进程源码卫生 ----

@@ -47,6 +47,7 @@
       { "from": "../qoder/qoder_catalog_intl.json", "to": "qoder/qoder_catalog_intl.json" },
       { "from": "../qoder/qoder_catalog_qworkcn.json", "to": "qoder/qoder_catalog_qworkcn.json" },
       { "from": "../autoclaw-switch/a_switch.py", "to": "autoclaw-switch/a_switch.py" },
+      { "from": "../models-catalog.json", "to": "models-catalog.json" },
       { "from": "../workbuddy/workbuddy-manager-v1.0.79/upstream/wb2api.exe", "to": "workbuddy/wb2api.exe" },
       { "from": "../workbuddy/workbuddy-manager-v1.0.79/upstream/wb2api-login.exe", "to": "workbuddy/wb2api-login.exe" },
       { "from": "../workbuddy/workbuddy-manager-v1.0.79/upstream/config.json", "to": "workbuddy/config.json" }

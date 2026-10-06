@@ -322,6 +322,25 @@ function mergeToolParams(params, patch) {
 // ------------------------------------------------------------------- catalog
 let catalogCache = { at: 0, models: [] };
 
+// 对外 id 一律规范名（见 models-catalog.json 的命名规范）：去 Comate 上游的
+// _<hash> 后缀、去 -fc / -oneapi 工具标记。目录条目同时保留 key（上游 modelKey），
+// chat 侧两种拼写都收，向上游只发 key。
+function canonicalComateId(raw) {
+  return String(raw).replace(/_[0-9a-f]{8,}$/i, "").replace(/-(?:fc|oneapi)$/i, "").toLowerCase();
+}
+
+// 请求里的模型名（规范名 / 上游原名 / 旧配置里的任意拼写）→ 上游 modelKey。
+// 目录未就绪时原样透传，让上游给准确错误，而不是 relay 编一个。
+function resolveComateModel(requested) {
+  if (!requested) return "auto";
+  const list = catalogCache.models;
+  if (!list.length) return requested;
+  const req = String(requested);
+  const hit = list.find((m) => m.id === req) || list.find((m) => m.key === req)
+    || list.find((m) => canonicalComateId(m.key) === canonicalComateId(req));
+  return hit ? hit.key : req;
+}
+
 async function fetchModels(license, username) {
   if (catalogCache.models.length && Date.now() - catalogCache.at < 600_000) return catalogCache.models;
   const r = await httpsJson("POST", BASE + "/api/v2/api/models/available",
@@ -329,9 +348,14 @@ async function fetchModels(license, username) {
   let models = [];
   try {
     const j = JSON.parse(r.text);
-    models = (j?.data?.models || [])
-      .filter((m) => m && m.modelId)
-      .map((m) => ({ id: m.modelId, name: m.displayName || m.modelId }));
+    const seen = new Map();   // 规范名 -> 上游 modelId；撞名时后到者保留完整原名
+    for (const m of j?.data?.models || []) {
+      if (!m?.modelId) continue;
+      const canon = canonicalComateId(m.modelId);
+      const id = seen.has(canon) ? m.modelId : canon;
+      seen.set(id, m.modelId);
+      models.push({ id, key: m.modelId, name: m.displayName || m.modelId });
+    }
   } catch {}
   if (models.length) catalogCache = { at: Date.now(), models };
   return models;
@@ -929,7 +953,7 @@ const server = createServer(async (req, res) => {
       const cred = readCredentials();
       const models = await fetchModels(cred.license, cred.username);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ object: "list", data: models.map((m) => ({ id: m.id, object: "model", owned_by: "comate", display_name: m.name })) }));
+      res.end(JSON.stringify({ object: "list", data: models.map((m) => ({ id: m.id, object: "model", owned_by: "comate", display_name: m.name, upstream_key: m.key })) }));
       return;
     }
 
@@ -940,7 +964,7 @@ const server = createServer(async (req, res) => {
 
     if (p === "/v1/messages" || p === "/messages") {
       // Anthropic shape
-      const model = payload.model || "auto";
+      const model = resolveComateModel(payload.model);
       const msgs = normalizeAnthropicMessages(payload);
       const clientTools = clientToolIndex(payload.tools, "anthropic");
       const pending = extractPending(msgs);
@@ -971,7 +995,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (p === "/v1/chat/completions" || p === "/chat/completions") {
-      const model = payload.model || "auto";
+      const model = resolveComateModel(payload.model);
       const msgs = normalizeOpenAIMessages(payload.messages);
       const clientTools = clientToolIndex(payload.tools, "openai");
       const pending = extractPending(msgs);

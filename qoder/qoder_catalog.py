@@ -1647,11 +1647,52 @@ _DISPLAY_INDEX = _display_name_index()
 QWORK_ALIASES = {
     "flash": "flash", "标准": "flash", "standard": "flash",
     "qwen3.8-flash": "flash", "qwen3.8-flash (标准)": "flash",
+    "qwen-flash": "flash",
     "pro": "pro", "高级": "pro", "advanced": "pro",
+    "qwen-pro": "pro",
     "qwen3.8-max-preview": "qwen3.8-max-preview",
     "qwen3.8-max": "qwen3.8-max-preview", "max": "qwen3.8-max-preview",
 }
 CLOSED_REALMS = ("qworkcn",)
+
+# ---------------------------------------------------------------------------
+# 对外规范名（见 models-catalog.json 的统一命名规范）：
+#   ① 全小写；② 无官方内部缩写 key（qmodel_38max 之类）；③ 同一模型跨区同名。
+# /v1/models 的 id 用规范名；旧 id（缩写 key / 官方显示名）经各自别名表保留解析。
+# 千问办公「高级」档底层版本未核实，按档位命名 qwen-pro，不编造版本号。
+CN_CANONICAL_BY_KEY = {
+    "auto": "auto",
+    "qmodel_38max": "qwen3.8-max",
+    "qfmodel": "qwen3.8-flash",
+    "qmodel_latest": "qwen3.7-max",
+    "qmodel": "qwen3.7-plus",
+    "q37fmodel": "qwen3.7-flash",
+    "q36fmodel": "qwen3.6-flash",
+    "dmodel": "deepseek-v4-pro",
+    "dfmodel": "deepseek-flash",   # 官方名 DeepSeek-Flash 未标版本，不冒认 deepseek-v4-flash
+    "gmodel": "glm-5.3",
+    "gfmodel": "glm-5.3-flash",
+    "gm51model": "glm-5.2",
+    "kmodel_latest": "kimi-k3",
+    "kmodel": "kimi-k2.8-preview",
+    "mmodel": "minimax-m2.7",
+}
+QWORK_CANONICAL_BY_KEY = {
+    "flash": "qwen3.8-flash",
+    "pro": "qwen-pro",
+    "qwen3.8-max-preview": "qwen3.8-max",
+}
+
+
+def canonical_model_id(mid, display_name=None):
+    """对外规范名：封闭区/已知 key 按映射表；未知条目取官方显示名小写（不造新名字）。"""
+    key = str(mid or "").strip()
+    if key in QWORK_CANONICAL_BY_KEY:
+        return QWORK_CANONICAL_BY_KEY[key]
+    if key in CN_CANONICAL_BY_KEY:
+        return CN_CANONICAL_BY_KEY[key]
+    name = str(display_name or "").strip()
+    return (name or key).lower()
 
 
 def _realm_alias_index(realm):

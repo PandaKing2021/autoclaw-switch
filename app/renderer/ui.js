@@ -119,7 +119,16 @@ async function refreshStatus() {
     const zc = s.zcode;
     const zcOk = zc.registered && zc.enabled && zc.inOrder;
     setPill("zcode-pill", zcOk ? "ok" : "err", zcOk ? "已注册" : "未注册");
-    $("zcode-registered").textContent = zc.registered ? (zc.enabled ? "已启用" : "已禁用") : "未注册";
+    // 动态增删的最近一次同步结果（链路开→注册 / 链路关→注销）一并露出
+    const zs = zc.zcodeSync;
+    let zsTxt = "";
+    if (zs && zs.result) {
+      const bits = [];
+      if (Array.isArray(zs.result.upserted) && zs.result.upserted.length) bits.push("+" + zs.result.upserted.join(" +"));
+      if (Array.isArray(zs.result.removed) && zs.result.removed.length) bits.push("-" + zs.result.removed.join(" -"));
+      if (bits.length) zsTxt = `｜同步 ${String(zs.at).slice(5, 16).replace("T", " ")}（${bits.join(" ")}）`;
+    }
+    $("zcode-registered").textContent = (zc.registered ? (zc.enabled ? "已启用" : "已禁用") : "未注册") + zsTxt;
     $("zcode-models").innerHTML = (zc.models || []).slice(0, 12).map((m) => `<span>${m}</span>`).join("") +
       ((zc.models || []).length > 12 ? `<span>+${zc.models.length - 12}</span>` : "");
     // ZCode 侧的注册数量以配置文件为准（网关没启动时也要显示已注册多少）

@@ -125,9 +125,13 @@ function ensureRelayServer() {
   try { fs.mkdirSync(RELAY_DIR, { recursive: true }); } catch {}
   if (!fs.existsSync(RELAY_SRC)) return `未找到 relay 源码（${RELAY_SRC}），请确认在完整项目目录内运行控制台`;
   try {
-    if (!fs.existsSync(RELAY_SERVER)) {
+    // 缺失或内容不同都（重）部署——历史上只在缺失时复制，升级控制台后 ~/.autoclaw-relay/
+    // 里的旧 server.mjs 永远不会被替换，relay 一直跑旧代码（表现为“重装了但模型名没变”）。
+    const srcBuf = fs.readFileSync(RELAY_SRC);
+    const serverExists = fs.existsSync(RELAY_SERVER);
+    if (!serverExists || !srcBuf.equals(fs.readFileSync(RELAY_SERVER))) {
       fs.copyFileSync(RELAY_SRC, RELAY_SERVER);
-      log("deployed relay server.mjs from", RELAY_SRC);
+      log(serverExists ? "updated relay server.mjs from" : "deployed relay server.mjs from", RELAY_SRC);
     }
     if (!fs.existsSync(RELAY_PERSONA)) {
       if (!fs.existsSync(PERSONA_SRC)) return `未找到 persona 模板（${PERSONA_SRC}），2.x 闸门会拒绝所有请求`;
@@ -780,7 +784,7 @@ function setupIpc() {
         models: health.aliases || [],
       },
       watcher: { running: watcherRunning() },
-      zcode,
+      zcode: { ...zcode, zcodeSync: lastZcodeSync },
       token,
       credential,
     };
@@ -801,7 +805,7 @@ function setupIpc() {
     relayProc.on("exit", (code) => { log("relay exited", code); relayProc = null; });
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 500));
-      if (relayAlive()) return { ok: true };
+      if (relayAlive()) { queueZcodeSync({ upsert: ["autoclaw"] }); return { ok: true }; }
     }
     return { ok: false, error: st.error || `10 秒内未就绪（运行时：${nd.source}），查看 relay.log` };
   });
@@ -812,6 +816,7 @@ function setupIpc() {
       const pid = out.trim().split(/\s+/).pop();
       if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
       if (relayProc) { try { relayProc.kill(); } catch {} relayProc = null; }
+      queueZcodeSync({ remove: ["autoclaw"] });
       return { ok: true };
     } catch (e) { return { ok: false, error: String(e) }; }
   });
@@ -852,6 +857,201 @@ function setupIpc() {
     } catch { return { ok: false, error: r.err || r.out || "解析失败" }; }
   });
 
+  // ===================== ZCode 动态增删（链路开→注册，链路关→注销） =====================
+  // 约定：ZCode 里能看到哪个供应商 = 对应平台链路此刻开启。qoder 与 qwenwork 同网关同生死。
+  // 同步一律串行（一条 promise 链），且永远走 writeZcodeConfig 的四道闸门——
+  // 注销靠 removeProviders + removedProviderAllowPaths 白名单放行“有意删除”的结构路径。
+  const PLATFORM_KEYS = ["autoclaw", "workbuddy", "trae", "doubao", "comate", "qoder"];
+  const PLATFORM_PROVIDER_IDS = {
+    autoclaw: [PROVIDER_ID], workbuddy: [WB_PROVIDER_ID], trae: [TRAE_PROVIDER_ID],
+    doubao: [DOUBAO_PROVIDER_ID], comate: [COMATE_PROVIDER_ID],
+    qoder: [QODER_PROVIDER_ID, QWENWORK_PROVIDER_ID],
+  };
+  const PLATFORM_ALIVE = {
+    autoclaw: relayAlive, workbuddy: wbAlive, trae: traeAlive,
+    doubao: doubaoAlive, comate: comateAlive, qoder: qoderAlive,
+  };
+  let lastZcodeSync = null;
+  let zcodeSyncChain = Promise.resolve();
+
+  /** 把一个平台的注册素材落进 cfg（纯内存操作，落盘交给 writeZcodeConfig） */
+  function applyPlatformReg(cfg, reg) {
+    const conf = cfg.config;
+    const rules = conf.providerConfigRules.providerRules;
+    const entries = conf.modelConfigRules.providerModelRules;
+    if (reg.kind === "autoclaw") {
+      // 目录以 a_switch.py 的 ZCODE_MODELS 为准（含逐路由实测的视觉矩阵）。
+      // personalModelIds 与 python 注册器同语义：整体替换而非并集——并集会把改名前的
+      // 旧 TitleCase 名永久残留（统一命名规范要求目录里只出现规范名）；
+      // 模型条目仍然只增不删（upsertModelEntries 的既有行为），能力声明保留。
+      const acIds = reg.catalog.map((x) => x.modelId);
+      let acRule = rules.find((r) => r.providerId === PROVIDER_ID);
+      if (!acRule) {
+        acRule = { providerId: PROVIDER_ID, providerName: "AutoClaw", enabled: true,
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: "autoclaw-local" },
+            api: { type: ZC.ZCODE_API.ANTHROPIC, baseUrl: "http://127.0.0.1:18766" },
+            personalModelIds: [] } };
+        rules.push(acRule);
+      }
+      acRule.config.personalModelIds = [...new Set(acIds)];
+      ZC.upsertModelEntries(entries, PROVIDER_ID,
+        reg.catalog.map((x) => modelEntry(PROVIDER_ID, x.modelId, x.contextWindow || 500000, !!x.vision)));
+      return { ok: true, models: acIds };
+    }
+    ZC.upsertProviderRule(rules, reg.rule);
+    ZC.upsertModelEntries(entries, reg.rule.providerId, reg.entries);
+    return { ok: true, models: reg.rule.config.personalModelIds, providerId: reg.rule.providerId };
+  }
+
+  /** AutoClaw 目录：python 加载 a_switch.py 取 ZCODE_MODELS（顺带由 python 幂等直写自己的 providerRule） */
+  async function autoclawReg() {
+    const r = await pythonOneShot(REGISTER_SNIPPET, {}, 120000);
+    try {
+      if (!r.ok && r.error) throw new Error(r.error);
+      const line = (r.out || "").trim().split("\n").filter((l) => l.startsWith("{")).pop();
+      const res = JSON.parse(line || "{}");
+      const catalog = Array.isArray(res.catalog) ? res.catalog : [];
+      if (!catalog.length) return { ok: false, error: "注册器未返回模型目录（a_switch.py 未被加载？），目录未刷新" };
+      return { ok: true, kind: "autoclaw", providerIds: [PROVIDER_ID], catalog };
+    } catch (e) {
+      return { ok: false, error: r.err || (e && e.message) || r.out || "解析失败" };
+    }
+  }
+
+  /**
+   * 平台注册素材：目录取自各网关（网关没启动只影响自己，报 error 不抛异常）。
+   * qoder 一次带回两条出口（qoder + qwenwork），目录为空的出口单独报错。
+   */
+  async function platformCatalogs(key) {
+    const out = [];
+    try {
+      if (key === "autoclaw") {
+        out.push(["autoclaw", await autoclawReg()]);
+      } else if (key === "workbuddy") {
+        const list = ((await wbHttp("GET", "/v1/models", null, 15000)).j?.data || []).map((x) => [x.id, 200000]);
+        out.push(["workbuddy", list.length ? {
+          ok: true,
+          rule: { providerId: WB_PROVIDER_ID, providerName: "WorkBuddy", enabled: true,
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: WB_API_KEY },
+              api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${WB_PORT}/v1` },
+              personalModelIds: list.map((m) => m[0]) } },
+          entries: list.map(([id, ctx]) => modelEntry(WB_PROVIDER_ID, id, ctx)),
+        } : { ok: false, error: "WorkBuddy 网关未运行，模型目录未刷新（已注册条目保持不变）" }]);
+      } else if (key === "trae") {
+        const list = await traeModels();
+        out.push(["trae", list.length ? {
+          ok: true,
+          rule: { providerId: TRAE_PROVIDER_ID, providerName: "Trae", enabled: true,
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: TRAE_API_KEY },
+              api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${TRAE_PORT}/v1` },
+              personalModelIds: list.map((m) => m.id) } },
+          // Trae 目录里 max 常为 0（如 glm-5.3 = {dev:200000,max:0}），真实可用值在 dev
+          entries: list.map((m) => modelEntry(TRAE_PROVIDER_ID, m.id,
+            m.trae?.context_window?.dev || m.trae?.context_window?.max || 184000, !!m.trae?.multimodal)),
+        } : { ok: false, error: "Trae 网关未运行，模型目录未刷新（已注册条目保持不变）" }]);
+      } else if (key === "doubao") {
+        const list = await doubaoModels();
+        const ids = list.map((m) => m.id);
+        out.push(["doubao", ids.length ? {
+          ok: true,
+          rule: { providerId: DOUBAO_PROVIDER_ID, providerName: "豆包工作", enabled: true,
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: DOUBAO_API_KEY },
+              api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${DOUBAO_PORT}/v1` },
+              personalModelIds: ids } },
+          entries: list.map((m) => modelEntry(DOUBAO_PROVIDER_ID, m.id, 16000)),
+        } : { ok: false, error: "豆包工作网关未运行，模型目录未刷新（已注册条目保持不变）" }]);
+      } else if (key === "comate") {
+        const list = await comateModels();
+        const ids = list.map((m) => m.id);
+        out.push(["comate", ids.length ? {
+          ok: true,
+          rule: { providerId: COMATE_PROVIDER_ID, providerName: "Comate 文心快码", enabled: true,
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: "comate-local" },
+              api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${COMATE_PORT}/v1` },
+              personalModelIds: ids } },
+          entries: list.map((m) => modelEntry(COMATE_PROVIDER_ID, m.id, 200000)),
+        } : { ok: false, error: "Comate 网关未运行，模型目录未刷新（已注册条目保持不变）" }]);
+      } else if (key === "qoder") {
+        // 两把出口 Key 由控制台生成并写进网关（见 qoderEnsureRealmKeys），明文只在 ~/.autoclaw-relay/
+        await qoderEnsureRealmKeys();
+        const q = await qoderModels();
+        const qIds = q.map((m) => m.id);
+        out.push(["qoder", qIds.length ? {
+          ok: true,
+          rule: { providerId: QODER_PROVIDER_ID, providerName: "Qoder CN", enabled: true,
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: qoderRealmKey("cn") || "qoder-local" },
+              api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${QODER_PORT}/v1` },
+              personalModelIds: qIds } },
+          entries: q.map((m) => modelEntry(QODER_PROVIDER_ID, m.id, m.max_input_tokens || 200000)),
+        } : { ok: false, error: "Qoder 网关未运行或账号池为空，模型目录未刷新（已注册条目保持不变）" }]);
+        const qw = await qwenworkModels();
+        const qwIds = qw.map((m) => m.id);
+        out.push(["qwenwork", qwIds.length ? {
+          ok: true,
+          rule: { providerId: QWENWORK_PROVIDER_ID, providerName: "千问办公", enabled: true,
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: qoderRealmKey("qworkcn") || "qwenwork-local" },
+              api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${QODER_PORT}/v1` },
+              personalModelIds: qwIds } },
+          entries: qw.map((m) => modelEntry(QWENWORK_PROVIDER_ID, m.id, m.max_input_tokens || 1000000)),
+        } : { ok: false, error: "千问办公目录为空：网关未运行或 qworkcn 账号未同步（已注册条目保持不变）" }]);
+      }
+    } catch (e) {
+      out.push([key, { ok: false, error: String((e && e.message) || e) }]);
+    }
+    return out;
+  }
+
+  /**
+   * 一次同步：remove 平台先摘除（结构放行白名单按被摘者生成），upsert 平台拉目录后合并，
+   * 最后单次落盘。有 errors 但没有任何实际变更时不写盘（错误原样带回）。
+   */
+  async function zcodeSyncOnce({ upsert = [], remove = [], reconcile = false } = {}) {
+    if (reconcile) {
+      upsert = []; remove = [];
+      for (const key of PLATFORM_KEYS) (PLATFORM_ALIVE[key]?.() ? upsert : remove).push(key);
+    }
+    if (!fs.existsSync(ZCODE_CFG)) return { ok: false, error: `未找到 ZCode 配置（${ZCODE_CFG}）` };
+    const summary = { ok: true, upserted: [], removed: [], errors: {} };
+    const prevRaw = fs.readFileSync(ZCODE_CFG, "utf8");
+    let cfg;
+    try { cfg = JSON.parse(prevRaw); } catch (e) { return { ok: false, error: "ZCode 配置无法解析：" + e.message }; }
+    let allowRemoved = [];
+    if (remove.length) {
+      const ids = [...new Set(remove.flatMap((k) => PLATFORM_PROVIDER_IDS[k] || []))];
+      const n = ZC.removeProviders(cfg, ids);
+      if (n) { summary.removed = ids; allowRemoved = ZC.removedProviderAllowPaths(ids); }
+    }
+    for (const key of upsert) {
+      for (const [name, reg] of await platformCatalogs(key)) {
+        if (!reg.ok) { summary.errors[name] = reg.error; continue; }
+        const ar = applyPlatformReg(cfg, reg);
+        if (ar.ok) summary.upserted.push(name); else summary.errors[name] = ar.error;
+      }
+    }
+    if (!summary.removed.length && !summary.upserted.length) {
+      if (Object.keys(summary.errors).length) summary.ok = false;
+      summary.note = "目录无变化，未写盘";
+      return summary;
+    }
+    summary.backup = path.basename(writeZcodeConfig(cfg, prevRaw, { allowRemovedPaths: allowRemoved }));
+    return summary;
+  }
+
+  /** 同步队列：任意时刻只有一个同步在跑，后到的排队；结果记进 lastZcodeSync 供状态页展示 */
+  function queueZcodeSync(plan) {
+    const run = zcodeSyncChain.then(() => zcodeSyncOnce(plan)).then(
+      (r) => { lastZcodeSync = { at: new Date().toISOString(), ...plan, result: r }; log("zcode sync:", JSON.stringify(lastZcodeSync)); },
+      (e) => { lastZcodeSync = { at: new Date().toISOString(), ...plan, error: String((e && e.message) || e) }; log("zcode sync failed:", lastZcodeSync.error); },
+    );
+    zcodeSyncChain = run.catch(() => {});
+    return run;
+  }
+
+  handle("zcode:sync", async () => {
+    await queueZcodeSync({ reconcile: true });
+    return lastZcodeSync || { ok: false, error: "同步未执行" };
+  });
+
   handle("zcode:register", async () => {
     // 全新机器上 ZCode 还没跑过、配置不存在时，先给可执行的指引（python 的注册器同样以该文件为落点）
     if (!fs.existsSync(ZCODE_CFG)) {
@@ -873,136 +1073,36 @@ function setupIpc() {
     const CATALOG_ALLOW = [PROVIDER_ID, WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID, QWENWORK_PROVIDER_ID]
       .flatMap((p) => [`config.modelConfigRules.providerModelRules[${p}]`,
                        `config.modelConfigRules.providerModelRules[${p}/`]);   // 模型目录由各家实时目录重写
-    // 网关目录各自单独取：某个网关没启动，只跳过它的目录刷新，不牵连同一次注册
-    let wbCatalog = [];
-    try { wbCatalog = ((await wbHttp("GET", "/v1/models", null, 15000)).j?.data || []).map((x) => [x.id, 200000]); }
-    catch (e) { res.wbCatalogError = String((e && e.message) || e); }
-    let traeCatalog = [];
-    try { traeCatalog = await traeModels(); }
-    catch (e) { res.traeCatalogError = String((e && e.message) || e); }
-    let doubaoCatalog = [];
-    try { doubaoCatalog = await doubaoModels(); }
-    catch (e) { res.doubaoCatalogError = String((e && e.message) || e); }
-    let comateCatalog = [];
-    try { comateCatalog = await comateModels(); }
-    catch (e) { res.comateCatalogError = String((e && e.message) || e); }
-    let qoderCatalog = [];
-    try { qoderCatalog = await qoderModels(); }
-    catch (e) { res.qoderCatalogError = String((e && e.message) || e); }
-
-    let qwenworkCatalog = [];
-    try { qwenworkCatalog = await qwenworkModels(); }
-    catch (e) { res.qwenworkCatalogError = String((e && e.message) || e); }
-
+    // 各平台目录统一走 platformCatalogs（网关没启动只影响自己）；AutoClaw 仍由 python
+    // 直取 ZCODE_MODELS（上面的 REGISTER_SNIPPET 已顺带幂等直写自己的 providerRule）。
     try {
       const prevRaw = fs.readFileSync(ZCODE_CFG, "utf8");
       const cfg = JSON.parse(prevRaw);
       const conf = cfg.config || {};
-      const rules = conf.providerConfigRules.providerRules;
-      const entries = conf.modelConfigRules.providerModelRules;
 
       // ① AutoClaw：目录以 a_switch.py 的 ZCODE_MODELS 为准（它带逐路由实测的视觉矩阵），
       //    这里只做并集与补条目，绝不删条目——曾因“统一修正成 4 个模型”把两个可用的
       //    DeepSeek 注册项删掉过。上下文长度按注册器的声明刷新，其余属性保留。
       const acCatalog = Array.isArray(res.catalog) ? res.catalog : [];
       if (acCatalog.length) {
-        const acIds = acCatalog.map((x) => x.modelId);
-        for (const rule of rules) {
-          if (rule.providerId === PROVIDER_ID) {
-            rule.config.personalModelIds = [...new Set([...(rule.config.personalModelIds || []), ...acIds])];
-          }
-        }
-        ZC.upsertModelEntries(entries, PROVIDER_ID,
-          acCatalog.map((x) => modelEntry(PROVIDER_ID, x.modelId, x.contextWindow || 500000, !!x.vision)));
-        res.models = acIds;
-        res.autoclaw = { registered: true, models: acIds };
+        applyPlatformReg(cfg, { kind: "autoclaw", catalog: acCatalog });
+        res.models = acCatalog.map((x) => x.modelId);
+        res.autoclaw = { registered: true, models: res.models };
       } else {
         res.autoclaw = { error: "注册器未返回模型目录（a_switch.py 未被加载？），目录未刷新" };
       }
 
-      // ② WorkBuddy：目录从网关动态拉取（新模型自动收录）
-      if (wbCatalog.length) {
-        ZC.upsertProviderRule(rules, { providerId: WB_PROVIDER_ID, providerName: "WorkBuddy", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: WB_API_KEY },
-            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${WB_PORT}/v1` },
-            personalModelIds: wbCatalog.map((m) => m[0]) } });
-        ZC.upsertModelEntries(entries, WB_PROVIDER_ID, wbCatalog.map(([id, ctx]) => modelEntry(WB_PROVIDER_ID, id, ctx)));
-        res.workbuddy = { registered: true, models: wbCatalog.map((m) => m[0]) };
-      } else {
-        res.workbuddy = { error: "WorkBuddy 网关未运行，模型目录未刷新（已注册条目保持不变）" };
+      // ②-⑦ WorkBuddy / Trae / 豆包 / Comate / Qoder CN + 千问办公：共用动态注册的素材构建器
+      for (const key of ["workbuddy", "trae", "doubao", "comate", "qoder"]) {
+        for (const [name, reg] of await platformCatalogs(key)) {
+          if (!reg.ok) { res[name] = { error: reg.error }; continue; }
+          const ar = applyPlatformReg(cfg, reg);
+          res[name] = ar.ok ? { registered: true, models: ar.models } : { error: ar.error };
+        }
       }
-
-      // ③ Trae：目录同样来自 relay（免费额度模型会自动收录）
-      if (traeCatalog.length) {
-        ZC.upsertProviderRule(rules, { providerId: TRAE_PROVIDER_ID, providerName: "Trae", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: TRAE_API_KEY },
-            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${TRAE_PORT}/v1` },
-            personalModelIds: traeCatalog.map((m) => m.id) } });
-        ZC.upsertModelEntries(entries, TRAE_PROVIDER_ID, traeCatalog.map((m) =>
-          // Trae 目录里 max 常为 0（如 glm-5.3 = {dev:200000,max:0}），真实可用值在 dev
-          modelEntry(TRAE_PROVIDER_ID, m.id, m.trae?.context_window?.dev || m.trae?.context_window?.max || 184000, !!m.trae?.multimodal)));
-        res.trae = { registered: true, models: traeCatalog.map((m) => m.id) };
-      } else {
-        res.trae = { error: "Trae 网关未运行，模型目录未刷新（已注册条目保持不变）" };
-      }
-
-      // ④ 豆包工作：目录来自 relay（当前为 doubao / doubao-think 两个合成模型）
-      if (doubaoCatalog.length) {
-        const ids = doubaoCatalog.map((m) => m.id);
-        ZC.upsertProviderRule(rules, { providerId: DOUBAO_PROVIDER_ID, providerName: "豆包工作", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: DOUBAO_API_KEY },
-            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${DOUBAO_PORT}/v1` },
-            personalModelIds: ids } });
-        ZC.upsertModelEntries(entries, DOUBAO_PROVIDER_ID, doubaoCatalog.map((m) => modelEntry(DOUBAO_PROVIDER_ID, m.id, 16000)));
-        res.doubao = { registered: true, models: ids };
-      } else {
-        res.doubao = { error: "豆包工作网关未运行，模型目录未刷新（已注册条目保持不变）" };
-      }
-
-      // ⑤ Comate（文心快码）：目录来自 relay（/api/v2/api/models/available 实时目录）
-      if (comateCatalog.length) {
-        const ids = comateCatalog.map((m) => m.id);
-        ZC.upsertProviderRule(rules, { providerId: COMATE_PROVIDER_ID, providerName: "Comate 文心快码", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: "comate-local" },
-            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${COMATE_PORT}/v1` },
-            personalModelIds: ids } });
-        ZC.upsertModelEntries(entries, COMATE_PROVIDER_ID, comateCatalog.map((m) => modelEntry(COMATE_PROVIDER_ID, m.id, 200000)));
-        res.comate = { registered: true, models: ids };
-      } else {
-        res.comate = { error: "Comate 网关未运行，模型目录未刷新（已注册条目保持不变）" };
-      }
-
-      // ⑥⑦ Qoder CN 与千问办公：同一个网关的两条出口，靠绑定出口的 Key 分流。
-      // 两把 Key 由控制台生成并写进网关（见 qoderEnsureRealmKeys），明文留在
-      // ~/.autoclaw-relay/qoder-realm-keys.json，此处只读取用于注册。
       const realmKeys = await qoderEnsureRealmKeys();
       res.realmKeys = realmKeys.ok ? { generated: realmKeys.generated, realms: realmKeys.realms }
         : { error: realmKeys.error };
-      // Qoder CN（已过滤掉账号不可用的付费项）
-      if (qoderCatalog.length) {
-        const ids = qoderCatalog.map((m) => m.id);
-        ZC.upsertProviderRule(rules, { providerId: QODER_PROVIDER_ID, providerName: "Qoder CN", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: qoderRealmKey("cn") || "qoder-local" },
-            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${QODER_PORT}/v1` },
-            personalModelIds: ids } });
-        ZC.upsertModelEntries(entries, QODER_PROVIDER_ID, qoderCatalog.map((m) => modelEntry(QODER_PROVIDER_ID, m.id, m.max_input_tokens || 200000)));
-        res.qoder = { registered: true, models: ids };
-      } else {
-        res.qoder = { error: "Qoder 网关未运行或账号池为空，模型目录未刷新（已注册条目保持不变）" };
-      }
-
-      // 千问办公（qworkcn 出口：标准 / 高级 / Qwen3.8-Max）
-      if (qwenworkCatalog.length) {
-        const ids = qwenworkCatalog.map((m) => m.id);
-        ZC.upsertProviderRule(rules, { providerId: QWENWORK_PROVIDER_ID, providerName: "千问办公", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: qoderRealmKey("qworkcn") || "qwenwork-local" },
-            api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${QODER_PORT}/v1` },
-            personalModelIds: ids } });
-        ZC.upsertModelEntries(entries, QWENWORK_PROVIDER_ID, qwenworkCatalog.map((m) => modelEntry(QWENWORK_PROVIDER_ID, m.id, m.max_input_tokens || 1000000)));
-        res.qwenwork = { registered: true, models: ids };
-      } else {
-        res.qwenwork = { error: "千问办公目录为空：网关未运行或 qworkcn 账号未同步（已注册条目保持不变）" };
-      }
 
       const order = conf.providerOrder || (conf.providerOrder = []);
       for (const p of [WB_PROVIDER_ID, TRAE_PROVIDER_ID, DOUBAO_PROVIDER_ID, COMATE_PROVIDER_ID, QODER_PROVIDER_ID, QWENWORK_PROVIDER_ID]) if (!order.includes(p)) order.push(p);
@@ -1128,7 +1228,7 @@ function setupIpc() {
     wbProc.on("exit", (code) => { log("workbuddy gateway exited", code); wbProc = null; });
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 500));
-      if (wbAlive()) return { ok: true };
+      if (wbAlive()) { queueZcodeSync({ upsert: ["workbuddy"] }); return { ok: true }; }
     }
     return { ok: false, error: st.error || "10 秒内未就绪，查看 server.log" };
   });
@@ -1139,6 +1239,7 @@ function setupIpc() {
       const pid = out.trim().split(/\s+/).pop();
       if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
       if (wbProc) { try { wbProc.kill(); } catch {} wbProc = null; }
+      queueZcodeSync({ remove: ["workbuddy"] });
       return { ok: true };
     } catch (e) { return { ok: false, error: String(e) }; }
   });
@@ -1187,8 +1288,10 @@ function setupIpc() {
         const h = await doubaoHealth();
         // 网关起来了但 cookie 过期/缺失：不算启动成功，把原因带出去让用户点「同步登录态」
         if (h.cookies && h.cookies.ok === false) {
+          queueZcodeSync({ upsert: ["doubao"] });
           return { ok: true, warn: `网关已启动，但豆包登录态不可用（${h.cookies.error || "缺少 " + (h.cookies.missing || []).join(",")}）` };
         }
+        queueZcodeSync({ upsert: ["doubao"] });
         return { ok: true };
       }
     }
@@ -1201,6 +1304,7 @@ function setupIpc() {
       const pid = out.trim().split(/\s+/).pop();
       if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
       if (doubaoProc) { try { doubaoProc.kill(); } catch {} doubaoProc = null; }
+      queueZcodeSync({ remove: ["doubao"] });
       return { ok: true };
     } catch (e) { return { ok: false, error: String(e) }; }
   });
@@ -1269,7 +1373,7 @@ function setupIpc() {
     traeProc.on("exit", (code) => { log("trae relay exited", code); traeProc = null; });
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 500));
-      if (traeAlive()) return { ok: true };
+      if (traeAlive()) { queueZcodeSync({ upsert: ["trae"] }); return { ok: true }; }
     }
     return { ok: false, error: st.error || `10 秒内未就绪（运行时：${nd.source}），查看 trae/relay.log` };
   });
@@ -1280,6 +1384,7 @@ function setupIpc() {
       const pid = out.trim().split(/\s+/).pop();
       if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
       if (traeProc) { try { traeProc.kill(); } catch {} traeProc = null; }
+      queueZcodeSync({ remove: ["trae"] });
       return { ok: true };
     } catch (e) { return { ok: false, error: String(e) }; }
   });
@@ -1319,7 +1424,8 @@ function setupIpc() {
       await new Promise((r) => setTimeout(r, 500));
       if (comateAlive()) {
         const h = await comateHealth();
-        if (!h.ok) return { ok: true, warn: `网关已启动，但 Comate 登录态不可用（${h.credential || "settings.json 缺 license"}）；安装并登录 Comate IDE 后即可用` };
+        if (!h.ok) { queueZcodeSync({ upsert: ["comate"] }); return { ok: true, warn: `网关已启动，但 Comate 登录态不可用（${h.credential || "settings.json 缺 license"}）；安装并登录 Comate IDE 后即可用` }; }
+        queueZcodeSync({ upsert: ["comate"] });
         return { ok: true };
       }
     }
@@ -1332,6 +1438,7 @@ function setupIpc() {
       const pid = out.trim().split(/\s+/).pop();
       if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
       if (comateProc) { try { comateProc.kill(); } catch {} comateProc = null; }
+      queueZcodeSync({ remove: ["comate"] });
       return { ok: true };
     } catch (e) { return { ok: false, error: String(e) }; }
   });
@@ -1372,7 +1479,8 @@ function setupIpc() {
       await new Promise((r) => setTimeout(r, 500));
       if (qoderAlive()) {
         const h = await qoderHealth();
-        if (!h.ok) return { ok: true, warn: `网关已启动，但账号池为空：点「同步账号」导入本机已登录的 Qoder/千问办公凭证` };
+        if (!h.ok) { queueZcodeSync({ upsert: ["qoder"] }); return { ok: true, warn: `网关已启动，但账号池为空：点「同步账号」导入本机已登录的 Qoder/千问办公凭证` }; }
+        queueZcodeSync({ upsert: ["qoder"] });
         return { ok: true };
       }
     }
@@ -1385,6 +1493,7 @@ function setupIpc() {
       const pid = out.trim().split(/\s+/).pop();
       if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
       if (qoderProc) { try { qoderProc.kill(); } catch {} qoderProc = null; }
+      queueZcodeSync({ remove: ["qoder"] });
       return { ok: true };
     } catch (e) { return { ok: false, error: String(e) }; }
   });
@@ -1393,7 +1502,7 @@ function setupIpc() {
     // 只用 enabled 的模型（Free 账号多数模型要付费，403 是终态；冒烟选第一个可用项）
     const models = (await qoderModels()).map((m) => m.id);
     if (!models.length) return { ok: false, error: "模型目录为空（网关账号池为空或未同步？）" };
-    const model = models.includes("Qwen3.8-Flash") ? "Qwen3.8-Flash" : models[0];
+    const model = models.includes("qwen3.8-flash") ? "qwen3.8-flash" : models[0];
     const r = await qoderHttp("POST", "/v1/chat/completions", {
       model, max_tokens: 64,
       messages: [{ role: "user", content: "请只回复OK" }],
@@ -1413,7 +1522,7 @@ function setupIpc() {
   handle("qwenwork:smoke", async () => {
     const models = (await qwenworkModels()).map((m) => m.id);
     if (!models.length) return { ok: false, error: "千问办公模型目录为空（账号池里没有 qworkcn 账号？点「同步账号」）" };
-    const model = models.includes("Qwen3.8-Flash") ? "Qwen3.8-Flash" : models[0];
+    const model = models.includes("qwen3.8-flash") ? "qwen3.8-flash" : models[0];
     const key = qoderRealmKey("qworkcn");
     const hdr = key ? { Authorization: `Bearer ${key}` } : { "X-Realm": "qworkcn" };
     const r = await qoderHttp("POST", "/v1/chat/completions", {
@@ -1459,6 +1568,10 @@ app.whenReady().then(() => {
   const wbBoot = ensureWbWorkDir();   // 打包态：播种 ~/.workbuddy-gateway/（config.json + auths/ + data/）
   if (wbBoot) log("workbuddy 自举失败:", wbBoot);
   setupIpc();
+  if (process.env.ASWITCH_SELFTEST !== "1") {
+    // 开机对账：活着的链路补注册进 ZCode，已停的摘除（后台串行跑，不阻塞窗口）
+    queueZcodeSync({ reconcile: true });
+  }
   if (process.env.ASWITCH_SELFTEST === "1") {
     // 自测模式：顺序执行各 IPC 处理器（等同逐个点击按钮），结果输出到 stdout
     const invoke = (ch, ...args) => {

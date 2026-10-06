@@ -58,16 +58,16 @@ const FALLBACK_ROUTES = [
   { id: "zai_auto", name: "Auto", contextWindow: 1048576, maxTokens: 131072 },
   { id: "zai_auto-fast", name: "Auto-Fast", contextWindow: 1048576, maxTokens: 393216 },
 ];
-// 对外暴露的友好别名（与 AutoClaw UI 的六个可选模型保持一致）。
+// 对外暴露的规范名（见 models-catalog.json 的统一命名规范）：全小写、无路由前缀。
 // DSH 的 dsh-deepseek-* / deepseek-flash 兼容名仍由 DSH_ALIASES 解析，
 // 但不放进公开清单，避免污染 ZCode 的模型选择列表。
 const ALIASES = [
-  "GLM-5.3",
-  "Deepseek-V4.1-Flash",
-  "DeepSeek-V4-Pro",
-  "GLM-5.3-Flash",
-  "Auto",
-  "Auto-Fast",
+  "glm-5.3",
+  "deepseek-v4.1-flash",
+  "deepseek-v4-pro",
+  "glm-5.3-flash",
+  "auto",
+  "auto-fast",
 ];
 
 // 显式模型名 -> route。要优先于下面的关键词正则：正则 /glm-5.3/ 会子串命中
@@ -2828,16 +2828,18 @@ const server = http.createServer(async (req, res) => {
       if (pathname === "/v1/models" || pathname === "/models") {
         const list = await getModels();
         const now = Math.floor(Date.now() / 1000);
-        const data = [
-          ...list.map((m) => ({
-            id: m.id, object: "model", created: now, owned_by: "autoclaw",
-            display_name: m.name, context_window: m.contextWindow, max_tokens: m.maxTokens,
-          })),
-          ...ALIASES.map((a) => ({
-            id: a, object: "model", created: now, owned_by: "autoclaw",
-            display_name: a, alias_of: normalizeRoute(a),
-          })),
-        ];
+        // 对外 id 一律规范名（models-catalog.json）：EXPLICIT_ROUTES 的反向映射给出
+        // route -> 规范名；route 前缀（zaicoding_/tdpsk_/zai_）是内部选路细节，不再当 id 暴露。
+        // normalizeRoute 对规范名/旧 TitleCase 名/路由名都宽容解析，双向兼容。
+        const canonOfRoute = new Map();
+        for (const [canon, rts] of Object.entries(EXPLICIT_ROUTES)) {
+          for (const rt of Array.isArray(rts) ? rts : [rts]) if (!canonOfRoute.has(rt)) canonOfRoute.set(rt, canon);
+        }
+        const data = list.map((m) => ({
+          id: canonOfRoute.get(m.id) || String(m.name || m.id).toLowerCase(),
+          object: "model", created: now, owned_by: "autoclaw",
+          display_name: m.name, context_window: m.contextWindow, max_tokens: m.maxTokens, route: m.id,
+        }));
         return sendJson(res, 200, { object: "list", data });
       }
       if (pathname === "/routes") {

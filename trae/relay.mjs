@@ -427,7 +427,10 @@ const json = (res, code, obj) => {
 async function resolveModel(requested, catalog) {
   if (!requested) return DEFAULT_MODEL;
   const clean = String(requested).replace(/^trae\//, "");
-  const hit = catalog.find((m) => m.name.toLowerCase() === clean.toLowerCase());
+  // 先精确命中（TitleCase 变体仍可解析），再忽略大小写（规范名/旧名都收）；
+  // 未知名字原样透传，由上游给准确错误
+  const hit = catalog.find((m) => m.name === clean)
+    || catalog.find((m) => m.name.toLowerCase() === clean.toLowerCase());
   return hit ? hit.name : clean;
 }
 
@@ -624,14 +627,24 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       const catalog = await listModels();
+      // 对外 id 一律规范名（见 models-catalog.json 命名规范）：统一小写、无大小写混排。
+      // 撞名时保留本就是小写拼写的那条（上游的规范形态，且覆盖组更全），
+      // TitleCase 重复条目并入；旧名仍可在 chat 侧解析（resolveModel 先精确后忽略大小写）。
+      const byCanon = new Map();
+      for (const m of catalog) {
+        const canon = String(m.name).toLowerCase();
+        const prev = byCanon.get(canon);
+        if (!prev) { byCanon.set(canon, m); continue; }
+        if (prev.name !== canon && m.name === canon) byCanon.set(canon, m);
+      }
       return json(res, 200, {
         object: "list",
-        data: catalog.map((m) => ({
-          id: m.name,
+        data: [...byCanon.entries()].map(([id, m]) => ({
+          id,
           object: "model",
           created: Math.floor(Date.now() / 1000),
           owned_by: "trae",
-          trae: { group: m.group, groups: m.groups, display_name: m.display_name, context_window: m.context_window_tokens, multimodal: m.multimodal },
+          trae: { group: m.group, groups: m.groups, display_name: m.display_name, context_window: m.context_window_tokens, multimodal: m.multimodal, upstream_name: m.name },
         })),
       });
     }

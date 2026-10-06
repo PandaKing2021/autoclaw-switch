@@ -155,9 +155,53 @@ function upsertModelEntries(entries, providerId, newEntries) {
   return entries;
 }
 
+/**
+ * 注销供应商：从 providerRules / providerModelRules / providerOrder 三处摘除。
+ * 只允许对"自己注册的供应商"调用（调用方负责核对 providerId 归属）；
+ * 结构不丢断言由 writeZcodeConfig 的 allowRemovedPaths 白名单兜底——
+ * 调用方必须用 removedProviderAllowPaths() 生成放行前缀，缺了会被闸门整单拒绝。
+ * 就地修改 cfg 并返回实际摘除数量（供调用方判断"本来就不存在则免写盘"）。
+ */
+function removeProviders(cfg, providerIds) {
+  const ids = new Set(providerIds);
+  const conf = cfg.config || {};
+  let removed = 0;
+  const rules = conf.providerConfigRules?.providerRules;
+  if (Array.isArray(rules)) {
+    const next = rules.filter((r) => !ids.has(r?.providerId));
+    removed += rules.length - next.length;
+    rules.length = 0;
+    rules.push(...next);
+  }
+  const entries = conf.modelConfigRules?.providerModelRules;
+  if (Array.isArray(entries)) {
+    const next = entries.filter((e) => !ids.has(e?.providerId));
+    removed += entries.length - next.length;
+    entries.length = 0;
+    entries.push(...next);
+  }
+  const order = conf.providerOrder;
+  if (Array.isArray(order)) {
+    const next = order.filter((p) => !ids.has(p));
+    removed += order.length - next.length;
+    order.length = 0;
+    order.push(...next);
+  }
+  return removed;
+}
+
+/** 注销时的结构放行前缀：providerRules 与 providerModelRules 两处、[pid] 与 [pid/ 两种元素路径形态 */
+function removedProviderAllowPaths(providerIds) {
+  return providerIds.flatMap((p) => [
+    `config.providerConfigRules.providerRules[${p}]`,
+    `config.providerConfigRules.providerRules[${p}/`,
+    `config.modelConfigRules.providerModelRules[${p}]`,
+    `config.modelConfigRules.providerModelRules[${p}/`,
+  ]);
+}
+
 /** 只读体检：报告配置里所有供应商的 api.type 是否合法、结构是否完整（不写文件） */
-function checkZcodeConfig(cfgPath) {
-  const cfg = readConfig(cfgPath);
+function checkZcodeConfig(cfgPath) {  const cfg = readConfig(cfgPath);
   const conf = cfg.config || {};
   const rules = conf.providerConfigRules?.providerRules || [];
   const illegal = rules.filter((r) => r.config?.api?.type && !ZCODE_API_TYPES.includes(r.config.api.type))
@@ -181,4 +225,5 @@ module.exports = {
   ZCODE_API, ZCODE_API_TYPES,
   readConfig, structurePaths, elementId,
   writeZcodeConfig, upsertProviderRule, upsertModelEntries, checkZcodeConfig,
+  removeProviders, removedProviderAllowPaths,
 };

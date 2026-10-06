@@ -1542,8 +1542,11 @@ def model_entry(mid, meta):
     """
     meta = meta or {}
     display_name = meta.get("name") or meta.get("display_name") or mid
+    # 对外 id 用规范名（见 qoder_catalog.canonical_model_id 与 models-catalog.json）：
+    # 官方显示名保留在 name/display_name，缩写 key 与显示名都进 aliases 兼容旧客户端
+    canonical = qoder_catalog.canonical_model_id(mid, display_name)
     item = {
-        "id": display_name,
+        "id": canonical,
         "object": "model",
         "created": int(time.time()),
         "owned_by": "qoder",
@@ -1567,8 +1570,10 @@ def model_entry(mid, meta):
         local = ""
     if local:
         item["name_local"] = local
-    # 所有可接受的填写形式
+    # 所有可接受的填写形式（缩写 key、「key (Name)」、官方显示名、人类别名）
     aliases = [mid, "%s (%s)" % (mid, display_name)] if display_name != mid else [mid]
+    if display_name != canonical and display_name not in aliases:
+        aliases.append(display_name)
     for ak, av in qoder_catalog.MODEL_ALIASES.items():
         if av == mid and ak not in aliases:
             aliases.append(ak)
