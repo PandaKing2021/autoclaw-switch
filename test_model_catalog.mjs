@@ -55,8 +55,10 @@ t("② trae: id === upstream 小写（逐条）", true);
     .map((p) => path.join(root, p)).find((p) => fs.existsSync(p));
   const py = fs.readFileSync(pyPath, "utf8");
   const block = /ZCODE_MODELS\s*=\s*\[([\s\S]*?)\n\]/.exec(py);
+  // 只认没被注释掉的条目：名单里允许留注释掉的示例条目（如权益被移除、待恢复的模型）
+  const liveBlock = block ? block[1].split("\n").filter((l) => !/^\s*#/.test(l)).join("\n") : "";
   const rows = block
-    ? [...block[1].matchAll(/\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*(True|False)\s*,\s*(\d+)\s*\)/g)]
+    ? [...liveBlock.matchAll(/\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*(True|False)\s*,\s*(\d+)\s*\)/g)]
         .map((m) => ({ id: m[1], route: m[2], vision: m[3] === "True", contextWindow: Number(m[4]) }))
     : [];
   t("③ a_switch.py: ZCODE_MODELS 可解析且非空", rows.length > 0, rows.length ? "" : "正则未匹配到任何条目");

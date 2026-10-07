@@ -6,7 +6,7 @@
 
 | 平台 | 额度来源 | 接入方式 | 网关对外 | 上游协议形态† | 端口 | 模型数* | 工具调用 |
 |---|---|---|---|---|---|---|---|
-| **AutoClaw**（智谱 Z.ai） | 账号积分，支持多号池 | 桥接客户端登录态 → 自建 relay | anthropic + openai + responses | **原生 chat completions**（persona 闸门） | 18766 | 6 | ✅ 结构化 |
+| **AutoClaw**（智谱 Z.ai） | 账号积分，支持多号池 | 桥接客户端登录态 → 自建 relay | anthropic + openai + responses | **原生 chat completions**（persona 闸门） | 18766 | 4 | ✅ 结构化 |
 | **WorkBuddy**（腾讯 CodeBuddy） | Free 档每月 100 + 每日 30 积分 | 本地 Go 网关（wb2api） | openai | **原生 chat completions**（body 原样透传） | 7863 | 46 | ✅ 结构化 |
 | **Trae SOLO CN**（字节） | 免费会话额度 | 离线解密客户端凭证 → 驱动其远端 agent 会话 | openai + anthropic | agent 会话协议（历史拍平成文本） | 18768 | 28 | ❌ 仅文本 |
 | **豆包工作**（字节 DoubaoWork） | 客户端内置额度 | CDP 取登录 cookie → 直连 `/chat/completion` | openai + anthropic | 网页 IM 协议（历史拍平成文本） | 18770 | 2（合成） | ❌ 仅文本 |
@@ -14,7 +14,7 @@
 | **Qoder CN**（阿里） | 客户端内置额度（Free 档 Qwen3.8 系可用） | vendored 社区网关（COSY 签名）+ 本机凭证入池 | openai + responses | COSY 信封 agent SSE（历史拍平、**工具真列表**） | 8791 | 14 | ✅ 透传 |
 | **千问办公**（QoderWork CN） | 同 Qoder 平台，独立网关 | 同 COSY 体系，多一处形态声明（见千问办公一节） | openai + responses | 同上（qwork 场景 + 工作台形态声明） | 8791 | 3 | ✅ 透传 |
 
-\* 模型目录随账号动态拉取，表中为 2026-10 本机实测值；豆包的目录在服务端且不可枚举，网关只能给出两个合成条目。Trae 上游同一模型的大小写两条（如 `DeepSeek-V4-Flash` 仅 solo_coder 组）已并入小写规范名条目，快照见 `models-catalog.json`。
+\* 模型目录随账号动态拉取，表中为 2026-10 本机实测值；AutoClaw 的 4 个是本机账号当前目录（两条 `tdpsk_deepseek-*` 被上游移除，见[供应商注册一节](#zcode-供应商注册写入安全边界重要)）。豆包的目录在服务端且不可枚举，网关只能给出两个合成条目。Trae 上游同一模型的大小写两条（如 `DeepSeek-V4-Flash` 仅 solo_coder 组）已并入小写规范名条目，快照见 `models-catalog.json`。
 † 这是**上游**真实说话的方式，与"网关对外暴露什么"是两回事——七条链路的入口全都是 chat completions，但只有前两家上游本身就是 chat completions。逐家证据与对使用体感的影响见[上游协议保真度](#上游协议保真度谁是真的-chat-completions)。
 ‡ Comate 的"会话续跑"是指工具循环：上游 agent 发起的调用（`Write`/`Read`/`Bash`…）翻译成调用方协议里的工具调用，执行结果经 `toolUseResults` 在**同一个 conversation+task** 上续跑交付。工具集是上游 agent 自己的，不是调用方声明的——调用方需要有同名（或 canonical 同名）的工具才能执行，详见 [Comate 一节](#comate-文心快码settingsjson-里的-license--云端-agent-三步链)。
 
@@ -111,7 +111,7 @@ Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + 日志 + 顶
 cd app && npm start                     # 启动（等价于 npx electron .）
 ASWITCH_SELFTEST=1 npx electron .       # 27 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 闸门断言 + 日志 + relay 停复）
 ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # 只跑指定处理器
-node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，18 条用例）
+node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，19 条用例）
 node test_model_catalog.mjs             # 模型命名一致性检查（离线 11 条；--live 连同在跑的网关一起验）
 ```
 
@@ -145,13 +145,16 @@ AutoClaw 2.0.1 相比 1.17.8 有五处结构性变化，每一处都会让旧版
 
 反代自动把 persona 整体替换为 system，并把调用方（ZCode）原有的 system 指令挪到首条 user 消息里作上下文——模型仍然看得到全部指令。
 
+> **★ 双线统一（2026-10）**：上游已把 2.x 适配并进 `relay/server.mjs`——**国内/国际通用**的单进程反代，同一端口（18766）、同一账号池按号选线：海外号（`aswitch_cloud_pool.json`，默认 lane）走 `autoglm-api.autoglm.ai` + 2.0.2 契约（harness 标记闸门 + 每请求现刷票）；国内号（`~/.autoclaw-relay/auth-compat/auth-cn.json`，由 `bridge/watch_auth.py` 从 2.x 客户端解密、跟随轮换自动刷新）走 `autoglm-api.zhipuai.cn` + 官方渠道契约（persona system 整体替换 + X-Session-Id/签名三件套 + `node:https` 传输）。挑号日志带 `(cn)`/`(oversea)` 标识，healthz 池子混编；想加国内号：装 2.x 客户端登录 → `python bridge/watch_auth.py` 常驻，完事。
+
 **上游协议是原生 chat completions**（与 WorkBuddy 同级）：请求发到 `{CLOUD_BASE}/chat/completions`，body 就是 OpenAI 形状（`messages` + `max_completion_tokens` 307200 + `stream_options.include_usage` + `store:false` + `reasoning_effort:high`）。入口有三个协议都收：Anthropic `/v1/messages`（`anthropicToOpenai()` 转换，工具声明由 `anthropicToolsToOpenai()` 转成 OpenAI 格式一并转发）、OpenAI `/v1/chat/completions`（原样）、Responses `/v1/responses`（`responsesToolsToChat()` 转成 chat 形状再走同一条上游）。
 
 | 组件 | 作用 |
 |---|---|
+| `relay/server.mjs` | ★ 上游主线的双线统一反代——`a_switch.py` 一键反代部署的就是它，双客户端凭证桥（auth-cn / auth-oversea）、410004 拉黑、2.0.2 网关修缮都落在它上面 |
+| `bridge/server_2x.mjs` | PR#4 的 2.x 独立部署版反代（控制台「启动 AutoClaw」部署的是它），同样按账号 lane 走国内/国际两条线 |
 | `bridge/make_compat_auth.py` | 凭证桥接：DPAPI 解密 2.x 凭证 → 合成旧版 auth.json |
-| `bridge/watch_auth.py` | 凭证自动同步器（常驻，应用轮换 token 即自动跟进） |
-| `bridge/server_2x.mjs` | ★ 2.x 权威反代（部署到 `~/.autoclaw-relay/server.mjs`） |
+| `bridge/watch_auth.py` | 凭证自动同步器（常驻，应用轮换 token 即自动跟进；按客户端安装源分写 `auth-compat/auth-cn.json` / `auth-oversea.json`） |
 | `bridge/extract_persona.py` | 从已安装客户端提取应用 persona（闸门硬要求；厂商文本不入仓库，客户端升级自动跟进，离线测试 `test_extract_persona.py`） |
 
 ### WorkBuddy：本地 Go 网关
@@ -277,10 +280,10 @@ ZCode 里能看到哪个供应商 = 对应平台链路此刻开启。这是控�
 - **注册结果里的 `ok` 只代表"目录取到了"**，写入是否被闸门拦下是另一个字段 `registerError`——历史上出现过"自检全绿、配置根本没变"的假绿，现在自测里有一条 `zcode:register:未被闸门拦下` 专门断言它为空
 - **目录只做并集**：`personalModelIds` 只加不删，模型条目缺则补；已存在条目的能力声明（如 `supportsImage`）保留，只刷新 `contextWindow`
 - **原子写 + 读回校验 + 回滚**：先写临时文件再 rename，写完重新解析，失败自动回滚到 `*.bak-<时间戳>`
-- **AutoClaw 的目录真源是 `a_switch.py` 的 `ZCODE_MODELS`**（6 个模型，带逐路由实测的视觉矩阵），控制台不自带写死的列表
+- **AutoClaw 的目录真源是 `a_switch.py` 的 `ZCODE_MODELS`**（4 个模型，带逐路由实测的视觉矩阵），控制台不自带写死的列表；两条 `tdpsk_deepseek-*`（DeepSeek-V4.1-Flash / DeepSeek-V4-Pro）因上游 2026-09-29 把它们移出账号模型目录（请求回 400 非法模型）而暂不注册，名单里注释保留、权益恢复即补回
 - **出口选择靠绑 Key，不靠请求头**：ZCode 的供应商条目没有自定义请求头字段，而 Qoder CN 与千问办公共用 `8791` 一个进程，于是注册前先调网关面板生成两把绑定到各自区域的 Key（`~/.autoclaw-relay/qoder-realm-keys.json`，0600 权限，明文只留本机），并顺带下发 `auth_disabled: true`——否则网关一旦存在 Key 就要求 `/v1` 全部带 Key，老注册会突然 401；写面板时用空 `key` 值占位保留别人建的条目，只增改自己那两条
 
-沙箱回归测试 `node app/test_zcode_config.js`（**18 条用例**，纯合成 fixture，跑在临时目录里、不动你本机的配置）：A1/A2/A3 正好是上面两个历史错误（非法枚举、丢兄弟键），旧实现必失败、现实现必通过；A4 是"缺 `modelId` 的坏条目也能被本家目录重写覆盖"——只放行带斜杠的写法会被这条卡住；H1–H4 覆盖动态增删的"删"半边（摘除干净且别家无损、无白名单的注销被闸门拒绝、注销不存在的供应商零改动、白名单前缀不越界）；G1 是下面这条源码卫生回归。
+沙箱回归测试 `node app/test_zcode_config.js`（**19 条用例**，纯合成 fixture，跑在临时目录里、不动你本机的配置）：A1/A2/A3 正好是上面两个历史错误（非法枚举、丢兄弟键），旧实现必失败、现实现必通过；A4 是"缺 `modelId` 的坏条目也能被本家目录重写覆盖"——只放行带斜杠的写法会被这条卡住；H1–H4 覆盖动态增删的"删"半边（摘除干净且别家无损、无白名单的注销被闸门拒绝、注销不存在的供应商零改动、白名单前缀不越界）；G1 是下面这条源码卫生回归。
 
 **另一个非闸门的教训**：`app/main.js` 里**同一作用域重复声明同名函数，JS 会静默覆盖**（不报错，`node --check` 也过）——曾经因此把 `comateModels()` 覆盖成返回字符串数组的版本，15 条 Comate 目录的 `modelId` 全写成 `null`，而注册还报 ok。现在 `test_zcode_config.js` 的 G1 用例会扫描 `main.js` 里所有顶层 `function` 声明并要求唯一。
 
@@ -343,7 +346,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 #     若网关侧开了校验，就用 realm-keys 里那一对 Key 走 Authorization: Bearer
 ```
 
-回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，18 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
+回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
 
 注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
 
@@ -374,7 +377,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 
 **全部七家的共同限制（先说清楚）**：入口虽然都是标准 chat completions，但只有 WorkBuddy 与 AutoClaw 的上游本身是 chat completions（`messages`/`tools` 结构化保真）；其余五家要把历史"拍平成文本"再喂给上游的 agent 协议，因此**多轮里的工具往返、结构化角色、附件引用都可能失真**，长会话尤其明显。五家里 Qoder CN 与千问办公是特例（工具声明是真列表，只有历史是文本），所以工具闭环仍然成立。逐家证据见[上游协议保真度](#上游协议保真度谁是真的-chat-completions)。
 
-**模型的视觉能力按路由实测配置**：GLM-5.3-Flash、DeepSeek-V4.1-Flash、Auto 系列可以看图；GLM-5.3（coding 版）和 DeepSeek-V4-Pro 不行，发图它会说看不见。
+**模型的视觉能力按路由实测配置**：GLM-5.3-Flash、Auto 系列可以看图；GLM-5.3（coding 版）不行，发图它会说看不见。（实测矩阵里 DeepSeek-V4.1-Flash 可看图、DeepSeek-V4-Pro 不行，但这两条路由 2026-09-29 起被上游移出账号目录、暂未注册，权益恢复后按原矩阵补回。）
 
 **Trae 的固有限制**：工具调用不透传（agent 自行决定，OpenAI 的 `tools` 字段被忽略，模型只回文本）；每轮固定开销约 17.6k prompt token（Trae 自己的 agent system prompt），短问答不划算，更适合长任务、长上下文场景。
 
@@ -391,13 +394,13 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 ├── app/                           ← Electron 管理控制台（七平台统一面板 + ZCode 注册）
 │   ├── main.js / preload.js       生命周期管理 + IPC（含 ASWITCH_SELFTEST 自测模式）
 │   ├── zcode-config.js            ★ ZCode 配置写入闸门（纯 Node：枚举/结构/原子/回滚 + 动态注销）
-│   ├── test_zcode_config.js       配置闸门与主进程源码卫生的沙箱回归测试（18 条用例）
+│   ├── test_zcode_config.js       配置闸门与主进程源码卫生的沙箱回归测试（19 条用例）
 │   ├── test_client.mjs            CDP 端的 GUI 自测脚本（需控制台带 --remote-debugging-port=9222）
 │   └── renderer/                  状态面板 UI（index.html / ui.js / style.css）
 ├── bridge/                        ← AutoClaw 2.x 适配层
 │   ├── make_compat_auth.py        凭证桥接（DPAPI 解密 → auth.json）
 │   ├── watch_auth.py              凭证自动同步器（常驻）
-│   ├── server_2x.mjs              ★ 2.x 权威反代（全部补丁就绪）
+│   ├── server_2x.mjs              PR#4 的 2.x 独立部署版反代（控制台「启动 AutoClaw」部署它；上游主线已并入 relay/server.mjs）
 │   ├── extract_persona.py         ★ 从已装客户端提取应用 persona（厂商文本不入库；随包种子仅兜底）
 │   └── test_*.mjs / probe_*.mjs   406 闸门的实验、验证与二分脚本（30 个）
 ├── trae/                          ← Trae SOLO CN 反代
@@ -435,7 +438,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 ├── models-catalog.json            ★ 模型统一命名规范 + 七平台规范名对照（单一事实源）
 ├── test_model_catalog.mjs           命名一致性守门（离线 11 条；--live 连网关一起验）
 ├── a_switch_app.py                ← A-SWITCH 1.x GUI（pywebview）
-├── relay/server.mjs               ← 1.x 反代（2.x 用户请用 bridge/server_2x.mjs）
+├── relay/server.mjs               ← 上游主线的双线统一反代（国内/国际通用；a_switch.py 一键反代部署的就是它）
 ├── A-SWITCH.spec / tools/ / assets/   PyInstaller 打包配置、邮件辅助脚本、图标
 ├── workbuddy/                     ← WorkBuddy 网关（**不入库**：exe 与 Go 源码需自备，见下）
 │   └── workbuddy-manager-v1.0.79/upstream/{wb2api.exe, wb2api-login.exe, config.json}

@@ -18,11 +18,9 @@
       "providerId": "autoclaw-glm-provider",
       "port": 18766,
       "protocol": "anthropic-messages",
-      "catalogSource": "autoclaw-switch/a_switch.py 的 ZCODE_MODELS（含逐路由实测视觉矩阵）",
+      "catalogSource": "autoclaw-switch/a_switch.py 的 ZCODE_MODELS（含逐路由实测视觉矩阵；tdpsk_deepseek-* 两条 2026-09-29 起被上游移出账号目录、请求回 400，已在 a_switch.py 名单里注释保留，权益恢复后一并补回）",
       "models": [
         { "id": "glm-5.3", "display": "GLM-5.3", "route": "zaicoding_glm-5.3", "vision": false, "contextWindow": 500000 },
-        { "id": "deepseek-v4.1-flash", "display": "DeepSeek-V4.1-Flash", "route": "tdpsk_deepseek-v4-flash-202605", "vision": true, "contextWindow": 500000 },
-        { "id": "deepseek-v4-pro", "display": "DeepSeek-V4-Pro", "route": "tdpsk_deepseek-v4-pro-202606", "vision": false, "contextWindow": 500000 },
         { "id": "glm-5.3-flash", "display": "GLM-5.3-Flash", "route": "zai_glm-5.3-flash", "vision": true, "contextWindow": 500000 },
         { "id": "auto", "display": "Auto", "route": "zai_auto", "vision": true, "contextWindow": 500000 },
         { "id": "auto-fast", "display": "Auto-Fast", "route": "zai_auto-fast", "vision": true, "contextWindow": 500000 }

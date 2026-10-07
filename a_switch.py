@@ -1131,15 +1131,36 @@ def _autoclaw_roots():
     if env:
         roots.append(Path(env))
     for drive in ("C:", "D:", "E:", "F:"):
-        roots.append(Path(drive) / "AutoClaw")
-        roots.append(Path(drive) / "Program Files" / "AutoClaw")
+        roots.append(Path(drive + "\\") / "AutoClaw")          # Path("C:")/"x" 是盘符相对路径（无分隔符），必须补 \n        roots.append(Path(drive + "\\") / "Program Files" / "AutoClaw")
     roots.append(Path.home() / "AppData" / "Local" / "AutoClaw")
     return roots
 
-AUTOCLAW_EXE_CANDIDATES = [r / "AutoClaw.exe" for r in _autoclaw_roots()]
+AUTOCLAW_EXE_CANDIDATES = [r / "AutoClaw.exe" for r in _autoclaw_roots()] \
+                        + [r / "AutoClaw2.exe" for r in _autoclaw_roots()]
+
+
+def _running_autoclaw_exes():
+    """从正在运行的进程里找 AutoClaw*.exe 的真实路径。
+
+    客户端可能装在目录扫描覆盖不到的地方（本机就在 D:\\APP\\code\\autoclaw\\AutoClaw2\\），
+    而运行中的进程路径是权威来源，且不做任何网络请求。
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process AutoClaw* -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:
+        return []
+    return [Path(p) for p in (l.strip() for l in out.splitlines()) if p.lower().endswith(".exe")]
 
 
 def find_autoclaw_exe() -> Path | None:
+    for p in _running_autoclaw_exes():
+        if p.is_file():
+            return p
     for p in AUTOCLAW_EXE_CANDIDATES:
         if p.is_file():
             return p
@@ -1199,10 +1220,17 @@ def _read_exe_file_version(exe: Path) -> str:
 def autoclaw_running() -> bool:
     import subprocess
     try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq AutoClaw.exe", "/FO", "CSV"],
-                             capture_output=True, timeout=10,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-        return b"AutoClaw.exe" in (out or b"")
+        # 2.x 客户端进程名是 AutoClaw2.exe，两个镜像都要查
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AutoClaw.exe", "/FO", "CSV"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        out2 = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AutoClaw2.exe", "/FO", "CSV"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        return (b"AutoClaw.exe" in (out or b"")
+                or b"AutoClaw2.exe" in (out2 or b""))
     except Exception:
         return False
 
@@ -1291,26 +1319,27 @@ _ISOLATED_PIDS: set = set()  # 本工具启动的隔离登录实例 PID（登录
 
 
 def _autoclaw_pids() -> set:
-    """所有 AutoClaw.exe 的 PID。
+    """所有 AutoClaw*.exe（1.x AutoClaw.exe + 2.x AutoClaw2.exe）的 PID。
 
     ⚠ AutoClaw 以管理员运行，非管理员查询 CIM 时 CommandLine 是空的
     （这正是 1.18.x 上"启动后探测不到进程"的根因），但 tasklist/CIM 的
     PID 永远可见——所以一切定位改用 PID 差集，不再匹配命令行。
     """
     import subprocess
+    pids = set()
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq AutoClaw.exe", "/FO", "CSV"],
-            capture_output=True, timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-        pids = set()
-        for line in (out or b"").decode("gbk", "replace").splitlines():
-            parts = [x.strip('"') for x in line.split('","')]
-            if len(parts) >= 2 and parts[0] == "AutoClaw.exe":
-                try:
-                    pids.add(int(parts[1]))
-                except ValueError:
-                    pass
+        for image in ("AutoClaw.exe", "AutoClaw2.exe"):
+            out = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV"],
+                capture_output=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            for line in (out or b"").decode("gbk", "replace").splitlines():
+                parts = [x.strip('"') for x in line.split('","')]
+                if len(parts) >= 2 and parts[0] == image:
+                    try:
+                        pids.add(int(parts[1]))
+                    except ValueError:
+                        pass
         return pids
     except Exception as e:
         log(f"枚举 AutoClaw 进程失败：{type(e).__name__}: {e}")
@@ -2502,6 +2531,16 @@ def _launch_isolated_profile(profile_dir: Path) -> set:
     env["OPENCLAW_STATE_DIR"] = str(isolated_home / ".openclaw-autoclaw")
     env["USERPROFILE"] = str(isolated_home)
     env["HOME"] = str(isolated_home)
+    # 2.x 客户端 pinUserDataDirectory() 在 single-instance lock 前调
+    # app.getPath("appData")（Windows 上直接读 APPDATA 环境变量）；
+    # 只改 USERPROFILE/HOME 会让 APPDATA 与 USERPROFILE 指向分裂，
+    # Electron 早期启动即抛 "Failed to get 'appData' path"。三件套一起重定向：
+    iso_appdata = isolated_home / "AppData" / "Roaming"
+    iso_local = isolated_home / "AppData" / "Local"
+    iso_appdata.mkdir(parents=True, exist_ok=True)
+    iso_local.mkdir(parents=True, exist_ok=True)
+    env["APPDATA"] = str(iso_appdata)
+    env["LOCALAPPDATA"] = str(iso_local)
     before = _autoclaw_pids()
     try:
         subprocess.Popen(cmd, env=env,
@@ -2518,7 +2557,49 @@ def _launch_isolated_profile(profile_dir: Path) -> set:
             _ISOLATED_PIDS.update(new)
             return new
         time.sleep(0.6)
+    # 40s 内没等到 PID 差集 ≠ 实例没起来（冷启动/杀软延迟可能超过 deadline）。
+    # 按临时 profile 特征兜底扫一次：只要有用这个 profile 目录的实例在跑，
+    # 一样登记为隔离实例，否则调用方按"启动失败"跳过 → 进程泄漏成多余窗口
+    #（2026-10-07 实测泄漏：两个 sweep 实例挂了 8 小时才被用户发现）。
+    leaked = _pids_with_userdata(profile_dir)
+    if leaked:
+        _ISOLATED_PIDS.update(leaked)
+        log(f"启动确认超时，但发现 {len(leaked)} 个持有该 profile 的实例，已登记隔离")
+        return leaked
     return set()
+
+
+def _pids_with_userdata(profile_dir: Path) -> set:
+    """按 --user-data-dir=<profile_dir> 特征找实例 PID（兜底泄漏清理用）。
+
+    ⚠ 提权进程的 CommandLine 对非管理员不可见（空串），此时返回空集——
+    兜底只在能看见命令行的场景生效；打包版 A-SWITCH 以管理员运行，可见。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name LIKE 'AutoClaw%'\" "
+             "| Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"],
+            capture_output=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        import json as _json
+        data = _json.loads((out or b"{}").decode("utf-8", "replace") or "{}")
+        items = data.get("ProcessId") and [data] or data if isinstance(data, list) else [data] if data else []
+        needle = str(profile_dir).lower()
+        hits = set()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            cl = str(it.get("CommandLine") or "")
+            if needle in cl.lower():
+                try:
+                    hits.add(int(it.get("ProcessId")))
+                except (TypeError, ValueError):
+                    pass
+        return hits
+    except Exception:
+        return set()
 
 
 def _kill_isolated(pids=None, wait: int = 12) -> None:
@@ -2637,23 +2718,16 @@ def _wait_for_login(profile_dir: Path, timeout: int = 300, on_progress=None,
         if honor_cancel and LOGIN_CANCEL.is_set():
             cancelled = True
             break
-        # 回跳自检：登录期间主 profile 的 auth.json 被改写 = z.ai 网页登录的深链
-        # （autoclaw:// → 系统拉起 D:\AutoClaw\AutoClaw.exe 接收）已把凭证落回主配置。
-        # 若身份仍是快照里那个号 = 浏览器交回的就是当前已登录账号（不是新号），
-        # 立刻点破并给出动作指引，别让用户傻等 300 秒超时。
-        if (not handover_reported and main_uid and main_auth.is_file()
-                and main_auth.stat().st_mtime >= flow_start):
+        _inflight_beat(profile_dir)      # 心跳：标记本登录目录"进行中"，防孤儿清理误删
+        # 实时监听兑换失败（630014 审核拒绝 / 631001 域名风控 / ...）：后端拒绝后 token
+        # 永远不会落盘，继续等只是白等 300 秒——日志里出现 failed 立即退出，报错里带真因。
+        _authlog = profile_dir / "_home" / ".openclaw-autoclaw" / "logs" / "autoclaw-auth.log"
+        if _authlog.is_file():
             try:
-                dd = json.loads(main_auth.read_text(encoding="utf-8", errors="replace"))
-                ui = dd.get("userInfo") or {}
-                uid_now = str(ui.get("user_id") or "")
-                if uid_now and uid_now == str(main_uid):
-                    handover_reported = True
-                    if on_progress:
-                        who = ui.get("email") or ui.get("user_name") or main_uid
-                        on_progress(f"⚠ 浏览器回跳交回的是当前已登录的账号（{who}）——不是新号。"
-                                    "请先在浏览器退出该账号、登录你想添加的账号，"
-                                    "然后在登录窗口重新点一次登录")
+                _txt = _authlog.read_text(encoding="utf-8", errors="replace")
+                if "oauth-login-zai.failed" in _txt or "oauth-login.failed" in _txt:
+                    cancelled = True
+                    break
             except Exception:
                 pass
         for d in cands:
@@ -3005,6 +3079,11 @@ def export_cloud_pool(entries: list) -> dict:
             "uid": str(a.user_id or a.appdata_dir.name),
             "name": a.nickname,
             "auth": tok if tok.lower().startswith("bearer ") else f"Bearer {tok}",
+            # 2026-09-30 起 2.0.2 网关对 chat 端点校验 token 新鲜度（分钟级，尽管 JWT
+            # 写 24h），relay 必须在每次模型请求前现刷一票；refresh_token+device_id
+            # 是刷票的原料，与 access token 同级明文落盘（同 request-headers.json 风险）。
+            "refresh_token": getattr(a, "refresh_token", "") or "",
+            "device_id": getattr(a, "device_id", "") or "",
             "access_expires_at": exp,
             "points": e.get("points"),
             "expiring": e.get("expiring"),
@@ -3921,8 +4000,11 @@ ZCODE_BASE_URL = f"http://127.0.0.1:{RELAY_PORT}"
 # 旧 TitleCase 名仍被 relay 的 normalizeRoute 宽容解析，双向兼容。
 ZCODE_MODELS = [
     ("glm-5.3",             "zaicoding_glm-5.3",              False, 500000),
-    ("deepseek-v4.1-flash", "tdpsk_deepseek-v4-flash-202605", True,  500000),
-    ("deepseek-v4-pro",     "tdpsk_deepseek-v4-pro-202606",   False, 500000),
+    # 2026-09-29 起本机账号的模型目录里 tdpsk_deepseek-* 两条被上游移除
+    # （runtime/model-catalog/remote-snapshot.json 只剩 4 个模型），请求回 400 非法模型。
+    # 权益恢复后把下面两行取消注释加回来即可（测试脚本会忽略注释掉的条目）：
+    # ("deepseek-v4.1-flash", "tdpsk_deepseek-v4-flash-202605", True,  500000),
+    # ("deepseek-v4-pro",     "tdpsk_deepseek-v4-pro-202606",   False, 500000),
     ("glm-5.3-flash",       "zai_glm-5.3-flash",              True,  500000),
     ("auto",                "zai_auto",                       True,  500000),
     ("auto-fast",           "zai_auto-fast",                  True,  500000),
@@ -3978,6 +4060,7 @@ def write_single_credential() -> bool:
 
 
 def relay_start() -> dict:
+    import subprocess
     node = find_node_exe()
     if not node:
         return {"ok": False, "error": "找不到 node.exe（AutoClaw 安装目录或系统 PATH）"}
@@ -3985,6 +4068,12 @@ def relay_start() -> dict:
     write_single_credential()
     logf = open(relay_home() / "relay.log", "ab")
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    # X-Version 必须跟随本机真实客户端（2.0.2 起上游对旧版本号回 406 空响应体，
+    # 和缺 harness 标记的表现完全一样，极易误判成"账号未放行"）。relay 启动时
+    # 读 AUTOCLAW_CLIENT_VERSION，默认 1.18.5.851 已经过时。
+    ver = detect_autoclaw_version()
+    if ver:
+        os.environ["AUTOCLAW_CLIENT_VERSION"] = ver
     subprocess.Popen([str(node), str(server)], cwd=str(relay_home()),
                      stdout=logf, stderr=subprocess.STDOUT,
                      creationflags=flags)
@@ -4023,7 +4112,8 @@ def zcode_register_provider() -> dict:
             "config": {"group": "standard-personal",
                        "access": {"type": "api-key", "apiKey": RELAY_TOKEN},
                        "api": {"type": "anthropic-messages", "baseUrl": ZCODE_BASE_URL},
-                       "personalModelIds": [m[0] for m in ZCODE_MODELS]}}
+                       "personalModelIds": [m[0] for m in ZCODE_MODELS],
+                       "modelOrder": [m[0] for m in ZCODE_MODELS]}}
     rules = conf.setdefault("providerConfigRules", {}).setdefault("providerRules", [])
     rules[:] = [r for r in rules if r.get("providerId") != ZCODE_PROVIDER_ID]
     rules.append(rule)
@@ -4039,7 +4129,10 @@ def zcode_register_provider() -> dict:
                                               "inputFormat": {"supportsText": True, "supportsImage": image,
                                                               "supportsVideo": False, "supportsAudio": False,
                                                               "supportsPdf": False},
-                                              "outputFormat": {"supportsText": True}}}})
+                                              "outputFormat": {"supportsText": True}},
+                               # ZCode 选模型时默认挂 $max 思考档位；不声明 values 会在
+                               # 会话恢复时校验失败（sessionModelUnavailable）被回退成默认供应商
+                               "optionSpecs": {"reasoningLevel": {"values": ["low", "high", "max"]}}}})
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "models": [m[0] for m in ZCODE_MODELS]}
 
@@ -4118,8 +4211,13 @@ def warm_unwarmed_accounts(rounds: int = 8) -> dict:
         if st.get("warmed") is True:
             continue
         tokf = home / "warm" / f".warm_{str(acc.user_id)[:8]}.token"
-        tokf.write_text(acc.token if str(acc.token).lower().startswith("bearer ") else f"Bearer {acc.token}",
-                        encoding="utf-8")
+        # 2.0.2 网关校验 token 新鲜度，warm 脚本要自己现刷：把原料写成 JSON
+        # （旧格式裸 token 文本仍被 warm_account.mjs 兼容读取）
+        tokf.write_text(json.dumps({
+            "auth": acc.token if str(acc.token).lower().startswith("bearer ") else f"Bearer {acc.token}",
+            "refresh_token": getattr(acc, "refresh_token", "") or "",
+            "device_id": getattr(acc, "device_id", "") or "",
+        }, ensure_ascii=False), encoding="utf-8")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         p = subprocess.run([str(node), str(home / "warm" / "warm_account.mjs"), tokf.name, str(rounds)],
                            capture_output=True, text=True, timeout=1800, cwd=str(home / "warm"),
