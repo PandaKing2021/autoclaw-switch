@@ -1131,7 +1131,9 @@ def _autoclaw_roots():
     if env:
         roots.append(Path(env))
     for drive in ("C:", "D:", "E:", "F:"):
-        roots.append(Path(drive + "\\") / "AutoClaw")          # Path("C:")/"x" 是盘符相对路径（无分隔符），必须补 \n        roots.append(Path(drive + "\\") / "Program Files" / "AutoClaw")
+        # Path("C:")/"x" 是盘符相对路径（无分隔符），必须补尾部分隔符才落到盘根
+        roots.append(Path(drive + "\\") / "AutoClaw")
+        roots.append(Path(drive + "\\") / "Program Files" / "AutoClaw")
     roots.append(Path.home() / "AppData" / "Local" / "AutoClaw")
     return roots
 

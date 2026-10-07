@@ -254,8 +254,10 @@ check("format_model_id helper",
 
 # model_entry 输出
 me = P.model_entry("qmodel_38max", cn38)
-check("model_entry id = OFFICIAL model name (the value clients fill in)",
-      me["id"] == "Qwen3.8-Max", me["id"])
+# 本地补丁（A-SWITCH）：对外 id 改用规范名（全小写，见 models-catalog.json），
+# 官方显示名仍在 aliases 里可解析（下一条断言）。
+check("model_entry id = canonical lowercase id (local patch; official name stays an alias)",
+      me["id"] == "qwen3.8-max", me["id"])
 check("model_entry upstream_key kept", me["upstream_key"] == "qmodel_38max")
 check("model_entry aliases cover key + bracket form + friendly alias",
       "qmodel_38max" in me["aliases"] and "qmodel_38max (Qwen3.8-Max)" in me["aliases"]
@@ -1449,7 +1451,10 @@ try:
     detected = _QA.scan_desktop_credentials()
     check("scan returns both realms", len(detected) >= 2, len(detected))
     realms_seen = {d["realm"] for d in detected}
-    check("scan covers intl + cn", realms_seen == {"intl", "cn"}, realms_seen)
+    # 本地补丁（A-SWITCH）：扫描多认一个 qworkcn 存储（千问办公），
+    # 故断言"至少覆盖 intl + cn"，本机登录了哪些就出哪些。
+    check("scan covers intl + cn (qworkcn added by local patch)",
+          {"intl", "cn"} <= realms_seen, realms_seen)
     valid = [d for d in detected if d.get("valid")]
     # 本机是否登录过属于环境状态：登录过则必须解出 uid/dt- 前缀
     if valid:
