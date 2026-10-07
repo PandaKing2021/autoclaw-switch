@@ -56,7 +56,7 @@
  */
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest, createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, existsSync, mkdirSync, writeFileSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -92,6 +92,32 @@ const SETTINGS_FILE = join(
   "Comate", "User", "settings.json",
 );
 const STATE_DIR = join(homedir(), ".comate-relay");
+
+// ---------------- 入站 api_key 闸门（A/B 档反代，2026-10-07） ----------------
+// 此前本机任何进程都能匿名打推理；现在注册的 access.apiKey（comate-local）
+// 真正当成入站钥匙：/v1/models、/v1/messages、/v1/chat/completions 必须带
+// x-api-key 或 Authorization: Bearer，常数时间比对。/health 豁免（控制台
+// comate:start 起来就探活，不带钥匙）。默认开启；COMATE_RELAY_KEY="" 或
+// COMATE_INBOUND_AUTH=0 关闭（离线纯函数测试与 test_stream 用 0）。
+// 轮换：COMATE_RELAY_KEY=新钥，或 COMATE_INBOUND_KEYS=逗号追加多把并存。
+const INBOUND_AUTH = process.env.COMATE_INBOUND_AUTH !== "0";
+const INBOUND_KEYS = new Set(
+  ["comate-local", process.env.COMATE_RELAY_KEY || ""]
+    .concat((process.env.COMATE_INBOUND_KEYS || "").split(","))
+    .map((s) => s.trim()).filter(Boolean),
+);
+function inboundKeyOk(req) {
+  const given = (req.headers["x-api-key"]
+    || String(req.headers.authorization || "").replace(/^Bearer\s+/i, "")).trim();
+  if (!given) return false;
+  for (const k of INBOUND_KEYS) {
+    const a = Buffer.from(given, "utf8"), b = Buffer.from(k, "utf8");
+    if (a.length === b.length && timingSafeEqual(a, b)) return true;
+  }
+  return false;
+}
+const INBOUND_MODEL_PATHS = ["/v1/models", "/models", "/v1/messages", "/messages",
+  "/v1/chat/completions", "/chat/completions"];
 
 function log(...a) {
   console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -934,6 +960,15 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   const p = url.pathname;
   try {
+    // 入站 api_key 闸门（模型路径才校验；/health 等豁免）
+    if (INBOUND_AUTH && INBOUND_MODEL_PATHS.includes(p) && !inboundKeyOk(req)) {
+      const msg = "unauthorized: missing or invalid api key (x-api-key or Authorization: Bearer)";
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(p.endsWith("/messages")
+        ? { type: "error", error: { type: "authentication_error", message: msg } }
+        : { error: { message: msg, type: "invalid_request_error" } }));
+      return;
+    }
     if (p === "/health" || p === "/") {
       let ok = false, user = "";
       try { const c = readCredentials(); ok = !!c.license; user = c.username; } catch {}

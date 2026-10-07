@@ -65,6 +65,8 @@ const COMATE_PROVIDER_ID = "comate-openai-provider";
 const COMATE_RELAY = path.join(RES_ROOT, "comate", "relay.mjs");
 const COMATE_LOG = path.join(HOME, ".comate-relay", "relay.log");
 const COMATE_PORT = 18774;
+// 入站 api_key 闸门（comate/relay.mjs 默认开启、内置同名钥匙；轮换走 env COMATE_RELAY_KEY）
+const COMATE_API_KEY = "comate-local";
 const COMATE_SETTINGS = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"),
   "Comate", "User", "settings.json");
 // --- Qoder CN（vendored 社区网关 qoder/qoder_proxy.py，COSY 签名；另含千问办公 qworkcn 区）---
@@ -434,7 +436,8 @@ function comateHttp(method, apiPath, body, timeoutMs = 8000) {
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({
       host: "127.0.0.1", port: COMATE_PORT, path: apiPath, method,
-      headers: { "Content-Type": "application/json", ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
+      headers: { "Content-Type": "application/json", "x-api-key": COMATE_API_KEY,
+                 ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
       timeout: timeoutMs,
     }, (res) => {
       let d = "";
@@ -505,7 +508,9 @@ async function qoderHealth() {
 }
 
 async function qoderModels(timeoutMs = 20000) {
-  const m = await qoderHttp("GET", "/v1/models", null, timeoutMs);
+  // 网关开启入站鉴权后 /v1/models 同样查 Key：带 cn 出口 Key（与 ZCode 注册同值）
+  const key = qoderRealmKey("cn") || "qoder-local";
+  const m = await qoderHttp("GET", "/v1/models", null, timeoutMs, { Authorization: `Bearer ${key}` });
   return (m.j?.data || []).filter((x) => x && x.id && x.enabled !== false);
 }
 
@@ -540,9 +545,9 @@ function qoderRealmKey(realm) { return readRealmKeys()[realm] || ""; }
  * 的 /settings/save 全量替换语义——别人在面板里建的 Key 用空值占位保留原值，
  * 只增改控制台自己那两条（id = aswitch-<realm>）。
  *
- * 同时把网关的密钥校验关掉：所有网关都只监听 127.0.0.1，且此前就是免鉴权；
- * 一旦存在 Key 网关会要求 /v1 全部带 Key，老的 Qoder CN 注册（占位 Key）会
- * 突然 401。这两把 Key 只当出口选择器用。
+ * 入站鉴权保持开启（auth_disabled:false）：/v1 全部路径要求带 Key，
+ * 本机任何进程不能再匿名打推理。控制台自己的调用（qoderModels / smoke）
+ * 都带上对应的 cn / qworkcn 出口 Key，注册的 ZCode 供应商也用同一把。
  */
 async function qoderEnsureRealmKeys() {
   const l = await qoderHttp("POST", "/panel/login", { password: QODER_PANEL_PASSWORD }, 10000);
@@ -561,7 +566,7 @@ async function qoderEnsureRealmKeys() {
     if (i >= 0) payload[i] = row; else payload.push(row);
   }
   try { fs.writeFileSync(QODER_REALM_KEYS, JSON.stringify(store, null, 1), { mode: 0o600 }); } catch (e) { return { ok: false, error: `出口 Key 落盘失败：${e.message}` }; }
-  const save = await qoderHttp("POST", "/settings/save", { api_keys: payload, auth_disabled: true }, 15000, { "X-Panel-Token": token });
+  const save = await qoderHttp("POST", "/settings/save", { api_keys: payload, auth_disabled: false }, 15000, { "X-Panel-Token": token });
   if (!save.ok) return { ok: false, error: `出口 Key 写入网关失败：${save.j?.error?.message || ("HTTP " + save.status)}` };
   return { ok: true, generated: changed, realms: Object.keys(store) };
 }
@@ -991,7 +996,7 @@ function setupIpc() {
         out.push(["comate", ids.length ? {
           ok: true,
           rule: { providerId: COMATE_PROVIDER_ID, providerName: "Comate 文心快码", enabled: true,
-            config: { group: "standard-personal", access: { type: "api-key", apiKey: "comate-local" },
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: COMATE_API_KEY },
               api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${COMATE_PORT}/v1` },
               personalModelIds: ids } },
           entries: list.map((m) => modelEntry(COMATE_PROVIDER_ID, m.id, 200000)),
@@ -1528,10 +1533,11 @@ function setupIpc() {
     const models = (await qoderModels()).map((m) => m.id);
     if (!models.length) return { ok: false, error: "模型目录为空（网关账号池为空或未同步？）" };
     const model = models.includes("qwen3.8-flash") ? "qwen3.8-flash" : models[0];
+    const cnKey = qoderRealmKey("cn") || "qoder-local";
     const r = await qoderHttp("POST", "/v1/chat/completions", {
       model, max_tokens: 64,
       messages: [{ role: "user", content: "请只回复OK" }],
-    }, 240000);
+    }, 240000, { Authorization: `Bearer ${cnKey}` });
     let reply = "", stop = "";
     try {
       const j = r.j;

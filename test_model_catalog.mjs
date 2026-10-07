@@ -90,15 +90,17 @@ async function fetchModels(name, port, headers) {
 if (LIVE) {
   const realmKeysFile = path.join(os.homedir(), ".autoclaw-relay", "qoder-realm-keys.json");
   let qworkKey = null;
-  try { const j = JSON.parse(fs.readFileSync(realmKeysFile, "utf8")); qworkKey = j.qworkcn || j.realms?.qworkcn || null; } catch {}
+  let cnKey = null;
+  try { const j = JSON.parse(fs.readFileSync(realmKeysFile, "utf8")); qworkKey = j.qworkcn || j.realms?.qworkcn || null; cnKey = j.cn || j.realms?.cn || null; } catch {}
 
   const targets = [
-    ["autoclaw", 18766, {}],
+    // 入站 api_key 闸门（2026-10-07）：A/B 档的 /v1/models 要求带钥匙，缺头会 401
+    ["autoclaw", 18766, { "x-api-key": "autoclaw-local" }],
     ["workbuddy", 7863, { authorization: "Bearer wb-local-key" }],
     ["trae", 18768, {}],
     ["doubao", 18770, {}],
-    ["comate", 18774, {}],
-    ["qoder", 8791, {}],
+    ["comate", 18774, { "x-api-key": "comate-local" }],
+    ["qoder", 8791, { authorization: `Bearer ${cnKey || "qoder-local"}` }],
     ["qwenwork", 8791, qworkKey ? { authorization: `Bearer ${qworkKey}` } : {}],
   ];
   for (const [name, port, headers] of targets) {

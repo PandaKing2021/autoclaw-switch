@@ -24,7 +24,8 @@ const OAI_TOOLS = [
 ];
 
 async function post(pathname, body) {
-  return await fetch(BASE + pathname, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  // 入站 api_key 闸门默认开启：真机 E2E 与 ZCode 一样带 comate-local
+  return await fetch(BASE + pathname, { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": "comate-local" }, body: JSON.stringify(body) });
 }
 async function sseEvents(pathname, body) {
   const r = await post(pathname, body);

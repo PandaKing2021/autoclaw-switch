@@ -82,7 +82,7 @@ function postSse(pathname, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({ host: "127.0.0.1", port: PORT, path: pathname, method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } }, (res) => {
+      headers: { "Content-Type": "application/json", "x-api-key": "comate-local", "Content-Length": Buffer.byteLength(data) } }, (res) => {
       const events = [];
       let buf = "";
       res.on("data", (c) => {
@@ -107,7 +107,7 @@ function postSse(pathname, body) {
 const postJson = (pathname, body) => new Promise((resolve, reject) => {
   const data = JSON.stringify(body);
   const req = http.request({ host: "127.0.0.1", port: PORT, path: pathname, method: "POST",
-    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } }, (res) => {
+    headers: { "Content-Type": "application/json", "x-api-key": "comate-local", "Content-Length": Buffer.byteLength(data) } }, (res) => {
     let t = "";
     res.on("data", (c) => (t += c));
     res.on("end", () => resolve({ status: res.statusCode, text: t }));
