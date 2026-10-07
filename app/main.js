@@ -1569,8 +1569,11 @@ app.whenReady().then(() => {
   if (wbBoot) log("workbuddy 自举失败:", wbBoot);
   setupIpc();
   if (process.env.ASWITCH_SELFTEST !== "1") {
-    // 开机对账：活着的链路补注册进 ZCode，已停的摘除（后台串行跑，不阻塞窗口）
-    queueZcodeSync({ reconcile: true });
+    // 开机对账：活着的链路补注册进 ZCode，已停的摘除（后台串行跑，不阻塞窗口）。
+    // queueZcodeSync 声明在 setupIpc 作用域内，这里必须走注册好的 zcode:sync 处理器
+    // 触发——直接调用会在 whenReady 抛 ReferenceError，连 createWindow 都到不了
+    // （症状：进程在、窗口无、日志只有 console started。2026-10-07 冷启动实测踩中）。
+    handlers["zcode:sync"]({}).catch((e) => log("开机对账失败:", String((e && e.message) || e)));
   }
   if (process.env.ASWITCH_SELFTEST === "1") {
     // 自测模式：顺序执行各 IPC 处理器（等同逐个点击按钮），结果输出到 stdout

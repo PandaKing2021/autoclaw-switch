@@ -366,6 +366,18 @@ t("G1 main.js 里不存在重复声明的函数（静默覆盖曾写出 null mod
   assert(seen.size > 20, `main.js 只扫到 ${seen.size} 个顶层函数声明，正则或文件结构变了，这条用例已失效`);
 });
 
+// 同类源码卫生：node --check 只查语法不查作用域。queueZcodeSync 声明在 setupIpc()
+// 作用域内，若 whenReady 直接调用它会在冷启动时抛 ReferenceError——症状是进程在、
+// 窗口无、日志只有 "console started"（2026-10-07 实测踩中，开机对账因此从未执行过）。
+t("G2 whenReady 不得直接调用 setupIpc 作用域的 queueZcodeSync（冷启动无窗 bug）", () => {
+  const src = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  const i = src.indexOf("app.whenReady");
+  assert(i > 0, "找不到 app.whenReady");
+  const tail = src.slice(i);
+  assert(!/\bqueueZcodeSync\s*\(/.test(tail),
+    'whenReady 直接调用了 setupIpc 内的 queueZcodeSync——冷启动会 ReferenceError 且窗口打不开（应走 handlers["zcode:sync"]）');
+});
+
 const pass = results.filter((r) => r[1]).length;
 for (const [name, ok, msg] of results) console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : "  <-- " + msg}`);
 console.log(`\n==== ${pass}/${results.length} ====`);
