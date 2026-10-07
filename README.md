@@ -20,7 +20,7 @@
 
 所有组件都跑在 `127.0.0.1`，凭证不离开你的电脑；七个平台在 ZCode 里是并列供应商（`autoclaw-glm-provider` / `workbuddy-openai-provider` / `trae-openai-provider` / `doubao-openai-provider` / `comate-openai-provider` / `qoder-openai-provider` / `qwenwork-openai-provider`），模型名不冲突，同一个会话里可以自由切换。模型名已按[统一命名规范](#模型统一命名规范modelscatalogjson)规范化（全小写、无上游 hash 与路由前缀），各链路同时兼容旧名。
 
-Qoder CN 与千问办公共用 `8791` 这**一个**网关进程（同一份账号池、同一套 COSY 签名），ZCode 侧靠**绑定出口的 API Key** 分成两个并列供应商（ZCode 的供应商配置没有自定义请求头字段，绑 Key 是官方设计的出口选择方式）：控制台注册时会自己生成两把 Key 写进网关、并关掉该网关的密钥校验（网关只监听回环，此前本就免鉴权），老的注册方式不受影响。
+Qoder CN 与千问办公共用 `8791` 这**一个**网关进程（同一份账号池、同一套 COSY 签名），ZCode 侧靠**绑定出口的 API Key** 分成两个并列供应商（ZCode 的供应商配置没有自定义请求头字段，绑 Key 是官方设计的出口选择方式）：控制台注册时会自己生成两把 Key 写进网关并**保持入站鉴权开启**（`/v1` 全部路径要带 Key，`/health` 等探针豁免），Key 兼具"出口选择 + 入站钥匙"双重身份。
 
 ## 这是什么 / 不是什么
 
@@ -330,23 +330,36 @@ curl -X POST http://127.0.0.1:18770/v1/chat/completions \
 node comate/relay.mjs &
 curl http://127.0.0.1:18774/health        # 登录态（settings.json 的 license）、模式（stateless）、工具循环与会话续跑路由表条数
 curl -X POST http://127.0.0.1:18774/v1/chat/completions \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: application/json' -H 'x-api-key: comate-local' \
   -d '{"model":"auto","messages":[{"role":"user","content":"reply OK"}]}'
 
 # Qoder CN / 千问办公网关（:8791，openai + responses；需 Python 3.9+，两条出口共用一个进程）
 python qoder/qoder_proxy.py --port 8791 --accounts-dir ~/.qoder-relay/accounts &
-curl http://127.0.0.1:8791/health         # 账号池数量、当前区域，以及按区域分列的 realms 明细
-curl http://127.0.0.1:8791/v1/models      # enabled=false 的项是付费墙模型，Free 账号调用会 403
-# 千问办公出口：带出口 Key（控制台生成，见 ~/.autoclaw-relay/qoder-realm-keys.json）或 X-Realm 头
+curl http://127.0.0.1:8791/health         # 账号池数量、当前区域，以及按区域分列的 realms 明细（探针豁免，不用带 Key）
+curl http://127.0.0.1:8791/v1/models -H "Authorization: Bearer $(python -c "import json;print(json.load(open(r'$HOME/.autoclaw-relay/qoder-realm-keys.json'))['cn'])")"
+                                          # enabled=false 的项是付费墙模型，Free 账号调用会 403
+# 千问办公出口：换 qworkcn 那把出口 Key（同一文件里），或退回 X-Realm 头
 curl http://127.0.0.1:8791/v1/models -H "X-Realm: qworkcn"    # 三个模型：qwen3.8-flash(标准) / qwen-pro(高级) / qwen3.8-max
 curl -X POST http://127.0.0.1:8791/v1/chat/completions \
   -H 'Content-Type: application/json' -H 'X-Realm: qworkcn' \
   -d '{"model":"qwen3.8-max","messages":[{"role":"user","content":"reply OK"}]}'
-# 注：注册后控制台会下发 auth_disabled=true（网关只监听回环），所以不带 Key 也能调；
-#     若网关侧开了校验，就用 realm-keys 里那一对 Key 走 Authorization: Bearer
 ```
 
-回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
+### 入站 api_key 闸门（2026-10-07 起，A/B 档默认开启）
+
+模型服务路径（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/routes`；Comate 网关同理含无前缀变体）要求请求带 `x-api-key` 或 `Authorization: Bearer`，常数时间比对，**匿名推理一律 401**——注册进 ZCode 的 `access.apiKey` 从此是真实生效的钥匙，不再是摆设。豁免：`/health`、`/healthz`、`/`、`/fwd`（GUI 业务桥）、`/admin/*`、OPTIONS 预检，桌面端与控制台零改动。各网关钥匙：
+
+| 网关 | 内置钥匙（与 ZCode 注册值一致） | 追加/轮换 | 关闭开关 |
+|---|---|---|---|
+| AutoClaw `:18766` | `autoclaw-local` ∪ `autoclaw-dsh`（dsh Bearer 兼容） | `AUTOCLAW_INBOUND_KEYS=k1,k2` | `AUTOCLAW_INBOUND_AUTH=0` |
+| Comate `:18774` | `comate-local` | `COMATE_RELAY_KEY=新钥` 或 `COMATE_INBOUND_KEYS=k1,k2` | `COMATE_INBOUND_AUTH=0` |
+| WorkBuddy `:7863` | wb2api 原生 `api_key`（config.json，`wb-local-key`） | — | config.json 置空 |
+| Qoder/千问 `:8791` | 两把出口 Key（`~/.autoclaw-relay/qoder-realm-keys.json`，绑 Key 即选出口） | 面板 API Keys 页 | 面板 `auth_disabled` |
+
+闸门回归：`node test_inbound_key.mjs`（零出站 32 条：401/放行判别式、双头形状、OPTIONS 204、`/health` 豁免、轮换钥、关闭开关、非环回监听下新旧两套鉴权并存）。
+```
+
+回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node test_inbound_key.mjs`（入站 api_key 闸门，零出站 32 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
 
 注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
 
@@ -359,7 +372,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 | 406 空响应 | 2.x 闸门五要素缺一（见上文）；最常见是 persona.txt 没部署——控制台点「启动」会自动从已安装客户端提取（日志里搜 `persona:`） |
 | 810001 系统繁忙 | GLM-5.3-Flash 白天高峰限流，夜间 23:00-09:00 畅通；反代已自动退避重试，白天建议改用 GLM-5.3 或 Auto 路由 |
 | Trae 401 | 凭证约 5 天过期，重新打开 Trae 登录一次；网关遇 401 自动重读 storage.json，无需重启 |
-| Qoder/千问办公 401 或 `no usable account for realm` | 该区域账号池为空或凭证过期。控制台「同步账号」重新入池；冷却中的账号要等冷却结束（或重启网关）才会重新可用 |
+| Qoder/千问办公 401 或 `no usable account for realm` | 先分两种 401：`invalid api key` = 请求没带/带错出口 Key（入站鉴权 2026-10-07 起默认开启，Key 见 `~/.autoclaw-relay/qoder-realm-keys.json`）；`no usable account` = 该区域账号池为空或凭证过期，控制台「同步账号」重新入池；冷却中的账号要等冷却结束（或重启网关）才会重新可用 |
 | 千问办公 SSE 里回 `503 Model catalog unavailable`（HTTP 却是 200） | 上游按场景分区目录、且要请求声明工作台形态：取错 `model_scene` 或没带 `session_type`/`business.product`。此提示只在 HTTP 200 的 SSE 正文里，看状态码发现不了——排查时直接看报文内容 |
 | Qoder/千问网关起不来 | 需要 Python 3.9+（纯标准库）。手动跑 `python qoder/qoder_proxy.py --port 8791` 看真实报错；端口被占说明已有一个网关在跑 |
 | 改完 `qoder/*.py` 或 `comate/relay.mjs` 没生效 | 长驻进程里还是旧代码——把它们停掉再启动（改 `app/main.js` 则要重启控制台进程），exe 版还要重新打包重装 |
