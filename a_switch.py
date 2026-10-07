@@ -2557,7 +2557,49 @@ def _launch_isolated_profile(profile_dir: Path) -> set:
             _ISOLATED_PIDS.update(new)
             return new
         time.sleep(0.6)
+    # 40s 内没等到 PID 差集 ≠ 实例没起来（冷启动/杀软延迟可能超过 deadline）。
+    # 按临时 profile 特征兜底扫一次：只要有用这个 profile 目录的实例在跑，
+    # 一样登记为隔离实例，否则调用方按"启动失败"跳过 → 进程泄漏成多余窗口
+    #（2026-10-07 实测泄漏：两个 sweep 实例挂了 8 小时才被用户发现）。
+    leaked = _pids_with_userdata(profile_dir)
+    if leaked:
+        _ISOLATED_PIDS.update(leaked)
+        log(f"启动确认超时，但发现 {len(leaked)} 个持有该 profile 的实例，已登记隔离")
+        return leaked
     return set()
+
+
+def _pids_with_userdata(profile_dir: Path) -> set:
+    """按 --user-data-dir=<profile_dir> 特征找实例 PID（兜底泄漏清理用）。
+
+    ⚠ 提权进程的 CommandLine 对非管理员不可见（空串），此时返回空集——
+    兜底只在能看见命令行的场景生效；打包版 A-SWITCH 以管理员运行，可见。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name LIKE 'AutoClaw%'\" "
+             "| Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"],
+            capture_output=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        import json as _json
+        data = _json.loads((out or b"{}").decode("utf-8", "replace") or "{}")
+        items = data.get("ProcessId") and [data] or data if isinstance(data, list) else [data] if data else []
+        needle = str(profile_dir).lower()
+        hits = set()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            cl = str(it.get("CommandLine") or "")
+            if needle in cl.lower():
+                try:
+                    hits.add(int(it.get("ProcessId")))
+                except (TypeError, ValueError):
+                    pass
+        return hits
+    except Exception:
+        return set()
 
 
 def _kill_isolated(pids=None, wait: int = 12) -> None:
