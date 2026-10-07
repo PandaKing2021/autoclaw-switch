@@ -2,7 +2,7 @@
   "name": "autoclaw-zcode-console",
   "version": "1.0.0",
   "description": "All-in-One 反代平台控制台：AutoClaw / WorkBuddy / Trae 三平台额度接入 ZCode",
-  "author": "PandaKing",
+  "author": "PandaKing2021",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
