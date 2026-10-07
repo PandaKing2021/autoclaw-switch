@@ -71,7 +71,7 @@ Then, in the console, three steps:
 
 **Restart ZCode** afterwards and the models of the running platforms appear.
 
-Cold-start is handled: the relay's runtime files (`~/.autoclaw-relay/server.mjs`, `persona.txt`) are deployed from `bridge/` automatically on every "start", no manual copying.
+Cold-start is handled: the relay's runtime files are prepared automatically — `server.mjs` is (re)deployed from `bridge/` whenever missing or changed, and the **persona is not shipped with the repo** (vendor text, per the PR#4 review): `bridge/extract_persona.py` extracts it from the installed AutoClaw client into `~/.autoclaw-relay/persona.txt`, follows client upgrades automatically, and falls back to the bundled seed only if extraction fails.
 
 ### Prerequisites
 
@@ -204,7 +204,7 @@ curl http://127.0.0.1:8791/health
 curl http://127.0.0.1:8791/v1/models -H "X-Realm: qworkcn"    # qwen3.8-flash(标准) / qwen-pro(高级) / qwen3.8-max
 ```
 
-Regression tests: `node trae/test_relay.mjs`, `node trae/test_robust.mjs`, `node doubao/test-relay.mjs`, `node doubao/test-zcode-shape.mjs`, `node comate/test_relay.mjs` (Comate's tool-loop contract, 34 offline cases: frame→tool-call assembly, per-key parameter concatenation, the continuation routing table, message normalization for both protocols, tool-name mapping and schema filtering), `node comate/test_stream.mjs` (**fake-upstream integration test, 6 cases**: a local server impersonates comate.baidu.com and pushes real SSE, proving content chunks == upstream frames (true passthrough, not post-hoc slicing), reasoning blocks forming on both protocols, continuation landing on the same conversation+task, internal tools never leaking, and the sync fallback — no network, no credits), `node app/test_zcode_config.js` (config-write gate, 18 cases), `node test_model_catalog.mjs` (model-naming consistency: 11 offline cases, `--live` also checks running gateways), `python qoder/_test_qoder.py`, `python qoder/_test_leak_guard.py` (asserts tokens never leak), and the console's per-card connectivity buttons for Qoder/QwenWork end-to-end. Comate's live multi-hop tool loop has its own `COMATE_E2E=1 node comate/e2e_tool_loop.mjs` (runs real tools, spends credits, skipped by default), and `node comate/probe_stream.mjs` timestamps every frame of one real streaming turn (spends credits, run by hand). In Git Bash, `curl -d '中文'` sends GBK bytes (the console code page) — use a Node script or `--data-binary @utf8file` for non-ASCII.
+Regression tests: `node trae/test_relay.mjs`, `node trae/test_robust.mjs`, `node doubao/test-relay.mjs`, `node doubao/test-zcode-shape.mjs`, `node comate/test_relay.mjs` (Comate's tool-loop contract, 34 offline cases: frame→tool-call assembly, per-key parameter concatenation, the continuation routing table, message normalization for both protocols, tool-name mapping and schema filtering), `node comate/test_stream.mjs` (**fake-upstream integration test, 6 cases**: a local server impersonates comate.baidu.com and pushes real SSE, proving content chunks == upstream frames (true passthrough, not post-hoc slicing), reasoning blocks forming on both protocols, continuation landing on the same conversation+task, internal tools never leaking, and the sync fallback — no network, no credits), `node app/test_zcode_config.js` (config-write gate, 18 cases), `node test_model_catalog.mjs` (model-naming consistency: 11 offline cases, `--live` also checks running gateways), `python qoder/_test_qoder.py`, `python qoder/_test_leak_guard.py` (asserts tokens never leak), `python bridge/test_extract_persona.py` (persona extraction against a synthetic bundle: dependency ordering, self-checks, stale/write branches), and the console's per-card connectivity buttons for Qoder/QwenWork end-to-end. Comate's live multi-hop tool loop has its own `COMATE_E2E=1 node comate/e2e_tool_loop.mjs` (runs real tools, spends credits, skipped by default), and `node comate/probe_stream.mjs` timestamps every frame of one real streaming turn (spends credits, run by hand). In Git Bash, `curl -d '中文'` sends GBK bytes (the console code page) — use a Node script or `--data-binary @utf8file` for non-ASCII.
 
 ## Troubleshooting
 
@@ -212,7 +212,7 @@ Regression tests: `node trae/test_relay.mjs`, `node trae/test_robust.mjs`, `node
 |---|---|
 | 401 Invalid token (AutoClaw) | The app rotated its access token. The credential watcher follows it automatically; if it is not running, log into AutoClaw once or re-run `bridge/make_compat_auth.py` |
 | 402 insufficient credits | Terminal error — wait for the daily grant (1000/day on login) or top up; the relay does not retry |
-| 406 empty response | One of the five 2.x gate factors is missing — most often `persona.txt` was never deployed (the console's "start" button fixes that) |
+| 406 empty response | One of the five 2.x gate factors is missing — most often `persona.txt` was never deployed; the console's "start" button extracts it from the installed client (search the log for `persona:`) |
 | 810001 "system busy" | GLM-5.3-Flash is rate-limited at peak hours; 23:00–09:00 is clear. The relay backs off and retries; use GLM-5.3 or an Auto route during the day |
 | Trae 401 | Credentials expire in ~5 days; log into Trae again. The gateway re-reads `storage.json` on 401 without a restart |
 | Qoder/QwenWork 401 or `no usable account for realm` | The realm's account pool is empty or expired. Press "Sync accounts"; cooling-down accounts become usable when the cooldown ends (or restart the gateway) |
@@ -243,7 +243,7 @@ Regression tests: `node trae/test_relay.mjs`, `node trae/test_robust.mjs`, `node
 ```
 (repo root — this is also the runtime resource root)
 ├── app/            Electron console (main.js / preload.js / zcode-config.js / test_zcode_config.js / renderer/)
-├── bridge/         AutoClaw 2.x adapter: credential bridging, watcher, server_2x.mjs, persona.txt, 406 experiments
+├── bridge/         AutoClaw 2.x adapter: credential bridging, watcher, server_2x.mjs, persona extractor, 406 experiments
 ├── trae/           Trae SOLO CN relay + offline credential decryptor + regression tests
 ├── doubao/         Doubao Work relay + CDP tooling + protocol probes
 ├── comate/         Comate relay + tool-loop regression test + fake-upstream stream test + live E2E + stream probe + license decryptor

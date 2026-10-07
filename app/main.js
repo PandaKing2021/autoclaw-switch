@@ -2,8 +2,7 @@
 // 职责：relay 与凭证同步器的生命周期、状态聚合、按需查询（积分/注册/日志）。
 // 设计约束：所有对上游的出站请求仅由用户在界面点击触发（无固定节奏轮询）。
 const { app, BrowserWindow, ipcMain } = require("electron");
-const { spawn, execSync } = require("child_process");
-const fs = require("fs");
+const { spawn, spawnSync, execSync } = require("child_process");const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
@@ -81,7 +80,8 @@ const QWENWORK_PROVIDER_ID = "qwenwork-openai-provider";
 const QODER_REALM_KEYS = path.join(RELAY_DIR, "qoder-realm-keys.json");
 const BRIDGE_DIR = path.join(RES_ROOT, "bridge");
 const RELAY_SRC = path.join(BRIDGE_DIR, "server_2x.mjs");   // relay 源码随项目走，首次运行部署到 RELAY_DIR
-const PERSONA_SRC = path.join(BRIDGE_DIR, "persona.txt");    // 同上：2.x 闸门要求的应用 persona
+const PERSONA_SRC = path.join(BRIDGE_DIR, "persona.txt");    // 种子（老版本随包；新版本由提取器生成，见下）
+const PERSONA_EXTRACTOR = path.join(BRIDGE_DIR, "extract_persona.py");  // 从已装客户端提取 persona（厂商文本不入库）
 const PYTHON = "python";
 // 与 trae/relay.mjs 保持一致：Trae 客户端把登录态写在这里，relay 离线解密它
 const TRAE_STORAGE = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"),
@@ -133,13 +133,38 @@ function ensureRelayServer() {
       fs.copyFileSync(RELAY_SRC, RELAY_SERVER);
       log(serverExists ? "updated relay server.mjs from" : "deployed relay server.mjs from", RELAY_SRC);
     }
+    // persona：厂商文本不入库（PR#4 维护者建议），由 extract_persona.py 从已安装客户端
+    // 提取。每次启动都跑一次 --if-stale（客户端更新后自动跟进）；提取失败时若运行时已有
+    // 旧文件继续用（好过没有），都没有才退回随包种子（老版本包里还有 bridge/persona.txt）。
+    const ex = extractPersonaTo(true);
+    if (ex) log("persona 提取器:", ex);
     if (!fs.existsSync(RELAY_PERSONA)) {
-      if (!fs.existsSync(PERSONA_SRC)) return `未找到 persona 模板（${PERSONA_SRC}），2.x 闸门会拒绝所有请求`;
-      fs.copyFileSync(PERSONA_SRC, RELAY_PERSONA);
-      log("deployed relay persona.txt from", PERSONA_SRC);
+      if (fs.existsSync(PERSONA_SRC)) fs.copyFileSync(PERSONA_SRC, RELAY_PERSONA);
+      else return `未找到 persona（提取失败：${ex || "未知原因"}）。安装并登录一次 AutoClaw 2.x 后再点「启动」；缺 persona 时 2.x 闸门会拒绝所有请求`;
     }
     return null;
   } catch (e) { return `部署 relay 失败：${String((e && e.message) || e)}`; }
+}
+
+/**
+ * 跑 bridge/extract_persona.py 把应用 persona 提取到运行时目录。
+ * 返回 null=成功（含 kept/unchanged），否则为错误描述。python/node 缺失按失败处理。
+ */
+function extractPersonaTo(ifStale) {
+  if (!fs.existsSync(PERSONA_EXTRACTOR)) return "未找到 bridge/extract_persona.py";
+  const args = [PERSONA_EXTRACTOR, "--out", RELAY_PERSONA];
+  if (ifStale) args.push("--if-stale");
+  try {
+    const r = spawnSync(PYTHON, args, { encoding: "utf8", timeout: 90000, windowsHide: true });
+    const line = (r.stdout || "").trim().split("\n").filter((l) => l.startsWith("{")).pop();
+    let res = {};
+    try { res = JSON.parse(line || "{}"); } catch {}
+    if (r.status !== 0 || res.ok === false) return (res.error || r.stderr || `python 退出码 ${r.status}`).slice(0, 200);
+    log("persona:", res.action || "checked", `(${res.chars || "?"} chars)`);
+    return null;
+  } catch (e) {
+    return String((e && e.message) || e).slice(0, 200);
+  }
 }
 
 /**
@@ -1138,7 +1163,7 @@ function setupIpc() {
     const file = (name, p, hint) => add(name, fs.existsSync(p), rel(p), hint);
     file("relay 源码", RELAY_SRC, "随控制台分发（bridge/）；缺失说明安装包不完整，重装一次即可");
     file("relay 运行时", RELAY_SERVER, "点「启动」会自动从 bridge/server_2x.mjs 部署，无需手工准备");
-    file("relay persona", RELAY_PERSONA, "2.x 闸门要求 system 与应用 persona 逐字一致；点「启动」自动从 bridge/persona.txt 部署，缺了会全部 406");
+    file("relay persona", RELAY_PERSONA, "2.x 闸门要求 system 与应用 persona 一致；点「启动」自动从已安装客户端提取（厂商文本不入库），提取失败会退回随包种子；缺了会全部 406");
     file("WorkBuddy 网关", WB_EXE, "上游 Go 二进制，随包分发；开发态在 workbuddy/…/upstream/");
     file("WorkBuddy 配置", WB_CONFIG, "打包版点「启动」自动播种；登录用 wb2api-login.exe");
     file("Trae 网关", TRAE_RELAY, "项目自带（trae/relay.mjs）");

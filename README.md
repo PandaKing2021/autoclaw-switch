@@ -69,7 +69,7 @@ npm start
 
 然后**重启 ZCode**，模型列表里就能看到开启中的平台模型了。
 
-冷启动加固已做：反代的运行时文件（`~/.autoclaw-relay/server.mjs` 与 `persona.txt`）由控制台自动从 `bridge/` 部署，第一次也是每次点「启动」时都会补齐，不需要手工 cp。
+冷启动加固已做：反代的运行时文件由控制台自动准备，不需要手工 cp——`server.mjs` 缺失或内容不同都从 `bridge/` 重新部署；**persona 不随仓库分发**（厂商文本，PR#4 审查意见），由 `bridge/extract_persona.py` 从已安装的 AutoClaw 客户端提取到 `~/.autoclaw-relay/persona.txt`，客户端升级后自动跟进，提取失败才退回随包种子。
 
 ### 前置条件
 
@@ -138,7 +138,7 @@ AutoClaw 2.0.1 相比 1.17.8 有五处结构性变化，每一处都会让旧版
 1. 传输层为干净的 HTTP/1.1 指纹——undici fetch（自动附加 `sec-fetch-mode` 等头、TLS ClientHello 亦有差异）被拦，`node:https` 原生请求稳定通过；
 2. 完整 OpenAI SDK 指纹头（`user-agent: OpenAI/JS 6.26.0` + `x-stainless-*` + `x-agent-id: main`）；
 3. `X-Session-Id` 会话头；
-4. system 消息与应用 persona **完全一致**（3099 字节，合并任何额外内容都会被拒，完全没有 system 同样被拒）；
+4. system 消息与应用 persona **一致**（由 `extract_persona.py` 从客户端提取，随客户端版本走；实测闸门是标记指纹式校验——提取出的规范变体与历史捕获文本不同样可通过，但合并任何额外内容都会被拒，完全没有 system 同样被拒）；
 5. 请求体参数同上第 4 条。
 
 曾被证伪的假说：时间窗 / IP 风控冷却 / 边缘节点轮换 / TLS 栈差异 / 头顺序 / temperature / 工具数量与名称 / 合成文本填充。完整实验记录见 [../TEST_REPORT.md](../TEST_REPORT.md)。
@@ -152,7 +152,7 @@ AutoClaw 2.0.1 相比 1.17.8 有五处结构性变化，每一处都会让旧版
 | `bridge/make_compat_auth.py` | 凭证桥接：DPAPI 解密 2.x 凭证 → 合成旧版 auth.json |
 | `bridge/watch_auth.py` | 凭证自动同步器（常驻，应用轮换 token 即自动跟进） |
 | `bridge/server_2x.mjs` | ★ 2.x 权威反代（部署到 `~/.autoclaw-relay/server.mjs`） |
-| `bridge/persona.txt` | 应用 persona system prompt（闸门硬要求，随反代一起部署） |
+| `bridge/extract_persona.py` | 从已安装客户端提取应用 persona（闸门硬要求；厂商文本不入仓库，客户端升级自动跟进，离线测试 `test_extract_persona.py`） |
 
 ### WorkBuddy：本地 Go 网关
 
@@ -343,7 +343,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 #     若网关侧开了校验，就用 realm-keys 里那一对 Key 走 Authorization: Bearer
 ```
 
-回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，18 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
+回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，18 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
 
 注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
 
@@ -353,7 +353,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 |---|---|
 | 401 Invalid token | 应用轮换了 access token。凭证同步器正常时会自动跟进；若没在跑，重新打开 AutoClaw 登录一次，或重跑 `bridge/make_compat_auth.py` |
 | 402 积分不足 | 终态错误，等每日赠送（每日登录 1000 分）或充值，反代不会重试 |
-| 406 空响应 | 2.x 闸门五要素缺一（见上文）；最常见是 persona.txt 没部署——控制台点「启动」会自动补 |
+| 406 空响应 | 2.x 闸门五要素缺一（见上文）；最常见是 persona.txt 没部署——控制台点「启动」会自动从已安装客户端提取（日志里搜 `persona:`） |
 | 810001 系统繁忙 | GLM-5.3-Flash 白天高峰限流，夜间 23:00-09:00 畅通；反代已自动退避重试，白天建议改用 GLM-5.3 或 Auto 路由 |
 | Trae 401 | 凭证约 5 天过期，重新打开 Trae 登录一次；网关遇 401 自动重读 storage.json，无需重启 |
 | Qoder/千问办公 401 或 `no usable account for realm` | 该区域账号池为空或凭证过期。控制台「同步账号」重新入池；冷却中的账号要等冷却结束（或重启网关）才会重新可用 |
@@ -398,7 +398,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 │   ├── make_compat_auth.py        凭证桥接（DPAPI 解密 → auth.json）
 │   ├── watch_auth.py              凭证自动同步器（常驻）
 │   ├── server_2x.mjs              ★ 2.x 权威反代（全部补丁就绪）
-│   ├── persona.txt                ★ 应用 persona system prompt
+│   ├── extract_persona.py         ★ 从已装客户端提取应用 persona（厂商文本不入库；随包种子仅兜底）
 │   └── test_*.mjs / probe_*.mjs   406 闸门的实验、验证与二分脚本（30 个）
 ├── trae/                          ← Trae SOLO CN 反代
 │   ├── relay.mjs                  ★ 网关本体（openai + anthropic，凭证解密 + 无状态转发）

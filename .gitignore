@@ -29,3 +29,4 @@ qoder/accounts/
 qoder/*.pyc
 qoder/__pycache__/
 qoder/usage/
+bridge/persona.txt
