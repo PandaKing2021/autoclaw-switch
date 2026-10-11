@@ -22,6 +22,8 @@
 
 Qoder CN 与千问办公共用 `8791` 这**一个**网关进程（同一份账号池、同一套 COSY 签名），ZCode 侧靠**绑定出口的 API Key** 分成两个并列供应商（ZCode 的供应商配置没有自定义请求头字段，绑 Key 是官方设计的出口选择方式）：控制台注册时会自己生成两把 Key 写进网关并**保持入站鉴权开启**（`/v1` 全部路径要带 Key，`/health` 等探针豁免），Key 兼具"出口选择 + 入站钥匙"双重身份。
 
+除 ZCode 之外，**七条链路现在也都能接 Codex CLI**——Codex 0.100+ 的 `wire_api` 只认 Responses API，能原生讲 `/v1/responses` 的链路（AutoClaw / Comate / Qoder CN / 千问办公）直连，只讲 chat completions 的（WorkBuddy / Trae / 豆包）走控制台监管的前门 `bridge/codex_front.mjs`（:18776）翻译；控制台新增的 Codex 卡片负责起停前门、注册 `~/.codex/config.toml` 的托管区与目录合并，详见 [Codex CLI 接入](#codex-cli-接入responses-api)。
+
 ## 这是什么 / 不是什么
 
 七个上游都是**消费级 agent 客户端**，不是模型厂商的公开 API。它们各自把自家积分/免费额度消耗在官方客户端里，本项目的反代让 ZCode 之类的标准 IDE 也能吃到这些额度。
@@ -89,7 +91,7 @@ npm start
 
 ## 桌面控制台（`app/`）
 
-Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + 日志 + 顶栏**：
+Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + Codex CLI 接入卡片 + 日志 + 顶栏**：
 
 - **AutoClaw 平台卡片**：运行状态 / 上游通道 / 运行时长 / 模型别名；启动、停止、连通性测试（真实推理）
 - **账号卡片**（同一行的第二块）：积分余额与即将过期（CN 网关按需查询）、token 剩余有效期、凭证同步器状态与启停
@@ -99,8 +101,9 @@ Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + 日志 + 顶
 - **Comate 文心快码卡片**：网关状态 / 登录态（license）/ 运行模式（无状态 + 工具循环：会话续跑，含路由表条数）/ 模型目录；启动、停止、连通性测试
 - **Qoder CN 卡片**：网关状态 / 账号池（可用数）/ 出口（`cn`）/ 监听 / 模型目录（只列账号可用的）；启动、停止、连通性测试、**同步账号**
 - **千问办公卡片**：与 Qoder CN **同一个网关进程的另一个出口**（卡片上标 `出口 qworkcn (qwenwork.cn)` 与共用端口）；模型目录只显示 `qwork` 场景里那三个；同样的四个按钮（启停/连通性测试/同步账号）
+- **Codex CLI 接入卡片**：Codex CLI 版本 / 配置文件 / 当前指向 / 已注册链路 / 前门（:18776）/ Codex 自带目录条目数六项状态，加链路一览（七条各自的接法与档位）；注册（写托管区 + 合并模型目录）、摘除（只删托管区、顶层键还原）、目录预览、冒烟（发一发真实 Responses 请求，不是探活）、前门启停、体检
 - **ZCode 供应商注册卡片**：注册状态（含最近一次动态同步的增删结果）/ 七家接入地址与模型数 / 模型清单 / 一键注册（全量刷新模型目录）/ **配置体检**（只读检查 `provider_config.json` 的枚举与必需字段）
-- **日志查看器**：`relay` / 同步器 / WorkBuddy / Trae / 豆包工作 / Comate / Qoder / 控制台**八个页签**，自动刷新
+- **日志查看器**：`relay` / 同步器 / WorkBuddy / Trae / 豆包工作 / Comate / Qoder / Codex / 控制台**九个页签**，自动刷新
 - **顶栏**：**一键启动全部**（按依赖顺序拉起各家网关与同步器，某项缺前置只影响它自己，失败时自动把体检结果摆出来）与**环境体检**
 
 环境体检逐项探测：Node 运行时、Python、`cryptography`、七家的网关源码与运行时文件、A-SWITCH 后端（`a_switch.py`，一键注册/余额/凭证同步的加载对象）、七家的登录态（AutoClaw 凭证 / Trae storage.json / 豆包 cookie / Comate settings.json / Qoder `auth.v1.dat` / 千问 `auth-v2.dat`）、ZCode 配置，每项都带"缺了会怎样 + 怎么补"。
@@ -109,7 +112,7 @@ Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + 日志 + 顶
 
 ```
 cd app && npm start                     # 启动（等价于 npx electron .）
-ASWITCH_SELFTEST=1 npx electron .       # 31 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 闸门断言 + 生成钥 + 标准钥别名 + 七链路鉴权体检 + 日志 + relay 停复）
+ASWITCH_SELFTEST=1 npx electron .       # 38 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + Codex 链路七项 + 体检 + 闸门断言 + 生成钥 + 标准钥别名 + 七链路鉴权体检 + 日志 + relay 停复）
 ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # 只跑指定处理器（带参数写 keys:generate=trae，`=` 后按 `=` 再拆，如 keys:alias=trae=sk-xxx=add）
 node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，19 条用例）
 node app/test_inbound_keys.js           # 「生成 api_key」钥存储/生成器 + 标准钥别名的纯净回归（34 条用例）
@@ -241,6 +244,29 @@ Qoder CN（`D:\Qoder CN`，`com.qodercn.app.stable`）与千问办公（QwenWork
 - **上游协议的保真度（用它之前先知道）**：网关入口是标准 chat completions（另收 `/v1/responses`，内部翻译成 chat 再走同一条上游），但**上行 body 是官方 `baseprompt.json` 的深拷贝**——里面的 `messages` 是"system + 拍平后的历史"，assistant 历史里的 `tool_calls` 会被序列化成文本标记，不是结构化消息；**只有 `tools` 是真列表**照发（客户端给了就用客户端的，没给就置空，避免把 Qoder 桌面端自带的 agent 工具泄漏给普通客户端）。结论：工具调用能闭环，但"同一个工具反复触发"的多轮保真度不如 WorkBuddy / AutoClaw（详见[上游协议保真度](#上游协议保真度谁是真的-chat-completions)）。
 - **账号池与签到**：网关自带多账号轮询、设备指纹派生（同号固定同虚拟设备）、每日签到/活动领取（官方幂等）。账号池文件在 `~/.qoder-relay/accounts/`（控制台启动时以 `--accounts-dir` 指定），**不入库**。
 
+## Codex CLI 接入（Responses API）
+
+Codex CLI 0.100+ 的 `wire_api` **只认 `"responses"`**（`chat` 已从二进制里删掉），而七条链路里只有四条原生讲 `/v1/responses`。接入分两档，全部由控制台新增的「Codex CLI 接入」卡片托管：
+
+| 链路 | Codex base_url | 接法 | 档位 |
+|---|---|---|---|
+| AutoClaw | `http://127.0.0.1:18766/v1` | 直连（relay 原生 `/v1/responses`） | 工具 |
+| Comate 文心快码 | `http://127.0.0.1:18774/v1` | 直连；工具词汇经 `comate/codex_shell.mjs` 从 IDE 词汇翻成 Codex 的 shell 词汇 | 工具 |
+| Qoder CN | `http://127.0.0.1:8791/v1` | 直连（vendored 网关自带 `/v1/responses`） | 工具 |
+| 千问办公 | `http://127.0.0.1:8791/v1` | 同上；两条链路靠各自绑定的出口 Key 分流 | 工具 |
+| WorkBuddy | `http://127.0.0.1:18776/wb/v1` | 前门翻译 → wb2api 的 chat completions | 工具 |
+| Trae SOLO CN | `http://127.0.0.1:18776/trae/v1` | 前门翻译 | 仅文本 |
+| 豆包工作 | `http://127.0.0.1:18776/doubao/v1` | 前门翻译 | 仅文本 |
+
+「仅文本」档的上游没有工具通道，在 Codex 里只能当纯文本助手（Codex 照样声明工具，翻译层把工具往返原样忽略）。
+
+- **前门（`bridge/codex_front.mjs`，:18776）**：WorkBuddy 的 wb2api 是 Go 单文件上游，路由表里根本没有 `/v1/responses`（源码注释里就写着转换器由外部提供），改二进制不划算，于是在本机起一个只绑 `127.0.0.1` 的翻译进程：`/<链路>/v1/responses` → 上游 `/v1/chat/completions`，其余路径（models 等）原样透传。钥匙不落地（`Authorization` / `x-api-key` 原样透传，上游自己校验），上游错误原样回传状态码（401/402 的语义不能丢）。变换层 `bridge/responses_transform.mjs` 是共享的——Comate relay 的原生 `/v1/responses` 路由也复用它：同一套流式状态机，id 形状 `resp_/msg_/fc_/ctc_/cmp_`；推理、工具调用、用量三件事全由翻译层补齐，压缩回合必须回**恰好一个** compaction 条目，否则 codex-rs 直接 Fatal。
+- **注册只动托管区（`app/codex-config.js`）**：四道闸门与 ZCode 那套同思路——G1 形状（provider id / base_url / wire_api / 模型取值全在白名单，base_url 只认本机已知端口与前缀）；G2 结构（**托管区之外逐字节不变**，实现是"去掉托管行后的残文必须相等"——你的 `[projects.*]`、注释、缩进、换行风格一个字节不动）；G3 原子（tmp+rename，写前备份）；G4 读回（写完重新解析断言托管区生效，失败即回滚）。凭据放 provider 表的 `experimental_bearer_token`，**不碰 `~/.codex/auth.json`**（那是官方登录的地盘）。摘除时按激活前的顶层键快照还原。
+- **目录是整体替换语义（`model_catalog_json`）**：0.160.1 实测自定义目录会**替换** Codex 自带目录（只写 1 条模型，`codex debug models` 就只剩那 1 条）——所以生成目录时把自带条目整份克隆进来再追加 A-SWITCH 条目；我方条目用最小模板（不写 `apply_patch_tool_type` / `supports_search_tool`，落到"未知模型回退元数据"的工具面——只有 shell 一族），因为桥只翻译 shell 词汇。
+- **Trae 的模型名大小写/后缀敏感**：`deepseek-v4-flash`（多模态全组那条）上游会**静默返回空**（HTTP 200 + 空 content，不报错），带 `-official` 后缀的那条才真出话——注册默认用后者，别改回去。
+- **两条上游工具形状的坑（Qoder / 千问办公）**：① 上游只认 `type:"function"` 工具，Codex 每轮还会带 `web_search` 与 `namespace multi_agent_v1`，网关必须过滤（日志里记 `dropped_tools=`）；② 上游只认 **Chat Completions 的嵌套工具形状**（`{type:"function",function:{…}}`）——扁平 Responses 形状（顶层 `name`/`description`/`parameters`）会回 400 `Error in upstream response`。`/v1/chat/completions` 入口靠 `normalize_tools()` 现包，`/v1/responses` 入口曾漏掉这一步（**2026-10-11 修复**：`responses_to_chat()` 出口补齐；症状是 Codex 报 `stream disconnected before completion`——上游 400 藏在 HTTP 200 的流里，看状态码看不出来）。排障钩子：`QODER_DUMP_BODY=<file>` 让网关把发往上游的明文请求体逐行追加进文件（当日就是靠它对比两条入口的上游体定位的）。
+- **验证**：`node bridge/test_codex_e2e.mjs [链路]` 真机跑完整闭环（注册 → **真的 `codex exec`** 跑一次工具循环 → 摘除并断言 `config.toml` 逐字节还原；`CODEX_HOME` 指向 `.research/codex-probe/e2e-home` 沙箱，不碰真实 `~/.codex`）。2026-10-11 实测：Comate ✓、WorkBuddy ✓、Trae ✓（文本档）、豆包 ✓（文本档）、千问办公 ✓（工具循环）；Qoder CN 因上游当日额度（`code-110`）受阻、AutoClaw 因桌面端未启动受阻——都是环境层，链路代码未动。
+
 ## ZCode 供应商的动态增删
 
 ZCode 里能看到哪个供应商 = 对应平台链路此刻开启。这是控制台自动维护的，不需要手动注册/清理：
@@ -363,15 +389,15 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 
 **标准钥（sk- 形·别名映射，2026-10-11 起）**：只认 `sk-` 开头钥匙的标准工具（DeepSeek Harness、Codex、OpenAI SDK 系）用首位「生成」拿到的主钥会被它们"看着别扭"（有些客户端/网关会做形状校验），但主钥又不能随便改成 `sk-` 形（ZCode 注册值跟着变，且和平台前缀约定冲突）。所以卡片给每条 env 型链路加了一个「sk 钥」按钮：点开留空回车即现场生成一把 `sk-<平台前缀>-<36 位 hex>`（也可粘贴你自己的 `sk-xxx`），登记进 `inbound-keys.json` 的顶层保留键 `_aliases`（形状 `{ "<链路>": ["sk-…"] }`，与扁平主钥互不干扰、旧档案完全兼容），随后自动重启该链路把「主钥 ∪ 别名」一并吃进闸门集合。**别名只进闸门，不改 ZCode 注册值**（ZCode 侧仍是主钥）——所以加/删别名都不需要重注册，也不影响 ZCode；别名在盘点里单列一行（左侧绿边、标签「（sk）」），点「✕」即从档案移除并重启、立刻失效（撤销语义）。手动用法等价于往档案里加一条并重启 relay：`Authorization: Bearer sk-tr-…`（或 `x-api-key`）。目前只覆盖四条 env 型链路——WorkBuddy 是 Go 二进制单钥、Qoder/千问办公是网关侧出口 Key，都要 sk- 形就直接用「生成」/`keys:rotate` 把主钥设成 `sk-` 形值（`keys:rotate` 接受任意合法形状，包括 `sk-xxx`）。
 
-控制台「入站 api_key」卡片把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账：✓ 注册一致 / ✗ 注册不一致 / ◇ 注册为备用钥 / 未注册 四态），首行「生成」按钮一键换新钥（生成 → 重启该链路 → 切 ZCode 注册值，见上），「sk 钥」按钮加/撤标准钥别名（见上），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:generate` / `keys:probe` / `keys:rotate` / `keys:alias` 五个通道；`keys:generate`、`keys:alias`（含撤销）与 `keys:probe` 同时进了全量自测（第 28-31 项）。
+控制台「入站 api_key」卡片把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账：✓ 注册一致 / ✗ 注册不一致 / ◇ 注册为备用钥 / 未注册 四态），首行「生成」按钮一键换新钥（生成 → 重启该链路 → 切 ZCode 注册值，见上），「sk 钥」按钮加/撤标准钥别名（见上），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:generate` / `keys:probe` / `keys:rotate` / `keys:alias` 五个通道；`keys:generate`、`keys:alias`（含撤销）与 `keys:probe` 同时进了全量自测（第 32-35 项）。
 
 闸门回归：`node test_inbound_key.mjs`（零出站 67 条：401/放行判别式、双头形状、OPTIONS 204、`/health` 豁免、轮换钥、关闭开关、非环回监听下新旧两套鉴权并存、trae 三端点全拦、doubao 目录端点入闸 + `/admin` 豁免、四条 env 链路的「生成」存储钥越过闸门且与内置钥并存、标准钥别名越过闸门（双头形状）、别家链路的别名不串门、删掉别名重启后即失效、旧格式档案无 `_aliases` 照常工作）。生成器与存储模块另有 `node app/test_inbound_keys.js`（34 条：随机钥形状/平台前缀、非法值拒绝、存储读写与损坏兜底、别名的增删/去重/宽容读、主钥与别名两条写路径互不吞噬、以及"四家 relay 源码确实读这个文件与 `_aliases`"的漂移守门）。
 
 ### 控制台 / 自测
 
-`ASWITCH_SELFTEST=1 npx electron .` 顺序执行各 IPC 处理器（等同逐个点按钮），`ASWITCH_SELFTEST_ONLY="keys:probe"` 可单跑指定通道。27 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 入站闸门断言 + 日志 + relay 停复）+ `keys:generate`（生成新钥端到端：生成 → 重启 → 复测 → 盘点换位，第 28 项）+ `keys:alias`（加一把 sk- 标准钥 → 带它打 `/v1/messages` 越过闸门且主钥不变，第 29 项）+ `keys:alias:remove`（撤销，第 30 项）+ `keys:probe`（七链路鉴权体检，第 31 项）。
+`ASWITCH_SELFTEST=1 npx electron .` 顺序执行各 IPC 处理器（等同逐个点按钮），`ASWITCH_SELFTEST_ONLY="keys:probe"` 可单跑指定通道。38 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + **Codex 链路七项**（体检 / 起前门 / 目录预览 / 注册 / 复检 / 冒烟 / 摘除后逐字节还原，在临时 `CODEX_HOME` 上跑、不碰真实 `~/.codex`）+ 体检 + 入站闸门断言 + 日志 + relay 停复）——其中 `keys:generate`（生成新钥端到端：生成 → 重启 → 复测 → 盘点换位）是第 32 项，`keys:alias`（加一把 sk- 标准钥 → 带它打 `/v1/messages` 越过闸门且主钥不变）第 33 项，`keys:alias:remove`（撤销）第 34 项，`keys:probe`（七链路鉴权体检）第 35 项。
 
-回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node app/test_inbound_keys.js`（生成钥存储与生成器 + 标准钥别名，34 条）、`node test_inbound_key.mjs`（入站 api_key 闸门，零出站 67 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
+回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node app/test_inbound_keys.js`（生成钥存储与生成器 + 标准钥别名，34 条）、`node test_inbound_key.mjs`（入站 api_key 闸门，零出站 67 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。**Codex 接入的离线回归**：`node app/test_codex_config.js`（config.toml 托管区四道闸门 + 目录合并，21 条）、`node bridge/test_responses_transform.mjs`（Responses⇄Chat 变换层穷举：工具/推理/用量/压缩回合，88 条）、`node bridge/test_codex_front.mjs`（前门路由与透传，6 条）、`node comate/test_responses.mjs`（Comate 原生 `/v1/responses` 与工具续跑，10 条）、`node comate/test_codex_shell.mjs`（上游工具词汇→Codex shell 词汇翻译，14 条）、`node comate/test_codex_shell_win.mjs`（Windows 落盘动作的沙箱真跑，5 条），全部离线；真机闭环则 `node bridge/test_codex_e2e.mjs [链路]`（注册 → `codex exec` 真跑工具循环 → 摘除还原，`CODEX_HOME` 沙箱隔离；2026-10-11 实测：comate / workbuddy / trae / 豆包 / 千问办公通过，qoder 因上游当日额度、autoclaw 因桌面端未启动受阻）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
 
 注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
 
@@ -421,7 +447,9 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 │   ├── main.js / preload.js       生命周期管理 + IPC（含 ASWITCH_SELFTEST 自测模式）
 │   ├── zcode-config.js            ★ ZCode 配置写入闸门（纯 Node：枚举/结构/原子/回滚 + 动态注销）
 │   ├── inbound-keys.js            ★ 入站钥匙存储与生成器（「生成 api_key」/ sk- 标准钥别名的纯 Node 核心，relay 与主进程共用）
+│   ├── codex-config.js            ★ Codex 配置（~/.codex/config.toml）的托管区读写闸门（纯 Node：形状/结构/原子/读回四道闸门 + 目录合并 + 摘除还原）
 │   ├── test_zcode_config.js       配置闸门与主进程源码卫生的沙箱回归测试（19 条用例）
+│   ├── test_codex_config.js       Codex 写入闸门的沙箱回归测试（21 条用例，含顶层旧值快照与还原）
 │   ├── test_inbound_keys.js       生成钥存储/生成器、别名读写与四家 relay 读档的漂移守门（34 条用例）
 │   ├── test_client.mjs            CDP 端的 GUI 自测脚本（需控制台带 --remote-debugging-port=9222）
 │   └── renderer/                  状态面板 UI（index.html / ui.js / style.css）
@@ -430,6 +458,9 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 │   ├── watch_auth.py              凭证自动同步器（常驻）
 │   ├── server_2x.mjs              PR#4 的 2.x 独立部署版反代（控制台「启动 AutoClaw」部署它；上游主线已并入 relay/server.mjs）
 │   ├── extract_persona.py         ★ 从已装客户端提取应用 persona（厂商文本不入库；随包种子仅兜底）
+│   ├── codex_front.mjs            ★ Codex 前门：只讲 chat completions 的链路（WorkBuddy/Trae/豆包）在本机做 Responses→Chat 翻译（:18776，只绑 127.0.0.1）
+│   ├── responses_transform.mjs    ☆ Responses⇄Chat 共享变换层（前门与 Comate 原生 /v1/responses 路由共用）
+│   ├── test_codex_*.mjs / test_responses_transform.mjs   Codex 前门与变换层的离线测试 + 真机 E2E
 │   └── test_*.mjs / probe_*.mjs   406 闸门的实验、验证与二分脚本（30 个）
 ├── trae/                          ← Trae SOLO CN 反代
 │   ├── relay.mjs                  ★ 网关本体（openai + anthropic，凭证解密 + 无状态转发）
@@ -445,6 +476,9 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 │   └── t-*.mjs                    协议实验脚本（会话、ACK、多轮、深思考对照）
 ├── comate/                        ← Comate（文心快码）反代
 │   ├── relay.mjs                  ★ 网关本体（openai + anthropic，license 凭证 + 云端 agent 三步链（SSE 真流式）+ 工具循环续跑）
+│   ├── codex_shell.mjs            上游 agent 工具词汇（Bash/Write…）→ Codex shell 词汇（exec_command）的纯函数翻译
+│   ├── test_responses.mjs         原生 /v1/responses 与工具续跑的离线回归（10 条）
+│   ├── test_codex_shell.mjs / test_codex_shell_win.mjs   词汇翻译单测（14 条）+ Windows 落盘动作沙箱真跑（5 条）
 │   ├── test_relay.mjs             工具循环契约的离线回归（34 条，不花额度）
 │   ├── test_stream.mjs            假上游流式/工具循环集成测试（6 条，不联网不花额度）
 │   ├── e2e_tool_loop.mjs          真机多跳工具循环 E2E（COMATE_E2E=1 才跑，消耗额度）
