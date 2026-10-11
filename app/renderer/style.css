@@ -59,3 +59,11 @@ footer { padding: 10px 22px; color: var(--dim); font-size: 11px; border-top: 1px
 .keyrow .kgen { flex: none; font-size: 11px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 5px; background: #20242e; color: var(--fg); cursor: pointer; }
 .keyrow .kgen:hover { border-color: var(--accent); color: var(--accent); }
 .keyrow .kgen:disabled { opacity: .55; cursor: default; }
+/* 标准钥（sk- 形·别名）：加钥按钮与别名行的撤销按钮；别名行左侧描边区分主钥行 */
+.keyrow .kalias { flex: none; font-size: 11px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 5px; background: #20242e; color: var(--fg); cursor: pointer; }
+.keyrow .kalias:hover { border-color: var(--ok); color: var(--ok); }
+.keyrow .kalias:disabled { opacity: .55; cursor: default; }
+.keyrow.kaliasrow { border-left: 3px solid var(--ok); }
+.keyrow .kdel { flex: none; font-size: 11px; padding: 1px 8px; border: 1px solid var(--line); border-radius: 5px; background: #20242e; color: var(--dim); cursor: pointer; }
+.keyrow .kdel:hover { border-color: var(--err); color: var(--err); }
+.keyrow .kdel:disabled { opacity: .55; cursor: default; }

@@ -179,8 +179,9 @@
         <div class="kv">
           <div><label>闸门语义</label><span>模型路径必须带钥匙（否则 401），/health 豁免；生成 = 加钥，内置兜底钥仍有效</span></div>
           <div><label>生效位置</label><span class="mono">ZCode access.apiKey = 闸门钥匙</span></div>
+          <div><label>标准钥（sk-）</label><span>「sk 钥」= 加一把 sk- 形别名，给只认 sk- 的标准工具（DeepSeek Harness / Codex / OpenAI SDK）用；只进闸门，不改 ZCode 注册值，可 ✕ 撤销</span></div>
         </div>
-        <div class="sec">钥匙盘点（悬停看来源，点击复制；「生成」= 随机新钥 + 自动重启链路 + 排队重注册）</div>
+        <div class="sec">钥匙盘点（悬停看来源，点击复制；「生成」= 随机新钥 + 自动重启链路 + 排队重注册；「sk 钥」= 加标准钥别名）</div>
         <div id="keys-list" class="keyslist">未加载</div>
         <div class="btns">
           <button id="btn-keys-probe" class="btn ok">鉴权体检</button>

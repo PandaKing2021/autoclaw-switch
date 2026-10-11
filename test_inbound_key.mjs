@@ -14,6 +14,9 @@
 // 控制台「生成」档案（~/.autoclaw-relay/inbound-keys.json，键 = 链路 id）：
 // 四条 env 链路启动时读它并钥，生成钥与内置兜底钥并存（HOME/USERPROFILE
 // 指向假目录做隔离，绝不碰真实档案）。
+// 标准钥（别名·sk- 形，档案顶层保留键 _aliases[链路]）：四条 env 链路启动时
+// 把「主钥 ∪ 别名」一并并进闸门集合——别名越过闸门、别家链路的别名不串门、
+// 从档案删掉别名重启后即失效（撤销语义），旧格式档案（无 _aliases）照常工作。
 import { spawn } from "node:child_process";
 import http from "node:http";
 import fs from "node:fs";
@@ -87,10 +90,13 @@ const FAKE_PORT = fakeUpstream.address().port;
 // 形状同 app/inbound-keys.js 的生成钥（前缀 + 36 位 hex），内容固定便于断言。
 // relay 只把它当「集合里再多一把钥」，没有任何额外语义。
 const storeKey = (id) => `${id}-${"0".repeat(36)}`;
-function fakeHomeWithStore(ids) {
+// 标准钥（别名·sk- 形）合成值：形状同 app/inbound-keys.js 的 generateStandardKey
+const aliasKey = (id) => `sk-${id}-${"1".repeat(36)}`;
+function fakeHomeWithStore(ids, aliases = {}) {
   const home = tmp("asw-inbound-home");
   const store = {};
   for (const id of ids) store[id] = storeKey(id);
+  if (Object.keys(aliases).length) store._aliases = aliases;
   fs.mkdirSync(path.join(home, ".autoclaw-relay"), { recursive: true });
   fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify(store));
   return home;
@@ -104,7 +110,7 @@ const baseA = {
 };
 // bridge 实例（= 控制台部署的 server.mjs 本体）把 HOME 指进带档案的假目录：
 // 生成钥通道只在 bridge 里（relay/server.mjs 是上游本体，控制台不部署它）
-const acHome = fakeHomeWithStore(["autoclaw"]);
+const acHome = fakeHomeWithStore(["autoclaw"], { autoclaw: [aliasKey("autoclaw")], trae: [aliasKey("trae")] });
 const autoclawInstances = [
   ["relay/server.mjs", { ...baseA, AUTOCLAW_PORT: "18899" }],
   ["bridge/server_2x.mjs", { ...baseA, AUTOCLAW_PORT: "18900", AUTOCLAW_INBOUND_KEYS: "rotated-key-1, rotated-key-2",
@@ -127,6 +133,9 @@ for (const [script, env] of autoclawInstances) {
     ok("[bridge] AUTOCLAW_INBOUND_KEYS 轮换钥生效", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": "rotated-key-2" })));
     ok("[bridge] 「生成」档案钥 (autoclaw-000…) 越过闸门", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("autoclaw") })));
     ok("[bridge] 档案钥与内置兜底钥并存", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": "autoclaw-local" })));
+    ok("[bridge] 标准钥别名 (sk-autoclaw-111…) 越过闸门", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("autoclaw") })));
+    ok("[bridge] 别名 Bearer 形状同权", passed(await req(s.port, "GET", "/v1/models", { authorization: `Bearer ${aliasKey("autoclaw")}` })));
+    ok("[bridge] 别家链路的标准钥不串门（trae 的别名） → 401", gated(await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("trae") })));
   }
   s.stop();
 }
@@ -186,9 +195,10 @@ for (const [script, env] of autoclawInstances) {
   fs.mkdirSync(path.join(appdata, "Comate", "User"), { recursive: true });
   fs.writeFileSync(path.join(appdata, "Comate", "User", "settings.json"),
     JSON.stringify({ "baidu.comate.license": "test-license", "baidu.comate.username": "tester" }));
-  // 同一假 home 里放一份「生成」档案：comate 启动时并钥
+  // 同一假 home 里放一份「生成」档案：comate 启动时并钥；另带本链路与 trae 各一把标准钥别名
   fs.mkdirSync(path.join(appdata, ".autoclaw-relay"), { recursive: true });
-  fs.writeFileSync(path.join(appdata, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify({ comate: storeKey("comate") }));
+  fs.writeFileSync(path.join(appdata, ".autoclaw-relay", "inbound-keys.json"),
+    JSON.stringify({ comate: storeKey("comate"), _aliases: { comate: [aliasKey("comate")], trae: [aliasKey("trae")] } }));
   const s = startScript("comate/relay.mjs", {
     APPDATA: appdata, COMATE_RELAY_PORT: "18904", COMATE_RELAY_HOST: "127.0.0.1",
     COMATE_RELAY_BASE: `http://127.0.0.1:${FAKE_PORT}`, COMATE_RELAY_KEY: "rotated-comate-key",
@@ -198,6 +208,8 @@ for (const [script, env] of autoclawInstances) {
   ok("[comate] 轮换钥生效", (await req(s.port, "GET", "/v1/models", { "x-api-key": "rotated-comate-key" })).status === 200);
   ok("[comate] 内置旧钥仍在（并存）", (await req(s.port, "GET", "/v1/models", { "x-api-key": "comate-local" })).status === 200);
   ok("[comate] 「生成」档案钥 (comate-000…) 并存生效", (await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("comate") })).status === 200);
+  ok("[comate] 标准钥别名 (sk-comate-111…) 越过闸门", (await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("comate") })).status === 200);
+  ok("[comate] 别家链路的标准钥不串门（trae 的别名） → 401", gated(await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("trae") })));
   s.stop();
 
   const s2 = startScript("comate/relay.mjs", {
@@ -218,9 +230,11 @@ for (const [script, env] of autoclawInstances) {
   const storage = path.join(home, "TRAE SOLO CN", "User");
   fs.mkdirSync(storage, { recursive: true });
   fs.writeFileSync(path.join(storage, "storage.json"), JSON.stringify({}));
-  // 假 home 里放一份「生成」档案（HOME/USERPROFILE 都指过来，Windows 上 homedir() 认 USERPROFILE）
+  // 假 home 里放一份「生成」档案（HOME/USERPROFILE 都指过来，Windows 上 homedir() 认 USERPROFILE）；
+  // 另带本链路与 doubao 各一把标准钥别名：前者必须越过闸门，后者必须被拦（不串门）
   fs.mkdirSync(path.join(home, ".autoclaw-relay"), { recursive: true });
-  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify({ trae: storeKey("trae") }));
+  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"),
+    JSON.stringify({ trae: storeKey("trae"), _aliases: { trae: [aliasKey("trae")], doubao: [aliasKey("doubao")] } }));
   const envBase = { HOME: home, USERPROFILE: home, TRAE_RELAY_HOST: "127.0.0.1", TRAE_STORAGE: path.join(storage, "storage.json") };
   const s = startScript("trae/relay.mjs", { ...envBase, TRAE_RELAY_PORT: "18906" }, "/health");
   await s.wait();
@@ -230,6 +244,9 @@ for (const [script, env] of autoclawInstances) {
   ok("[trae] trae-local-key (x-api-key) 越过闸门", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": "trae-local-key" })));
   ok("[trae] Bearer 形状同权", passed(await req(s.port, "GET", "/v1/models", { authorization: "Bearer trae-local-key" })));
   ok("[trae] 「生成」档案钥 (trae-000…) 越过闸门（与内置钥并存）", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("trae") })));
+  ok("[trae] 标准钥别名 (sk-trae-111…) 越过闸门", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("trae") })));
+  ok("[trae] 别名 Bearer 形状同权", passed(await req(s.port, "GET", "/v1/models", { authorization: `Bearer ${aliasKey("trae")}` })));
+  ok("[trae] 别家链路的标准钥不串门（doubao 的别名） → 401", gated(await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("doubao") })));
   ok("[trae] /health 无钥放行", (await req(s.port, "GET", "/health")).status === 200);
   s.stop();
 
@@ -258,9 +275,11 @@ for (const [script, env] of autoclawInstances) {
 // ~/.doubao-relay 是硬编码 homedir()/.doubao-relay，把 HOME 指进假目录即可。
 {
   const home = tmp("doubao-inbound-home");
-  // 假 home 里放一份「生成」档案：doubao 启动时并钥（档案与内置钥、config.json key 三者并存）
+  // 假 home 里放一份「生成」档案：doubao 启动时并钥（档案与内置钥、config.json key 三者并存）；
+  // 另带本链路与 comate 各一把标准钥别名：前者越过闸门，后者被拦（不串门）
   fs.mkdirSync(path.join(home, ".autoclaw-relay"), { recursive: true });
-  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify({ doubao: storeKey("doubao") }));
+  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"),
+    JSON.stringify({ doubao: storeKey("doubao"), _aliases: { doubao: [aliasKey("doubao")], comate: [aliasKey("comate")] } }));
   const s = startScript("doubao/relay.mjs", {
     HOME: home, USERPROFILE: home,
     DOUBAO_RELAY_PORT: "18907", DOUBAO_RELAY_HOST: "127.0.0.1",
@@ -271,6 +290,8 @@ for (const [script, env] of autoclawInstances) {
   ok("[doubao] doubao-local-key (x-api-key) 越过闸门（200=合成目录）", (await req(s.port, "GET", "/v1/models", { "x-api-key": "doubao-local-key" })).status === 200);
   ok("[doubao] Bearer 形状同权", (await req(s.port, "GET", "/v1/models", { authorization: "Bearer doubao-local-key" })).status === 200);
   ok("[doubao] 「生成」档案钥 (doubao-000…) 越过闸门（与内置钥并存）", (await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("doubao") })).status === 200);
+  ok("[doubao] 标准钥别名 (sk-doubao-111…) 越过闸门", (await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("doubao") })).status === 200);
+  ok("[doubao] 别家链路的标准钥不串门（comate 的别名） → 401", gated(await req(s.port, "GET", "/v1/models", { "x-api-key": aliasKey("comate") })));
   ok("[doubao] /health 无钥放行", (await req(s.port, "GET", "/health")).status === 200);
   // /admin/* 豁免的证明：匿名 POST 没被闸门 401 拦下（空 HOME 下 cookie 缺失 → 500 业务错误，非 401）
   ok("[doubao] /admin/* 仍豁免（匿名进业务路径=500 缺 cookie，非闸门 401）",
@@ -295,6 +316,18 @@ for (const [script, env] of autoclawInstances) {
   ok("[doubao] DOUBAO_INBOUND_KEYS 轮换钥生效", (await req(s3.port, "GET", "/v1/models", { "x-api-key": "rotated-dk-1" })).status === 200);
   ok("[doubao] 内置旧钥仍并存", (await req(s3.port, "GET", "/v1/models", { "x-api-key": "doubao-local-key" })).status === 200);
   s3.stop();
+
+  // 撤销 = 控制台「✕」从档案删掉别名 → 重启后别名不再被认，主钥不受影响。
+  // 顺带覆盖旧格式档案（纯扁平、无 _aliases）：主钥照常生效（向后兼容）。
+  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify({ doubao: storeKey("doubao") }));
+  const s4 = startScript("doubao/relay.mjs", {
+    HOME: home, USERPROFILE: home,
+    DOUBAO_RELAY_PORT: "18907", DOUBAO_RELAY_HOST: "127.0.0.1",
+  }, "/health");
+  await s4.wait();
+  ok("[doubao] 旧格式档案（无 _aliases）主钥仍生效", (await req(s4.port, "GET", "/v1/models", { "x-api-key": storeKey("doubao") })).status === 200);
+  ok("[doubao] 别名随档案撤销（重启后不再被认） → 401", gated(await req(s4.port, "GET", "/v1/models", { "x-api-key": aliasKey("doubao") })));
+  s4.stop();
 }
 
 // ------------------------------------------------------------------ 汇总

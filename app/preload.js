@@ -35,6 +35,8 @@ contextBridge.exposeInMainWorld("api", {
   keysQuery: () => ipcRenderer.invoke("keys:query"),
   keysProbe: () => ipcRenderer.invoke("keys:probe"),
   keysGenerate: (linkId) => ipcRenderer.invoke("keys:generate", linkId),
+  // 标准钥（别名·sk- 形）：action = add（key 为空则现场生成一把 sk-<前缀>-<hex>）/ remove（撤销 key）
+  keysAlias: (linkId, key, action) => ipcRenderer.invoke("keys:alias", linkId, key, action),
   keysRotate: (linkId, newKey) => ipcRenderer.invoke("keys:rotate", linkId, newKey),
   tailLog: (which) => ipcRenderer.invoke("logs:tail", which),
 });

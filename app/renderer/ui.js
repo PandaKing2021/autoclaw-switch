@@ -368,8 +368,16 @@ async function refreshKeys() {
       const gen = i === 0
         ? `<button class="kgen" data-link="${l.id}" title="生成新 api_key：随机新钥写入网关档案 → 自动重启在跑的链路 → 排队切换 ZCode 注册值（生成是加钥：内置兜底钥与旧钥仍有效）">生成</button>`
         : "";
-      return `<div class="keyrow"><span class="klabel">${l.label}${i > 0 ? "（备）" : ""}</span>`
-        + `<span class="kvalue" title="${l.label} · ${k.source}｜点击复制" data-copy="${k.value.replace(/"/g, "&quot;")}">${k.value}</span>${i === 0 ? zc + gen : ""}</div>`;
+      // 标准钥（sk- 形·别名）：只对四条 env 链路开放（wb2api 单钥二进制 / qoder 系走网关出口 Key）
+      const skBtn = i === 0 && l.aliasable
+        ? `<button class="kalias" data-link="${l.id}" title="加一把 sk- 形标准钥（别名）：给只认 sk- 开头钥匙的标准工具（DeepSeek Harness / Codex / OpenAI SDK）用。别名只进本链路入站闸门，ZCode 注册值不变；可留空自动生成，也可填自己的 sk-xxx">sk 钥</button>`
+        : "";
+      const del = k.alias
+        ? `<button class="kdel" data-link="${l.id}" data-key="${k.value.replace(/"/g, "&quot;")}" title="撤销这把标准钥（从档案移除并重启本链路；主钥与 ZCode 注册值不受影响）">✕</button>`
+        : "";
+      const tag = k.alias ? "（sk）" : (i > 0 ? "（备）" : "");
+      return `<div class="keyrow${k.alias ? " kaliasrow" : ""}"><span class="klabel">${l.label}${tag}</span>`
+        + `<span class="kvalue" title="${l.label} · ${k.source}｜点击复制" data-copy="${k.value.replace(/"/g, "&quot;")}">${k.value}</span>${i === 0 ? zc + gen + skBtn : del}</div>`;
     }).join("")).join("");
     document.querySelectorAll("#keys-list .kvalue").forEach((el) => {
       el.onclick = async () => {
@@ -394,6 +402,53 @@ async function refreshKeys() {
             line = `❌ ${label} 生成失败：${r.error || "未知原因"}`;
           }
         } catch (e) { line = "❌ 生成异常：" + e.message; }
+        await refreshKeys();
+        $("keys-note").textContent = line;
+        setPill("keys-pill", code, pill);
+      };
+    });
+    document.querySelectorAll("#keys-list .kalias").forEach((el) => {
+      el.onclick = async () => {
+        const linkId = el.dataset.link;
+        const label = (el.closest(".keyrow")?.querySelector(".klabel")?.textContent || linkId).replace(/（备）|（sk）/g, "");
+        const typed = window.prompt(`为「${label}」加一把 sk- 形标准钥（别名）——给 DeepSeek Harness / Codex / OpenAI SDK 这类只认 sk- 开头钥匙的标准工具用：\n\n· 留空直接确定 = 现场生成一把 sk-<前缀>-<36 位 hex>\n· 也可粘贴你自己的 sk-xxx（4..128 个可打印字符、无空白）\n· 别名只进本链路入站闸门，ZCode 注册值不变；本链路会被重启一次`, "");
+        if (typed === null) return;   // 取消
+        el.disabled = true;
+        setPill("keys-pill", "unknown", "加标准钥中…");
+        $("keys-note").textContent = `正在为 ${label} 登记标准钥（写档案 → 重启本链路，最长约 30 秒）…`;
+        let line = "", code = "err", pill = "加标准钥失败";
+        try {
+          const r = await window.api.keysAlias(linkId, String(typed).trim(), "add");
+          if (r.ok) {
+            line = `✅ ${label} 标准钥：${r.key}\n${r.note || ""}\n标准工具里填：Authorization: Bearer ${r.key}（或 x-api-key: ${r.key}）`;
+            code = "ok"; pill = "已加标准钥";
+          } else {
+            line = `❌ ${label} 加标准钥失败：${r.error || "未知原因"}`;
+          }
+        } catch (e) { line = "❌ 加标准钥异常：" + e.message; }
+        await refreshKeys();
+        $("keys-note").textContent = line;
+        setPill("keys-pill", code, pill);
+      };
+    });
+    document.querySelectorAll("#keys-list .kdel").forEach((el) => {
+      el.onclick = async () => {
+        const linkId = el.dataset.link, key = el.dataset.key;
+        const label = (el.closest(".keyrow")?.querySelector(".klabel")?.textContent || linkId).replace(/（备）|（sk）/g, "");
+        if (!window.confirm(`撤销「${label}」的标准钥？\n\n${key}\n\n· 从档案移除并重启本链路；已在用它的工具会立刻失去访问\n· 主钥（ZCode 注册值）与内置兜底钥不受影响`)) return;
+        el.disabled = true;
+        setPill("keys-pill", "unknown", "撤销中…");
+        $("keys-note").textContent = `正在撤销 ${label} 的标准钥（改档案 → 重启本链路）…`;
+        let line = "", code = "err", pill = "撤销失败";
+        try {
+          const r = await window.api.keysAlias(linkId, key, "remove");
+          if (r.ok) {
+            line = `✅ ${label} 标准钥已撤销\n${r.note || ""}`;
+            code = "ok"; pill = "已撤销";
+          } else {
+            line = `❌ ${label} 撤销失败：${r.error || "未知原因"}`;
+          }
+        } catch (e) { line = "❌ 撤销异常：" + e.message; }
         await refreshKeys();
         $("keys-note").textContent = line;
         setPill("keys-pill", code, pill);

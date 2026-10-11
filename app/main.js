@@ -1596,19 +1596,29 @@ function setupIpc() {
   // （ZCode 的 provider_config.json、~/.autoclaw-relay/ 下的两个档案），
   // 这里只是把散在各处的值聚到一个视图里，不新增暴露面。
   // 列表第一位 = 当前主钥（linkApiKey 的口径，keys:probe 的带钥探针也用它）。
-  const pushKey = (arr, value, source) => {
+  const pushKey = (arr, value, source, extra) => {
     const v = typeof value === "string" ? value.trim() : "";
-    if (v && !arr.some((k) => k.value === v)) arr.push({ value: v, source });
+    if (v && !arr.some((k) => k.value === v)) arr.push({ value: v, source, ...(extra || {}) });
   };
   const genKeyOf = (linkId) => IK.activeKey(IK.readStore(INBOUND_KEYS_FILE), linkId);
+  // 标准钥（别名·sk- 形）：档案顶层 _aliases[linkId] 里的值，专门喂 dsh / Codex /
+  // OpenAI SDK 这类只认 sk- 形钥匙的标准工具。只进闸门集合，不改 ZCode 注册值，
+  // 所以在清单里始终排在主钥之后（keys[0] 永远是当前主钥），并带 alias 标记
+  // 供 UI 渲染撤销按钮。
+  const pushAliases = (keys, linkId) => {
+    for (const k of IK.readAliases(INBOUND_KEYS_FILE)[linkId] || []) {
+      pushKey(keys, k, "标准钥 sk-（别名·工具用；可撤销）", { alias: true });
+    }
+  };
   const KEY_INVENTORY = [
-    { id: "autoclaw", label: "AutoClaw", port: 18766, keys: () => {
+    { id: "autoclaw", label: "AutoClaw", port: 18766, aliasable: true, keys: () => {
       const gen = genKeyOf("autoclaw");
       const keys = [];
       pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
       pushKey(keys, "autoclaw-local", gen ? "内置兜底（生成后仍有效）" : "内置（闸门 & ZCode 注册）");
       pushKey(keys, process.env.AUTOCLAW_PROXY_TOKEN || "autoclaw-dsh", "PROXY_TOKEN（dsh 共用）");
       if (process.env.AUTOCLAW_INBOUND_KEYS) for (const k of process.env.AUTOCLAW_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "AUTOCLAW_INBOUND_KEYS 轮换钥");
+      pushAliases(keys, "autoclaw");
       return keys;
     } },
     { id: "workbuddy", label: "WorkBuddy", port: WB_PORT, keys: () => [
@@ -1616,15 +1626,16 @@ function setupIpc() {
       // 没有 env 追加通道；「生成」= 改写该文件并重启网关
       { value: linkApiKey("workbuddy"), source: "wb2api config.json api_key" },
     ] },
-    { id: "trae", label: "Trae", port: TRAE_PORT, keys: () => {
+    { id: "trae", label: "Trae", port: TRAE_PORT, aliasable: true, keys: () => {
       const gen = genKeyOf("trae");
       const keys = [];
       pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
       pushKey(keys, "trae-local-key", gen ? "内置兜底（生成后仍有效）" : "内置（闸门 & ZCode 注册）");
       if (process.env.TRAE_INBOUND_KEYS) for (const k of process.env.TRAE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "TRAE_INBOUND_KEYS 轮换钥");
+      pushAliases(keys, "trae");
       return keys;
     } },
-    { id: "doubao", label: "豆包工作", port: DOUBAO_PORT, keys: () => {
+    { id: "doubao", label: "豆包工作", port: DOUBAO_PORT, aliasable: true, keys: () => {
       const gen = genKeyOf("doubao");
       const keys = [];
       pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
@@ -1634,15 +1645,17 @@ function setupIpc() {
       pushKey(keys, fileKey, "~/.doubao-relay/config.json");
       pushKey(keys, process.env.DOUBAO_RELAY_KEY, "DOUBAO_RELAY_KEY 环境变量");
       if (process.env.DOUBAO_INBOUND_KEYS) for (const k of process.env.DOUBAO_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "DOUBAO_INBOUND_KEYS 轮换钥");
+      pushAliases(keys, "doubao");
       return keys;
     } },
-    { id: "comate", label: "Comate", port: COMATE_PORT, keys: () => {
+    { id: "comate", label: "Comate", port: COMATE_PORT, aliasable: true, keys: () => {
       const gen = genKeyOf("comate");
       const keys = [];
       pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
       pushKey(keys, "comate-local", gen ? "内置兜底（生成后仍有效）" : "内置（闸门 & ZCode 注册）");
       pushKey(keys, process.env.COMATE_RELAY_KEY, "COMATE_RELAY_KEY 环境变量");
       if (process.env.COMATE_INBOUND_KEYS) for (const k of process.env.COMATE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "COMATE_INBOUND_KEYS 轮换钥");
+      pushAliases(keys, "comate");
       return keys;
     } },
     { id: "qoder", label: "Qoder CN", port: QODER_PORT, keys: () => {
@@ -1679,8 +1692,8 @@ function setupIpc() {
     })();
     return {
       ok: true,
-      links: KEY_INVENTORY.map(({ id, label, port, keys }) => ({
-        id, label, port, keys: keys(), zcode: cfgMatch[id] || null,
+      links: KEY_INVENTORY.map(({ id, label, port, aliasable, keys }) => ({
+        id, label, port, aliasable: !!aliasable, keys: keys(), zcode: cfgMatch[id] || null,
       })),
     };
   });
@@ -1745,6 +1758,41 @@ function setupIpc() {
         : withKey && (withKey.status === 502 || withKey.status === 503) ? "闸门在岗、钥匙有效（上游不可达/未登录，见对应链路冒烟）"
         : "闸门在岗且钥匙有效",
     };
+  }
+
+  /**
+   * 拿「指定的一把钥匙」打链路模型端点（keys:probe 用主钥，这里给标准钥/别名
+   * 断言用）。判定口径与 keys:probe 相同：401 且报文是闸门特征才算“被闸门拦下”，
+   * 其余状态码（200 目录 / 上游 401、502、503）都算越过闸门。
+   */
+  function probeKey(linkId, key) {
+    const link = KEY_INVENTORY.find((l) => l.id === linkId);
+    if (!link) return Promise.resolve({ status: 0, gateBody: false, error: "未知链路" });
+    const anthro = ["autoclaw", "comate", "trae"].includes(linkId);
+    const path = anthro ? "/v1/messages" : "/v1/models";
+    const method = anthro ? "POST" : "GET";
+    const data = method === "POST" ? JSON.stringify({ model: "probe", max_tokens: 1, messages: [{ role: "user", content: "ping" }] }) : null;
+    return new Promise((resolve) => {
+      const rq = http.request({
+        host: "127.0.0.1", port: link.port, path, method,
+        headers: {
+          ...(data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}),
+          "x-api-key": key, authorization: `Bearer ${key}`,
+          ...(linkId === "autoclaw" ? { "anthropic-version": "2023-06-01" } : {}),
+        },
+        timeout: 12000,
+      }, (res) => {
+        let b = ""; res.on("data", (c) => (b += c));
+        res.on("end", () => resolve({
+          status: res.statusCode,
+          gateBody: res.statusCode === 401 && (b.includes("missing or invalid api key") || b.includes("missing or invalid API key") || b.includes('"invalid api key"')),
+        }));
+      });
+      rq.on("error", (e) => resolve({ status: 0, gateBody: false, error: String(e.message) }));
+      rq.setTimeout(12000, () => { rq.destroy(); resolve({ status: -1, gateBody: false, error: "timeout" }); });
+      if (data) rq.write(data);
+      rq.end();
+    });
   }
 
   handle("keys:probe", async () => {
@@ -1841,7 +1889,49 @@ function setupIpc() {
         ? "WorkBuddy：点「生成」由控制台改写 wb2api config.json 并重启网关；手动方式同此（改 api_key 后重启 wb2api.exe）"
         : linkId === "qoder" || linkId === "qwenwork"
           ? "Qoder/千问办公：点「生成」由控制台重建出口 Key（写本地明文 → 写网关 → 重注册）"
-          : `${link.label}：点「生成」由控制台生成随机新钥，写入 ~/.autoclaw-relay/inbound-keys.json 并自动重启该链路；手动方式：${link.id.toUpperCase()}_INBOUND_KEYS=旧钥,新钥 平滑并存，重启 relay 后在 ZCode 里更新注册值`,
+          : `${link.label}：点「生成」由控制台生成随机新钥，写入 ~/.autoclaw-relay/inbound-keys.json 并自动重启该链路；手动方式：${link.id.toUpperCase()}_INBOUND_KEYS=旧钥,新钥 平滑并存，重启 relay 后在 ZCode 里更新注册值。要给只认 sk- 形的标准工具（dsh / Codex / OpenAI SDK）用，点行内「sk 钥」加一把标准钥（别名）即可——它不改 ZCode 注册值`,
+    };
+  });
+
+  /**
+   * 标准钥（别名·sk- 形）：给只认 sk- 开头钥匙的标准工具（DeepSeek Harness、
+   * Codex、OpenAI SDK 系）备的一把旁路钥匙。写档案顶层 _aliases[linkId]，
+   * 只进对应 relay 的入站闸门集合，不动 ZCode 注册值——所以加/删都不排队重注册，
+   * 但必须重启对应链路（闸门集合在启动时构造一次）。
+   * action：add（key 为空则现场生成一把 sk-<前缀>-<36 hex>，也可用自带的自定义钥）
+   * / remove（撤销，给 key）。
+   */
+  handle("keys:alias", async (_e, linkId, key, action) => {
+    const link = KEY_INVENTORY.find((l) => l.id === linkId);
+    if (!link) return { ok: false, error: `未知链路 ${linkId}（可选：${KEY_INVENTORY.map((l) => l.id).join("、")}）` };
+    if (!link.aliasable) {
+      return { ok: false, error: linkId === "workbuddy"
+        ? "WorkBuddy 不支持标准钥别名：wb2api 是单钥二进制（只有 config.json 的 api_key 一把）。要 sk- 形就用「生成」/「轮换」把主钥直接换成 sk- 形"
+        : `${link.label} 不支持标准钥别名：该链路走网关侧出口 Key，单钥；要用 sk- 形请直接用「生成」` };
+    }
+    const act = String(action || "add").trim();
+    let out;
+    if (act === "remove") {
+      const want = String(key || "").trim();
+      if (!want) return { ok: false, error: "撤销标准钥需要给出要移除的值" };
+      out = IK.removeAlias(INBOUND_KEYS_FILE, linkId, want);
+      if (!out.ok) return out;
+      if (!out.removed) return { ok: false, error: "档案里没有这把标准钥（可能已撤销，或值不一致）", aliases: out.aliases };
+    } else if (act === "add") {
+      out = IK.addAlias(INBOUND_KEYS_FILE, linkId, String(key || "").trim() || IK.generateStandardKey(linkId));
+      if (!out.ok) return out;
+    } else {
+      return { ok: false, error: `未知 action：${act}（可选 add / remove）` };
+    }
+    let restarted = false;
+    try { restarted = await restartLink(linkId); } catch (e) {
+      return { ok: false, error: `标准钥已${act === "remove" ? "撤销" : "落盘"}，但链路重启失败：${e.message}（手动重启该链路即可生效）`, aliases: out.aliases };
+    }
+    const verb = act === "remove" ? "标准钥已撤销" : "标准钥已登记";
+    return {
+      ok: true, linkId, action: act, key: out.key || String(key || "").trim(), aliases: out.aliases,
+      store: INBOUND_KEYS_FILE, restarted,
+      note: `${verb}${restarted ? "、链路已重启（即刻生效）" : "（链路未运行，下次启动即生效）"}；别名只进闸门，ZCode 注册值不变、无需重注册`,
     };
   });
 
@@ -2003,6 +2093,20 @@ app.whenReady().then(() => {
       const kgActive = (trk?.keys || [])[0]?.value === kg.key;
       prog(`keys:generate trae key=${kg.key ? kg.key.slice(0, 12) + "…" : "-"} restarted=${kg.restarted} store=${kg.store ? "ok" : "-"} active=${kgActive} ${kg.error || kg.note || ""}`);
       await t("keys:generate", kg.ok === true && /^tr-[0-9a-f]{36}$/.test(String(kg.key)) && kgActive);
+      // 标准钥（别名 sk-）：给 trae 加一把 sk- 形旁路钥（写 _aliases → 重启 trae 吃进），
+      // 用它带钥打 /v1/messages 必须越过闸门（证明别名真的进了闸门集合），
+      // 且 ZCode 注册值仍是主钥、盘点里别名排在其后；最后撤销还原现场
+      const ka = await invoke("keys:alias", "trae", "", "add");
+      const trA = ((await invoke("keys:query")).links || []).find((l) => l.id === "trae");
+      const aliasSeen = (trA?.keys || []).some((k) => k.alias === true && k.value === ka.key);
+      const aliasMainKept = (trA?.keys || [])[0]?.value === kg.key;
+      const aProbe = ka.ok ? await probeKey("trae", ka.key) : { status: 0 };
+      prog(`keys:alias add key=${ka.key ? ka.key.slice(0, 14) + "…" : "-"} restarted=${ka.restarted} listed=${aliasSeen} mainKept=${aliasMainKept} probe=${aProbe.status} ${ka.error || ka.note || ""}`);
+      await t("keys:alias", ka.ok === true && /^sk-tr-[0-9a-f]{36}$/.test(String(ka.key)) && aliasSeen && aliasMainKept
+        && aProbe.status !== 0 && aProbe.status !== -1 && aProbe.gateBody !== true);
+      const kx = await invoke("keys:alias", "trae", ka.key, "remove");
+      prog(`keys:alias remove restarted=${kx.restarted} left=${(kx.aliases || []).length} ${kx.error || kx.note || ""}`);
+      await t("keys:alias:remove", kx.ok === true && (kx.aliases || []).every((k) => k !== ka.key));
       // 入站 api_key：全部活着的链路匿名必须 401、带盘点钥匙必须越过闸门（不消耗上游额度）
       const kp = await invoke("keys:probe");
       prog(`keys:probe ${(kp.probes || []).map((p) => `${p.label}:${p.ok ? "ok" : p.detail}`).join(" | ")}`);

@@ -68,15 +68,21 @@ const AUTH_KEY = "iCubeAuthInfo://icube.cloudide";
 // 控制台「生成」的钥读 ~/.autoclaw-relay/inbound-keys.json（键 = 链路 id）：
 // 生成是加钥，内置钥永久兜底；生成后控制台会重启本链路把新钥吃进来，手动
 // 启动的实例重启一次同样生效（启动时读一次档案）。
+// 档案里本链路有两摊钥：扁平主钥（「生成」）与顶层保留键 _aliases 下的标准钥
+// （控制台「sk 钥」——给 dsh / Codex / OpenAI SDK 这类只认 sk- 的工具用）。
+// 两摊都是本链路的有效入站钥，这里一并吃进闸门集合；改任一处都要重启本链路。
 const INBOUND_AUTH = process.env.TRAE_INBOUND_AUTH !== "0";
-function consoleStoreKey() {
+function consoleStoreKeys() {
   try {
-    const v = JSON.parse(readFileSync(join(homedir(), ".autoclaw-relay", "inbound-keys.json"), "utf8"))?.trae;
-    return typeof v === "string" ? v.trim() : "";
-  } catch { return ""; }
+    const raw = JSON.parse(readFileSync(join(homedir(), ".autoclaw-relay", "inbound-keys.json"), "utf8"));
+    const main = typeof raw?.trae === "string" ? [raw.trae] : [];
+    const aliases = Array.isArray(raw?._aliases?.trae) ? raw._aliases.trae : [];
+    return main.concat(aliases).map((s) => (typeof s === "string" ? s.trim() : "")).filter(Boolean);
+  } catch { return []; }
 }
 const INBOUND_KEYS = new Set(
-  ["trae-local-key", consoleStoreKey()]
+  ["trae-local-key"]
+    .concat(consoleStoreKeys())
     .concat((process.env.TRAE_INBOUND_KEYS || "").split(","))
     .map((s) => s.trim()).filter(Boolean),
 );
