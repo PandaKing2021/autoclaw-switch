@@ -8,6 +8,7 @@ const os = require("os");
 const path = require("path");
 const ZC = require("./zcode-config.js");   // ZCode 供应商配置的读写闸门（纯 Node，回归测试见 app/test_zcode_config.js）
 const IK = require("./inbound-keys.js");   // 入站 api_key 的生成/存档（纯 Node，回归测试见 app/test_inbound_keys.js）
+const CX = require("./codex-config.js");   // Codex 配置（~/.codex/config.toml）的托管区读写闸门（纯 Node，回归测试见 app/test_codex_config.js）
 
 const HOME = os.homedir();
 const RELAY_DIR = path.join(HOME, ".autoclaw-relay");
@@ -79,6 +80,15 @@ const QWENWORK_PROVIDER_ID = "qwenwork-openai-provider";
 const QODER_REALM_KEYS = path.join(RELAY_DIR, "qoder-realm-keys.json");
 const BRIDGE_DIR = path.join(RES_ROOT, "bridge");
 const RELAY_SRC = path.join(BRIDGE_DIR, "server_2x.mjs");   // relay 源码随项目走，首次运行部署到 RELAY_DIR
+// --- Codex（Codex CLI）：只讲 chat completions 的链路走 bridge/codex_front.mjs 翻译，
+// relay 自带 /v1/responses 的链路由 Codex 直连；配置写进 ~/.codex/config.toml 的托管区 ---
+const CODEX_FRONT = path.join(BRIDGE_DIR, "codex_front.mjs");
+const CODEX_FRONT_PORT = CX.FRONT_PORT;                     // 18776（与 codex-config.js 的唯一口径一致）
+const CODEX_FRONT_LOG = path.join(RELAY_DIR, "codex-front.log");
+const CODEX_STATE = path.join(RELAY_DIR, "codex-state.json");   // 顶层键旧值快照（0600，runtime 数据不进仓库）
+let codexFrontProc = null;
+/** config.toml 的落点：尊重 CODEX_HOME（Codex 自己的口径），没有就是 ~/.codex */
+const codexCfgPath = () => path.join(process.env.CODEX_HOME || path.join(HOME, ".codex"), "config.toml");
 const PERSONA_SRC = path.join(BRIDGE_DIR, "persona.txt");    // 种子（老版本随包；新版本由提取器生成，见下）
 const PERSONA_EXTRACTOR = path.join(BRIDGE_DIR, "extract_persona.py");  // 从已装客户端提取 persona（厂商文本不入库）
 const PYTHON = "python";
@@ -833,6 +843,13 @@ function setupIpc() {
       },
       watcher: { running: watcherRunning() },
       zcode: { ...zcode, zcodeSync: lastZcodeSync },
+      // Codex 只报三件事：前门在不在、注册了哪几条链路、当前指向谁（详细体检走 codex:status）
+      codex: (() => {
+        let providers = [], current = null;
+        try { const p = CX.parseToml(fs.readFileSync(codexCfgPath(), "utf8")); providers = CX.ourTables(p); current = CX.topValue(p, "model_provider"); } catch {}
+        return { frontRunning: (() => { try { return /LISTENING/.test(execSync(`netstat -ano | findstr :${CODEX_FRONT_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString()); } catch { return false; } })(),
+          providers, current, configPath: codexCfgPath() };
+      })(),
       token,
       credential,
     };
@@ -1205,6 +1222,11 @@ function setupIpc() {
     file("千问办公登录态", path.join(process.env.APPDATA || "", "QwenWorkCN", "auth-v2.dat"), "需安装并登录千问办公客户端（QwenWorkCN）；与 Qoder 共用同一个网关，点「同步账号」一次导入两条出口");
     file("AutoClaw 凭证", REQ_HEADERS, "需安装并登录 AutoClaw 桌面客户端；同步器把登录态搬成反代凭证");
     file("ZCode 配置", ZCODE_CFG, "需先安装并运行过一次 ZCode，注册才有落点");
+    // Codex：CLI 决定能不能用（配置由我们写，缺失不算错——首次注册会创建并在同目录留备份）
+    const cxVer = codexVersion();
+    add("Codex CLI", !!cxVer, cxVer || "未找到", "想接 Codex 才需要它（npm i -g @openai/codex）；注册写的 config.toml 由它读取");
+    add("Codex 配置", true, `${String(codexCfgPath()).replace(HOME, "~")}（${fs.existsSync(codexCfgPath()) ? `已注册 ${(() => { try { return CX.ourTables(CX.parseToml(fs.readFileSync(codexCfgPath(), "utf8"))).length; } catch { return 0; } })()} 条 A-SWITCH 链路` : "尚无，首次注册自动创建"}）`,
+      "只写自己的托管区（[model_providers.aswitch-*] + 顶层指针键），别人的表与注释一个字节不动");
     file("A-SWITCH 后端", A_SWITCH_PY, "一键注册 / 余额查询 / 凭证同步加载它（a_switch.py）；随本仓库分发，打包态在 resources/autoclaw-switch/");
     return { ok: items.every((i) => i.ok), items };
   });
@@ -1224,6 +1246,7 @@ function setupIpc() {
     await run("豆包工作网关", "doubao:start");
     await run("Comate 网关", "comate:start");
     await run("Qoder 网关", "qoder:start");
+    await run("Codex 前门", "codex:front-start");   // 只绑 127.0.0.1 的翻译层，给 Codex 用（不接也没人打它）
     await run("凭证同步器", "watcher:start");
     return { ok: steps.every((s) => s.ok), steps };
   });
@@ -1591,6 +1614,279 @@ function setupIpc() {
     return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model, available: models };
   });
 
+  // ===================== Codex 接入（前门翻译 + config.toml 托管区） =====================
+  // 全景与取证见 .research/cc-switch-codex-analysis.md。要点：
+  //   - Codex 0.100+ 的 wire_api 只认 "responses"：WorkBuddy/Trae/豆包 由 codex_front 翻译，
+  //     Comate/AutoClaw/Qoder/千问办公 的 relay 自带 /v1/responses，Codex 直连（不经过前门）。
+  //   - 凭据放 provider 表的 experimental_bearer_token，不碰 ~/.codex/auth.json
+  //     （那是官方登录的地盘，动它等于把官方登录打给第三方）。
+  //   - 只动托管区：我们的 [model_providers.aswitch-*] 表 + 4 个顶层指针键；
+  //     别人的表 / 注释 / [projects.*] / 换行风格一个字节不动（闸门与备份回滚在 codex-config.js）。
+  //   - 自定义 model_catalog_json 是**整体替换**自带目录，所以生成时必须克隆自带条目。
+
+  const CODEX_ALIVE = {
+    autoclaw: relayAlive, workbuddy: wbAlive, trae: traeAlive, doubao: doubaoAlive,
+    comate: comateAlive, qoder: qoderAlive, qwenwork: qoderAlive,   // 千问办公与 Qoder 同网关
+  };
+
+  /** 前门健康（/health 带链路表；端口不通即未运行） */
+  async function codexFrontHealth() {
+    return new Promise((resolve) => {
+      const req = http.get(`http://127.0.0.1:${CODEX_FRONT_PORT}/health`, { timeout: 4000 }, (res) => {
+        let d = "";
+        res.on("data", (c) => (d += c));
+        res.on("end", () => { try { resolve({ running: true, ...JSON.parse(d) }); } catch { resolve({ running: true, ok: false }); } });
+      });
+      req.on("error", () => resolve({ running: false, ok: false }));
+      req.on("timeout", () => { req.destroy(); resolve({ running: false, ok: false }); });
+    });
+  }
+
+  // --- codex CLI 的定位与调用：Windows 上 npm 装的是 .cmd 垫片，直接 spawn 会 ENOENT，
+  //     一律借 cmd.exe 跑（参数全是我们写死的常量，没有用户输入拼进去）---
+  let codexCliCache = null;
+  function codexCli() {
+    if (codexCliCache) return codexCliCache;
+    const appdata = process.env.APPDATA || path.join(HOME, "AppData", "Roaming");
+    const cands = [process.env.CODEX_BIN, path.join(appdata, "npm", "codex.cmd"), path.join(appdata, "npm", "codex")].filter(Boolean);
+    for (const c of cands) if (fs.existsSync(c)) { codexCliCache = c; return c; }
+    try {
+      const w = execSync("where codex", { shell: "cmd.exe", timeout: 8000 }).toString().trim().split(/\r?\n/)[0];
+      if (w && fs.existsSync(w)) { codexCliCache = w; return w; }
+    } catch {}
+    codexCliCache = "codex";   // 交给调用方报 ENOENT（"未找到 Codex CLI"）
+    return codexCliCache;
+  }
+  function codexRun(args, timeoutMs = 30000) {
+    const r = spawnSync(`"${codexCli()}" ${args.join(" ")}`, {
+      encoding: "utf8", shell: true, windowsHide: true, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024,
+    });
+    return { ok: r.status === 0 && !r.error, out: r.stdout || "", err: `${r.stderr || ""}${r.error ? r.error.message : ""}`.trim(), status: r.status };
+  }
+  const codexVersion = () => { const r = codexRun(["--version"], 15000); return r.ok ? r.out.trim() : ""; };
+
+  /** 自带模型目录（离线，不需要登录）。自定义目录整体替换自带目录 → 必须克隆它们 */
+  let codexBundledCache = null;
+  function codexBundled(refresh = false) {
+    if (codexBundledCache && !refresh) return codexBundledCache;
+    const r = codexRun(["debug", "models", "--bundled"], 60000);
+    const out = { ok: false, models: [], error: "" };
+    try {
+      out.models = JSON.parse(r.out).models || [];
+      out.ok = out.models.length > 0;
+    } catch (e) { out.error = r.err || `输出不是 JSON（退出码 ${r.status}）`; }
+    codexBundledCache = out;
+    return out;
+  }
+
+  /** 统一命名目录（models-catalog.json）里各平台的模型声明：窗口 / 视觉 */
+  function unifiedModels(linkId) {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(RES_ROOT, "models-catalog.json"), "utf8"));
+      return j.platforms?.[linkId]?.models || [];
+    } catch { return []; }
+  }
+
+  /**
+   * 一条链路的 Codex 目录条目：**只读**各网关的模型目录（带钥），窗口/视觉尽量取统一命名的声明。
+   * 与 ZCode 注册流程（platformCatalogs）的区别：这里绝不触发 a_switch.py 的写配置副作用。
+   */
+  async function codexModelList(linkId) {
+    const meta = new Map(unifiedModels(linkId).map((m) => [m.id, m]));
+    let ids = [];
+    try {
+      if (linkId === "autoclaw") ids = (await healthOnce(4000)).aliases || [];
+      else if (linkId === "workbuddy") ids = ((await wbHttp("GET", "/v1/models", null, 15000)).j?.data || []).map((m) => m.id || m);
+      else if (linkId === "trae") ids = (await traeModels()).map((m) => m.id);
+      else if (linkId === "doubao") ids = (await doubaoModels()).map((m) => m.id);
+      else if (linkId === "comate") ids = (await comateModels()).map((m) => m.id);
+      else if (linkId === "qoder") ids = (await qoderModels(15000)).map((m) => m.id);
+      else if (linkId === "qwenwork") ids = (await qwenworkModels(15000)).map((m) => m.id);
+    } catch {}
+    return [...new Set(ids.filter((x) => typeof x === "string" && x.trim()))].map((id) => {
+      const m = meta.get(id) || {};
+      return { slug: id, displayName: m.display || id, contextWindow: m.contextWindow || 200000, vision: !!m.vision };
+    });
+  }
+
+  /** 前门进程（只绑 127.0.0.1；链路表 = CODEX_LINKS 里 via="front" 的三条） */
+  handle("codex:front-start", async () => {
+    // 前门要认的三条链路（缺一条就说明跑着的是老进程/手工起的：注册那条链路会 404，
+    // 报告出来让用户「前门停止 → 前门启动」重启，不动别人的进程）
+    const needLinks = CX.CODEX_LINKS.filter((x) => x.via === "front").map((x) => x.frontPath);
+    const missing = (links) => needLinks.filter((k) => !links || !(k in links));
+    const h = await codexFrontHealth();
+    if (h.running) return { ok: true, already: true, links: h.links || {}, missing: missing(h.links) };
+    if (!fs.existsSync(CODEX_FRONT)) return { ok: false, error: `未找到 bridge/codex_front.mjs（${CODEX_FRONT}）` };
+    const nd = findNode();
+    const args = [CODEX_FRONT, "--port", String(CODEX_FRONT_PORT)];
+    for (const l of CX.CODEX_LINKS.filter((x) => x.via === "front")) args.push("--upstream", `${l.frontPath}=http://127.0.0.1:${l.port}`);
+    const st = trySpawn(nd.cmd, args, {
+      cwd: BRIDGE_DIR, env: { ...process.env, ...nd.env }, windowsHide: true, detached: true,
+      stdio: ["ignore", fs.openSync(CODEX_FRONT_LOG, "a"), fs.openSync(CODEX_FRONT_LOG, "a")],
+    });
+    if (!st.proc) return { ok: false, error: `${st.error || "无法启动 Node 运行时"}（${nd.source}）` };
+    codexFrontProc = st.proc;
+    codexFrontProc.unref();
+    codexFrontProc.on("exit", (code) => { log("codex front exited", code); codexFrontProc = null; });
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const hh = await codexFrontHealth();
+      if (hh.running) return { ok: true, links: hh.links || {}, missing: missing(hh.links) };
+    }
+    return { ok: false, error: st.error || "10 秒内未就绪，查看 ~/.autoclaw-relay/codex-front.log" };
+  });
+
+  handle("codex:front-stop", async () => {
+    try {
+      const out = execSync(`netstat -ano | findstr :${CODEX_FRONT_PORT} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+      const pid = out.trim().split(/\s+/).pop();
+      if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
+      if (codexFrontProc) { try { codexFrontProc.kill(); } catch {} codexFrontProc = null; }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  /** 只读体检 + 逐链路现状（面板一屏：配置、目录、前门、cli、七条链路各自能不能用） */
+  handle("codex:status", async () => {
+    const cfg = codexCfgPath();
+    const bundled = codexBundled();
+    const bundledSlugs = bundled.models.map((m) => m.slug);
+    const report = CX.checkCodexConfig(cfg, { bundledSlugs });
+    const front = await codexFrontHealth();
+    const version = codexVersion();
+    const links = CX.CODEX_LINKS.map((l) => ({
+      id: l.id, label: l.label, tier: l.tier, via: l.via, port: l.port, model: l.model,
+      baseUrl: CX.linkBaseUrl(l), providerId: CX.codexProviderId(l.id),
+      registered: (report.providers || []).some((t) => t.providerId === CX.codexProviderId(l.id)),
+      current: report.current?.model_provider === CX.codexProviderId(l.id),
+      upstreamAlive: CODEX_ALIVE[l.id](),
+      note: l.tier === "chat" ? "上游没有工具通道：Codex 里当纯文本档用" : "工具循环可用（Codex 会在本机执行命令）",
+    }));
+    return {
+      ok: report.ok === true, configPath: cfg, exists: report.exists !== false,
+      eol: report.eol, bom: report.bom, current: report.current || {}, catalog: report.catalog || null,
+      providers: report.providers || [], foreignTables: report.foreignTables || [], foreignTopKeys: report.foreignTopKeys || [],
+      problems: report.problems || [], warnings: report.warnings || [],
+      front: { running: front.running, port: CODEX_FRONT_PORT, links: front.links || {},
+        responsesCalls: front.responsesCalls || 0, upstreamErrors: front.upstreamErrors || 0, lastError: front.lastError || null },
+      cli: { path: codexCli(), version, ok: !!version },
+      bundled: { count: bundled.models.length, error: bundled.error || "" },
+      links,
+    };
+  });
+
+  /** 注册 / 设为当前：写托管表 + 顶层指针 + 目录（闸门失败即抛，绝不落半截配置） */
+  handle("codex:register", async (_e, linkId, opts = {}) => {
+    const link = CX.linkOf(linkId);
+    if (!link) return { ok: false, error: `未知链路 ${linkId}（可选：${CX.CODEX_LINKS.map((l) => l.id).join("、")}）` };
+    let frontLinks = null, frontMissing = [];
+    if (link.via === "front") {
+      const st = await handlers["codex:front-start"]({});
+      if (!st.ok) return { ok: false, error: `Codex 前门没起来：${st.error}` };
+      frontLinks = st.links || null;
+      frontMissing = st.missing || [];
+    }
+    const models = await codexModelList(linkId);
+    const bundled = codexBundled();
+    // 上游目录里的 id 可能是带前缀的全名（wb2api 报 cn:glm-5.3）——写全名才进得了目录、
+    // 才拿得到元数据；写别名会让 Codex 回退默认元数据（0.160.1 实测会打 warning）
+    const wantModel = opts.model || link.model;
+    const model = CX.pickModel(wantModel, models.map((m) => m.slug));
+    let r;
+    try {
+      r = CX.activate(codexCfgPath(), {
+        linkId, model, token: linkApiKey(linkId), statePath: CODEX_STATE,
+        writeCatalog: opts.writeCatalog !== false, catalogModels: models,
+        bundled: bundled.models.length ? bundled.models : null,
+        contextWindow: opts.contextWindow, autoCompactLimit: opts.autoCompactLimit,
+      });
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+    const report = CX.checkCodexConfig(codexCfgPath(), { bundledSlugs: bundled.models.map((m) => m.slug) });
+    const alive = CODEX_ALIVE[linkId]();
+    const warnings = [...report.warnings];
+    if (!bundled.models.length) warnings.push(`自带模型目录取不到（${bundled.error || "codex debug models 无输出"}）：目录只含本次取到的模型，官方模型可能从选择器里消失`);
+    if (!models.length) warnings.push(`上游模型目录取不到（${link.label} 网关没起、或钥匙不一致）：这次目录只含 Codex 自带条目，Codex 里选不到这条链路的模型 —— 修好上游再注册一次`);
+    else if (!models.some((m) => m.slug === model)) warnings.push(`上游目录里没有模型 ${model}：Codex 会回退默认元数据（窗口/推理档位不准），用「目录预览」挑一个真实 id 再注册`);
+    if (!alive) warnings.push(`上游网关（:${link.port}）现在没在跑：配置已写好，但 Codex 里发请求会 502，先把它启动起来`);
+    if (frontMissing.length) warnings.push(`前门在跑但不认得 ${frontMissing.map((k) => "/" + k).join("、")}（老进程或手工起的）：这条链路会 404，点「前门停止」再「前门启动」重启它`);
+    if (link.tier === "chat") warnings.push("聊天档：上游没有工具通道，Codex 里只能当纯文本助手用（工具调用会失败）");
+    return { ok: true, linkId, providerId: r.providerId, baseUrl: r.baseUrl, model: r.model, tier: link.tier,
+      modelPicked: r.model !== wantModel ? { want: wantModel, used: r.model } : null,
+      backup: r.backup, catalog: r.catalog, activeLinks: r.activeLinks, upstreamAlive: alive,
+      front: frontLinks, warnings, report };
+  });
+
+  /** 摘除：只删我们的表；若它是当前供应商就把顶层键还原成注册前的样子 */
+  handle("codex:deregister", async (_e, linkId) => {
+    if (!CX.linkOf(linkId)) return { ok: false, error: `未知链路 ${linkId}` };
+    try {
+      const r = CX.deregister(codexCfgPath(), { linkId, statePath: CODEX_STATE });
+      return { ...r, report: CX.checkCodexConfig(codexCfgPath()) };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+  });
+
+  /** 目录预览：这次会给 Codex 看到哪些模型（自带克隆 + 我方），不写盘 */
+  handle("codex:catalog", async (_e, linkId) => {
+    const link = CX.linkOf(linkId);
+    if (!link) return { ok: false, error: `未知链路 ${linkId}` };
+    const bundled = codexBundled();
+    const models = await codexModelList(linkId);
+    const picked = CX.pickModel(link.model, models.map((m) => m.slug));
+    const cat = CX.buildCatalog({ bundled: bundled.models, models, ensureModel: picked });
+    return { ok: true, linkId, liveModels: models.map((m) => m.slug), liveEmpty: models.length === 0,
+      wantModel: link.model, pickedModel: picked, ensured: cat.ensured,
+      bundled: cat.bundled, ours: cat.ours,
+      skipped: cat.skipped, count: cat.count, builtSlugs: cat.slugs,
+      bundledOk: bundled.models.length > 0, error: bundled.error || "" };
+  });
+
+  /** 冒烟：按 Codex 的形状打一发 /v1/responses（走前门的链路经翻译；直连链路直连 relay） */
+  handle("codex:smoke", async (_e, linkId = "workbuddy") => {
+    const link = CX.linkOf(linkId) || CX.linkOf("workbuddy");
+    let origin, path0;
+    if (link.via === "front") {
+      const st = await handlers["codex:front-start"]({});
+      if (!st.ok) return { ok: false, error: `Codex 前门没起来：${st.error}` };
+      origin = { host: "127.0.0.1", port: CODEX_FRONT_PORT };
+      path0 = `/${link.frontPath}/v1/responses`;
+    } else {
+      origin = { host: "127.0.0.1", port: link.port };
+      path0 = "/v1/responses";
+    }
+    const model = link.model;
+    // 512 而不是 64：思考型模型（glm-5.3 / qwen3.8-max 等）会先花掉一截 reasoning tokens，
+    // 上限太小时正文一个字都不剩（实测 64 → 只有 reasoning 项、status=incomplete）。
+    const body = JSON.stringify({ model, input: "请只回复OK", max_output_tokens: 512, stream: false });
+    const r = await new Promise((resolve) => {
+      const req = http.request({ ...origin, path: path0, method: "POST", timeout: 240000,
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${linkApiKey(link.id)}`, "Content-Length": Buffer.byteLength(body) } },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => (d += c));
+        res.on("end", () => {
+          let out = "", reply = "";
+          try {
+            const j = JSON.parse(d);
+            out = j.output || [];
+            reply = out.flatMap((o) => o.content || []).map((c) => c.text || "").join("").trim();
+            if (!reply && j.error) reply = typeof j.error === "string" ? j.error : (j.error.message || "");
+          } catch { reply = d.slice(0, 200); }
+          resolve({ status: res.statusCode, items: out.map((o) => o.type), reply });
+        });
+      });
+      req.on("error", (e) => resolve({ status: 0, items: [], reply: e.message }));
+      req.on("timeout", () => { req.destroy(); resolve({ status: 0, items: [], reply: "超时（240s）" }); });
+      req.write(body); req.end();
+    });
+    // 判定：200 且「有正文或至少有一个 reasoning 项」——有些思考型模型在 512 上限里
+    // 只来得及吐思考，那不是链路坏了（items 里能看到 reasoning）
+    const reasoning = r.items.some((t) => t === "reasoning");
+    return { ok: r.status === 200 && (r.reply.length > 0 || reasoning), link: link.id, model, path: path0,
+      status: r.status, items: r.items, reasoningOnly: reasoning && !r.reply,
+      reply: r.reply.slice(0, 200) || (reasoning ? "（本次只有思考内容，正文被 max_output_tokens 截断）" : "") };
+  });
+
   // --- 入站 api_key（七条链路统一闸门的钥匙盘点 / 鉴权体检 / 生成）---
   // 盘点：每条链路 ZCode 注册用的钥匙值 + 来源。所有钥匙本就是明文落在本机
   // （ZCode 的 provider_config.json、~/.autoclaw-relay/ 下的两个档案），
@@ -1943,6 +2239,7 @@ function setupIpc() {
     if (which === "doubao") return tailFile(DOUBAO_LOG, 150);
     if (which === "comate") return tailFile(COMATE_LOG, 150);
     if (which === "qoder") return tailFile(QODER_LOG, 150);
+    if (which === "codex") return tailFile(CODEX_FRONT_LOG, 150);
     return tailFile(RELAY_LOG, 200);
   });
 }
@@ -2066,6 +2363,40 @@ app.whenReady().then(() => {
       const qws = await invoke("qwenwork:smoke");
       prog(`qwenwork:smoke detail status=${qws.status} model=${qws.model} reply=${String(qws.reply).slice(0, 80)}`);
       await t("qwenwork:smoke", qws.ok === true);
+      // ---- Codex 接入：在**临时 CODEX_HOME** 上跑（把用户真实 config.toml 复制过去当 fixture），
+      // 覆盖 只读体检 → 起前门 → 目录预览 → 注册（写托管区+目录）→ 复检 → 冒烟 → 摘除后逐字节还原。
+      // 不用真实 ~/.codex：自测中途中断时，用户自己的 Codex 配置不该被留在半途。
+      const cxHome = fs.mkdtempSync(path.join(os.tmpdir(), "aswitch-codex-selftest-"));
+      const cxRealCfg = codexCfgPath();
+      let cxCopied = false;
+      try { if (fs.existsSync(cxRealCfg)) { fs.copyFileSync(cxRealCfg, path.join(cxHome, "config.toml")); cxCopied = true; } } catch {}
+      process.env.CODEX_HOME = cxHome;
+      const cxNorm = () => { try { const s = fs.readFileSync(codexCfgPath(), "utf8"); return s.trim() ? s : null; } catch { return null; } };
+      const cxBefore = cxNorm();
+      prog(`codex selftest home=${cxHome}（用户真实配置${cxCopied ? "已复制当 fixture" : "不存在"}，全程不碰原文件）`);
+      const cx0 = await invoke("codex:status");
+      prog(`codex:status cli=${cx0.cli?.version || "未找到"} 自带目录=${cx0.bundled?.count} 前门=${cx0.front?.running} 已注册=${(cx0.providers || []).map((p) => p.providerId).join(",") || "无"}`);
+      await t("codex:status", cx0.cli?.ok === true && cx0.bundled?.count > 0 && Array.isArray(cx0.links) && cx0.links.length === 7);
+      const cxf = await invoke("codex:front-start");
+      prog(`codex:front-start ${cxf.already ? "已在运行" : "已启动"} links=${Object.keys(cxf.links || {}).join(",")} 缺=${JSON.stringify(cxf.missing || [])}`);
+      await t("codex:front-start", cxf.ok === true && !!(cxf.links || {}).wb);
+      const cxc = await invoke("codex:catalog", "workbuddy");
+      prog(`codex:catalog 自带=${cxc.bundled} 我方=${cxc.ours} 共=${cxc.count} 网关实时目录=${JSON.stringify(cxc.liveModels).slice(0, 160)} skipped=${JSON.stringify(cxc.skipped)}`);
+      await t("codex:catalog", cxc.ok === true && cxc.count > cxc.bundled);
+      const cxr = await invoke("codex:register", "workbuddy");
+      prog(`codex:register provider=${cxr.providerId} model=${cxr.model} 目录=${cxr.catalog?.count} 上游=${cxr.upstreamAlive} 警告=${(cxr.warnings || []).join(" | ") || "无"}`);
+      await t("codex:register", cxr.ok === true && cxr.providerId === "aswitch-workbuddy" && cxr.catalog?.count > 0);
+      const cx1 = await invoke("codex:status");
+      prog(`codex:status(注册后) current=${cx1.current?.model_provider} 目录条目=${cx1.catalog?.entries} ok=${cx1.ok} 问题=${JSON.stringify(cx1.problems)}`);
+      await t("codex:status(注册后)", cx1.current?.model_provider === "aswitch-workbuddy" && cx1.ok === true && cx1.catalog?.entries > 0);
+      const cxs = await invoke("codex:smoke", "workbuddy");
+      prog(`codex:smoke link=${cxs.link} status=${cxs.status} 输出项=${JSON.stringify(cxs.items)} reply=${String(cxs.reply).slice(0, 60)}`);
+      await t("codex:smoke", cxs.ok === true);
+      const cxd = await invoke("codex:deregister", "workbuddy");
+      prog(`codex:deregister changed=${cxd.changed} restored=${cxd.restored} 目录已清=${cxd.catalogRemoved} 文件逐字节还原=${cxBefore === cxNorm()}`);
+      await t("codex:deregister", cxd.ok === true && cxd.changed === true && cxd.restored === true && cxBefore === cxNorm());
+      delete process.env.CODEX_HOME;   // 临时 home 用完就还回去，后面的 env:check 报真实路径
+      try { fs.rmSync(cxHome, { recursive: true, force: true }); } catch {}
       // 一键启动（此时各家都已在跑，应全部报“已在运行”）
       const all = await invoke("all:start");
       prog(`all:start ${(all.steps || []).map((s) => `${s.name}:${s.ok ? s.detail : s.detail}`).join(" | ")}`);
@@ -2114,7 +2445,8 @@ app.whenReady().then(() => {
       const l1 = await invoke("logs:tail", "relay");
       const l2 = await invoke("logs:tail", "watch");
       const l3 = await invoke("logs:tail", "trae");
-      await t("logs:tail", l1.length > 50 && l2.length > 0 && l3.length > 0);
+      const l4 = await invoke("logs:tail", "codex");
+      await t("logs:tail", l1.length > 50 && l2.length > 0 && l3.length > 0 && l4.length > 0);
       prog("relay:stop 发起");
       await invoke("relay:stop");
       await new Promise((r) => setTimeout(r, 2500));

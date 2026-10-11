@@ -217,6 +217,34 @@
       </div>
     </section>
 
+    <section class="grid">
+      <!-- Codex CLI（0.100+ 只认 /v1/responses：前门翻译 + config.toml 托管区读写） -->
+      <div class="card">
+        <div class="card-head"><h2>Codex CLI 接入</h2><span id="codex-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>Codex CLI</label><span id="codex-cli">-</span></div>
+          <div><label>配置文件</label><span class="mono" id="codex-config">-</span></div>
+          <div><label>当前指向</label><span id="codex-current">-</span></div>
+          <div><label>已注册链路</label><span id="codex-registered">-</span></div>
+          <div><label>前门（:18776）</label><span id="codex-front">-</span></div>
+          <div><label>Codex 自带目录</label><span id="codex-bundled">-</span></div>
+        </div>
+        <div class="sec">链路一览（注册 = 写托管表；当前 = Codex 正在用它；「聊天档」上游没有工具通道，只能当纯文本助手）</div>
+        <div id="codex-links" class="keyslist">点右下「体检」加载</div>
+        <div class="btns">
+          <select id="codex-link" class="btn" title="要操作的链路"></select>
+          <button id="btn-codex-register" class="btn ok">注册 / 设为当前</button>
+          <button id="btn-codex-deregister" class="btn danger">摘除</button>
+          <button id="btn-codex-catalog" class="btn">目录预览</button>
+          <button id="btn-codex-smoke" class="btn">冒烟</button>
+          <button id="btn-codex-front-start" class="btn">前门启动</button>
+          <button id="btn-codex-front-stop" class="btn">前门停止</button>
+          <button id="btn-codex-refresh" class="btn">体检</button>
+        </div>
+        <div id="codex-note" class="note"></div>
+      </div>
+    </section>
+
     </section>
 
     <section class="card logcard">
@@ -230,6 +258,7 @@
           <button class="tab" data-log="doubao">豆包工作</button>
           <button class="tab" data-log="comate">Comate</button>
           <button class="tab" data-log="qoder">Qoder</button>
+          <button class="tab" data-log="codex">Codex</button>
           <button class="tab" data-log="console">控制台</button>
           <label class="auto"><input type="checkbox" id="autorefresh" checked /> 自动刷新</label>
         </div>

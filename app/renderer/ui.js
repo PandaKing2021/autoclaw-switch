@@ -140,6 +140,15 @@ async function refreshStatus() {
     $("zcode-qoder-count").textContent = zc.qoderModels != null ? zc.qoderModels : "-";
     $("zcode-qwenwork-count").textContent = zc.qwenworkModels != null ? zc.qwenworkModels : "-";
 
+    // codex（这条只报廉价事实：前门在不在 / 注册了哪几条 / 当前指向谁；
+    // 七条链路明细 + 目录 + CLI 版本要跑 codex debug models，按需拉 → 「体检」按钮）
+    const cx = s.codex || {};
+    const cxRegs = (cx.providers || []).length;
+    const cxCur = (cx.providers || []).find((p) => p.providerId === cx.current);
+    setPill("codex-pill", cx.current ? "ok" : cxRegs ? "warn" : "unknown",
+      cx.current ? `当前：${String(cxCur?.name || cx.current).replace("A-SWITCH ", "")}`
+        : cxRegs ? `已注册 ${cxRegs} 条·未指向` : cx.frontRunning ? "前门在跑·未接入" : "未接入");
+
 
     // overall
     updateBootNote({ relay: !!s.relay.running, workbuddy: !!s.workbuddy.running, trae: !!tr.running, doubao: !!db.running, comate: !!cm.running, qoder: !!qd.running, watcher: !!s.watcher.running });
@@ -354,6 +363,155 @@ $("btn-zcheck").onclick = async () => {
   btn.disabled = false;
 };
 
+// --- Codex CLI 卡片：注册 = 写 ~/.codex/config.toml 的托管区（A-SWITCH 表 + 顶层指针 + 目录），
+// 摘除 = 只删托管区并把顶层键还原成注册前的值。链路明细要跑 codex debug models / netstat 七次，
+// 所以不做轮询，只在「体检」和每次动作后拉一遍（前门在不在这类廉价事实由 3 秒轮询的 status:query 报）。
+let codexLinkList = [];
+const codexSel = () => $("codex-link").value || (codexLinkList[0] && codexLinkList[0].id) || "workbuddy";
+const codexLabelOf = (id) => (codexLinkList.find((l) => l.id === id) || {}).label || id;
+
+async function refreshCodexDetail() {
+  let r = null;
+  try { r = await window.api.codexStatus(); } catch (e) { $("codex-note").textContent = "❌ 体检异常：" + e.message; return null; }
+  if (!r || r.error) { $("codex-note").textContent = "❌ 体检失败：" + ((r && r.error) || "无返回"); return null; }
+  codexLinkList = r.links || [];
+  const sel = $("codex-link");
+  const keep = sel.value;
+  sel.innerHTML = codexLinkList.map((l) => `<option value="${l.id}">${l.label}（${l.tier === "chat" ? "聊天档" : "工具档"}）</option>`).join("");
+  if (keep) sel.value = keep;
+  const mark = (cls, text, tip) => `<span class="kzcode ${cls}" title="${String(tip).replace(/"/g, "&quot;")}">${text}</span>`;
+  $("codex-links").innerHTML = codexLinkList.map((l) => `<div class="keyrow"><span class="klabel">${l.label}</span>`
+    + `<span class="cxinfo" title="托管表 ${l.providerId}｜base_url ${l.baseUrl}｜默认模型 ${l.model}">:${l.port} · ${l.model}${l.via === "front" ? " · 经前门" : " · 直连"}</span>`
+    + mark(l.tier === "chat" ? "stale" : "match", l.tier === "chat" ? "聊天档" : "工具档", l.note)
+    + mark(l.upstreamAlive ? "match" : "mismatch", l.upstreamAlive ? "上游在" : "上游停",
+      l.upstreamAlive ? `上游网关 :${l.port} 在跑` : `上游网关 :${l.port} 没跑：现在注册的话，Codex 里发请求会 502，先启动它`)
+    + mark(l.registered ? "match" : "none", l.registered ? "已注册" : "未注册",
+      l.registered ? "config.toml 里有这条链路的托管表" : "config.toml 里还没有它")
+    + (l.current ? mark("match", "◆ 当前", "Codex 现在指向它（顶层 model_provider）") : "") + `</div>`).join("");
+  $("codex-cli").textContent = r.cli.version || "未找到";
+  $("codex-cli").title = r.cli.path || "";
+  $("codex-config").textContent = (r.configPath || "-").replace(/^.*[\\/]\.codex/, "~/.codex");
+  $("codex-config").title = r.configPath || "";
+  $("codex-current").textContent = r.current && r.current.model_provider
+    ? `${r.current.model_provider} · ${r.current.model || "?"}` : "（未设置，Codex 用自带默认）";
+  $("codex-registered").textContent = (r.providers || []).length
+    ? r.providers.map((p) => String(p.providerId || "").replace("aswitch-", "")).join("、") : "（无）";
+  $("codex-front").textContent = r.front.running
+    ? `运行中 · ${r.front.responsesCalls} 次 /v1/responses${r.front.upstreamErrors ? ` · 上游错 ${r.front.upstreamErrors}` : ""}`
+    : "未运行（聊天档链路才需要它）";
+  $("codex-bundled").textContent = r.bundled.count ? `${r.bundled.count} 个官方条目` : `取不到：${r.bundled.error || "codex debug models 无输出"}`;
+  // 体检的问题/告警就写进备注区（红/黄各一行，长时间挂着，提醒用户去处理）
+  const lines = [];
+  if (!r.cli.ok) lines.push("⚠️ 没找到 Codex CLI：注册写的配置它才读得到（npm i -g @openai/codex）");
+  if (!r.exists) lines.push("ℹ️ config.toml 还不存在：首次「注册」会自动创建");
+  for (const p of r.problems || []) lines.push("❌ " + p);
+  for (const w of r.warnings || []) lines.push("⚠️ " + w);
+  $("codex-note").textContent = lines.join("\n");
+  return r;
+}
+
+// 动作按钮的公共外壳：禁用按钮 → 干活 → 打印结果 → 拉一遍明细 → 刷新廉价状态
+async function codexAct(btnId, busy, fn) {
+  const btn = $(btnId); btn.disabled = true;
+  $("codex-note").textContent = busy;
+  try { $("codex-note").textContent = await fn(); }
+  catch (e) { $("codex-note").textContent = "❌ 异常：" + e.message; }
+  btn.disabled = false;
+  await refreshCodexDetail();
+  refreshStatus();
+}
+
+$("btn-codex-refresh").onclick = async () => {
+  const btn = $("btn-codex-refresh"); btn.disabled = true;
+  $("codex-note").textContent = "体检中（读 config.toml + 问 codex debug models + 探七条上游）…";
+  const r = await refreshCodexDetail();
+  if (r && !r.problems.length && !r.warnings.length) {
+    $("codex-note").textContent = `✅ 配置干净：${r.providers.length} 条托管链路｜当前 ${
+      r.current && r.current.model_provider ? r.current.model_provider : "（未指向我们）"}｜前门 ${r.front.running ? "在跑" : "停"}`;
+  }
+  btn.disabled = false;
+};
+
+$("btn-codex-register").onclick = () => {
+  const linkId = codexSel(), label = codexLabelOf(linkId);
+  const link = codexLinkList.find((l) => l.id === linkId) || {};
+  if (!window.confirm(`把 Codex 指向「${label}」？\n\n`
+    + `· 只动 config.toml 的托管区（一条 A-SWITCH provider 表 + 顶层 model_provider/model 指针），其它内容一个字节不动，改动前自动备份\n`
+    + `· 同时写模型目录 aswitch-model-catalog.json：Codex 自带目录会被克隆保留，官方模型不丢\n`
+    + `· 凭据放在 provider 表的 experimental_bearer_token，不碰 ~/.codex/auth.json\n`
+    + (link.tier === "chat" ? `· ⚠️ 这条是聊天档：上游没有工具通道，Codex 里只能当纯文本助手用\n` : `· 工具循环可用：Codex 会在本机执行命令（sandbox 按 Codex 自己的配置）\n`)
+    + (link.upstreamAlive ? "" : `· ⚠️ 上游网关 :${link.port} 现在没跑，先启动它\n`)
+    + `\n注册后要新开 Codex 进程才刷 /model 菜单（0.160.1 实测不热加载）。`)) return;
+  codexAct("btn-codex-register", `注册中：写 config.toml + 生成目录（拉 ${label} 模型目录）…`, async () => {
+    const r = await window.api.codexRegister(linkId);
+    if (!r.ok) return "❌ " + (r.error || "失败");
+    let s = `✅ 已把 Codex 指向 ${codexLabelOf(r.linkId)}（${r.providerId}）\n`
+      + `模型 ${r.model}｜base_url ${r.baseUrl}`
+      + (r.modelPicked ? `\nℹ️ 上游目录里没有「${r.modelPicked.want}」，顶层模型改用它的全名「${r.modelPicked.used}」（写全名才拿得到目录元数据）` : "")
+      + "\n"
+      + `目录：${r.catalog ? `${r.catalog.count} 条 = 自带 ${r.catalog.bundled} + 本条链路 ${r.catalog.ours}`
+        + (r.catalog.skipped.length ? `（重名跳过 ${r.catalog.skipped.join("、")}）` : "") : "未写"}`
+      + `\n托管链路：${(r.activeLinks || []).length ? r.activeLinks.join("、") : "-"}${r.backup ? `｜备份 ${r.backup}` : ""}`;
+    for (const w of r.warnings || []) s += "\n⚠️ " + w;
+    for (const p of (r.report && r.report.problems) || []) s += "\n❌ " + p;
+    return s + "\n新开一个 Codex 进程生效。";
+  });
+};
+
+$("btn-codex-deregister").onclick = () => {
+  const linkId = codexSel(), label = codexLabelOf(linkId);
+  if (!window.confirm(`摘除「${label}」在 Codex 里的托管区？\n\n`
+    + `· 只删这条链路的 A-SWITCH provider 表\n`
+    + `· 如果它正好是当前供应商，顶层 model_provider/model 会还原成注册前的旧值（用户原本没有就删干净，绝不替你留半截配置）\n`
+    + `· 我们的托管表全摘完时，顺便清掉 aswitch-model-catalog.json`)) return;
+  codexAct("btn-codex-deregister", `摘除中：改 config.toml（${label}）…`, async () => {
+    const r = await window.api.codexDeregister(linkId);
+    if (!r.ok) return "❌ " + (r.error || "失败");
+    if (!r.changed) return `ℹ️ config.toml 里没有「${label}」的痕迹（${r.reason || "无事可做"}）`;
+    return `✅ 已摘除 ${label}`
+      + (r.restored ? "｜顶层指针已还原成注册前的样子" : "｜它本来就不是当前供应商")
+      + (r.catalogRemoved ? "｜我们的模型目录已清掉" : "") + `｜还剩 ${r.remaining} 条托管链路`
+      + (r.backup ? `｜备份 ${r.backup}` : "");
+  });
+};
+
+$("btn-codex-catalog").onclick = () => {
+  const linkId = codexSel(), label = codexLabelOf(linkId);
+  codexAct("btn-codex-catalog", `预览中：读 ${label} 的模型目录…`, async () => {
+    const r = await window.api.codexCatalog(linkId);
+    if (!r.ok) return "❌ " + (r.error || "失败");
+    return `目录预览（${label}）：共 ${r.count} 条 = Codex 自带 ${r.bundled} + 我方 ${r.ours}`
+      + (r.skipped.length ? `；重名跳过 ${r.skipped.join("、")}` : "") + "\n"
+      + `本条链路给 Codex 的模型（${r.liveModels.length}）：${r.liveModels.join("、") || "-"}`
+      + `\n顶层模型预览：${r.pickedModel}${r.pickedModel !== r.wantModel ? `（表里默认 ${r.wantModel}，取了对得上的全名）` : ""}`
+      + (r.ensured.length ? `（目录里没有它，真注册时会补一条合成条目）` : "")
+      + (r.liveEmpty ? `\n⚠️ 上游模型目录是空的：网关没起、或控制台手里那把钥匙和网关的不一致（注册时目录只剩 Codex 自带条目）` : "")
+      + (r.bundledOk ? "" : `\n⚠️ Codex 自带目录取不到（${r.error}）：真注册时只写我方条目，官方模型会从选择器里消失`);
+  });
+};
+
+$("btn-codex-smoke").onclick = () => {
+  const linkId = codexSel(), label = codexLabelOf(linkId);
+  codexAct("btn-codex-smoke", `冒烟中：按 Codex 的形状打一发 /v1/responses（${label}，最长 240 秒）…`, async () => {
+    const r = await window.api.codexSmoke(linkId);
+    return (r.ok ? "✅ 冒烟通过" : "❌ 冒烟失败")
+      + `｜${codexLabelOf(r.link)} → ${r.path}（HTTP ${r.status}）\n回复：${r.reply || "（空）"}\n输出项：${(r.items || []).join("、") || "-"}`;
+  });
+};
+
+$("btn-codex-front-start").onclick = () => codexAct("btn-codex-front-start", "启动前门（:18776，带 wb/trae/doubao 三条上游）…", async () => {
+  const r = await window.api.codexFrontStart();
+  if (!r.ok) return "❌ " + (r.error || "失败");
+  return (r.already ? "ℹ️ 前门本来就在跑" : "✅ 前门已启动")
+    + `｜:18776 · 上游 ${Object.keys(r.links || {}).join("、") || "-"}`
+    + ((r.missing || []).length ? `\n⚠️ 前门不认得 ${r.missing.map((k) => "/" + k).join("、")}（老进程或手工起的）：这条链路会 404，点「前门停止」再「前门启动」重启它` : "");
+});
+
+$("btn-codex-front-stop").onclick = () => codexAct("btn-codex-front-stop", "停前门…", async () => {
+  const r = await window.api.codexFrontStop();
+  return r.ok ? "✅ 前门已停（聊天档链路会跟着不可用，工具档不受影响）" : "❌ " + (r.error || "失败");
+});
+
 // --- 入站 api_key 卡片：钥匙盘点渲染 + 点击复制 + 生成 + 鉴权体检 ---
 async function refreshKeys() {
   try {
@@ -539,4 +697,5 @@ setInterval(() => { if ($("autorefresh").checked) refreshLog(); }, 3000);
 refreshStatus();
 refreshPoints();
 refreshKeys();
+refreshCodexDetail();   // Codex 卡片的链路明细只在开机与动作后拉（要跑 codex debug models，不进 3 秒轮询）
 refreshLog();
