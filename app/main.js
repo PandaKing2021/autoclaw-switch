@@ -2099,6 +2099,10 @@ function setupIpc() {
     return { ok: probes.every((p) => p.ok), probes, at: new Date().toISOString() };
   });
 
+  // 自测块在 app.whenReady 作用域，probeKey 在 setupIpc 作用域——直接调用会
+  // ReferenceError（与 queueZcodeSync 同一个坑），所以照旧走处理器。
+  handle("keys:probe:one", (_e, linkId, key) => probeKey(linkId, key));
+
   /**
    * 重启在跑的链路（停旧进程 → 走既有 start 处理器起新实例）：生成新钥后必须
    * 让在跑实例重新读档案。未运行返回 false（不需要重启，start 时自然读新钥）。
@@ -2431,7 +2435,7 @@ app.whenReady().then(() => {
       const trA = ((await invoke("keys:query")).links || []).find((l) => l.id === "trae");
       const aliasSeen = (trA?.keys || []).some((k) => k.alias === true && k.value === ka.key);
       const aliasMainKept = (trA?.keys || [])[0]?.value === kg.key;
-      const aProbe = ka.ok ? await probeKey("trae", ka.key) : { status: 0 };
+      const aProbe = ka.ok ? await invoke("keys:probe:one", "trae", ka.key) : { status: 0 };
       prog(`keys:alias add key=${ka.key ? ka.key.slice(0, 14) + "…" : "-"} restarted=${ka.restarted} listed=${aliasSeen} mainKept=${aliasMainKept} probe=${aProbe.status} ${ka.error || ka.note || ""}`);
       await t("keys:alias", ka.ok === true && /^sk-tr-[0-9a-f]{36}$/.test(String(ka.key)) && aliasSeen && aliasMainKept
         && aProbe.status !== 0 && aProbe.status !== -1 && aProbe.gateBody !== true);
