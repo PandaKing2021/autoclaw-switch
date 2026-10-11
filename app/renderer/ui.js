@@ -354,7 +354,7 @@ $("btn-zcheck").onclick = async () => {
   btn.disabled = false;
 };
 
-// --- 入站 api_key 卡片：钥匙盘点渲染 + 点击复制 + 鉴权体检 ---
+// --- 入站 api_key 卡片：钥匙盘点渲染 + 点击复制 + 生成 + 鉴权体检 ---
 async function refreshKeys() {
   try {
     const r = await window.api.keysQuery();
@@ -362,14 +362,41 @@ async function refreshKeys() {
     $("keys-list").innerHTML = r.links.map((l) => l.keys.map((k, i) => {
       const z = l.zcode || {};
       const zc = z.registered == null ? '<span class="kzcode none" title="未注册进 ZCode 或配置不可读">未注册</span>'
-        : z.matches === true ? '<span class="kzcode match" title="与 ZCode 注册值一致">✓ 注册一致</span>'
-        : '<span class="kzcode mismatch" title="ZCode 注册值已和这里盘点的不一致——改过钥匙就重新点「一键注册」">✗ 注册不一致</span>';
+        : z.matches !== true ? '<span class="kzcode mismatch" title="ZCode 注册值已和这里盘点的不一致——点「生成」或「一键注册」切到当前主钥，重启 ZCode 生效">✗ 注册不一致</span>'
+        : z.current === true ? '<span class="kzcode match" title="ZCode 注册的正是当前主钥（列表第一位）">✓ 注册一致</span>'
+        : '<span class="kzcode stale" title="ZCode 注册的是列表里的备用钥——仍能用，但非当前主钥。点「生成」或「一键注册」切到当前主钥，重启 ZCode 生效">◇ 注册为备用钥</span>';
+      const gen = i === 0
+        ? `<button class="kgen" data-link="${l.id}" title="生成新 api_key：随机新钥写入网关档案 → 自动重启在跑的链路 → 排队切换 ZCode 注册值（生成是加钥：内置兜底钥与旧钥仍有效）">生成</button>`
+        : "";
       return `<div class="keyrow"><span class="klabel">${l.label}${i > 0 ? "（备）" : ""}</span>`
-        + `<span class="kvalue" title="${l.label} · ${k.source}｜点击复制" data-copy="${k.value.replace(/"/g, "&quot;")}">${k.value}</span>${i === 0 ? zc : ""}</div>`;
+        + `<span class="kvalue" title="${l.label} · ${k.source}｜点击复制" data-copy="${k.value.replace(/"/g, "&quot;")}">${k.value}</span>${i === 0 ? zc + gen : ""}</div>`;
     }).join("")).join("");
     document.querySelectorAll("#keys-list .kvalue").forEach((el) => {
       el.onclick = async () => {
         try { await navigator.clipboard.writeText(el.dataset.copy); el.title = "已复制 ✓（" + el.title; setTimeout(() => {}, 0); } catch { /* 无剪贴板权限时降级：用户可手动选中 */ }
+      };
+    });
+    document.querySelectorAll("#keys-list .kgen").forEach((el) => {
+      el.onclick = async () => {
+        const linkId = el.dataset.link;
+        const label = (el.closest(".keyrow")?.querySelector(".klabel")?.textContent || linkId).replace("（备）", "");
+        if (!window.confirm(`为「${label}」生成新 api_key？\n\n· 随机新钥写入网关档案（在跑的链路会被重启以吃进新钥）\n· ZCode 注册值自动切到新钥（ZCode 重启后生效）\n· 生成是加钥：内置兜底钥与旧钥仍然有效，随时可再生成覆盖`)) return;
+        el.disabled = true;
+        setPill("keys-pill", "unknown", "生成中…");
+        $("keys-note").textContent = `正在为 ${label} 生成新钥匙（写档案 → 重启链路 → 排队重注册，最长约 30 秒）…`;
+        let line = "", code = "err", pill = "生成失败";
+        try {
+          const r = await window.api.keysGenerate(linkId);
+          if (r.ok) {
+            line = `✅ ${label} 新钥匙：${r.key}\n${r.note || ""}${r.hint ? "\n" + r.hint : ""}`;
+            code = "ok"; pill = "已生成";
+          } else {
+            line = `❌ ${label} 生成失败：${r.error || "未知原因"}`;
+          }
+        } catch (e) { line = "❌ 生成异常：" + e.message; }
+        await refreshKeys();
+        $("keys-note").textContent = line;
+        setPill("keys-pill", code, pill);
       };
     });
     setPill("keys-pill", "unknown", "已盘点");

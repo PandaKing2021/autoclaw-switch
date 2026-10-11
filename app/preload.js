@@ -34,6 +34,7 @@ contextBridge.exposeInMainWorld("api", {
   qwenworkSmoke: () => ipcRenderer.invoke("qwenwork:smoke"),
   keysQuery: () => ipcRenderer.invoke("keys:query"),
   keysProbe: () => ipcRenderer.invoke("keys:probe"),
+  keysGenerate: (linkId) => ipcRenderer.invoke("keys:generate", linkId),
   keysRotate: (linkId, newKey) => ipcRenderer.invoke("keys:rotate", linkId, newKey),
   tailLog: (which) => ipcRenderer.invoke("logs:tail", which),
 });

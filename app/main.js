@@ -7,9 +7,11 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 const ZC = require("./zcode-config.js");   // ZCode 供应商配置的读写闸门（纯 Node，回归测试见 app/test_zcode_config.js）
+const IK = require("./inbound-keys.js");   // 入站 api_key 的生成/存档（纯 Node，回归测试见 app/test_inbound_keys.js）
 
 const HOME = os.homedir();
 const RELAY_DIR = path.join(HOME, ".autoclaw-relay");
+const INBOUND_KEYS_FILE = IK.storePath(HOME);   // 「生成 api_key」的档案（0600，runtime 数据不进仓库）
 const RELAY_SERVER = path.join(RELAY_DIR, "server.mjs");
 const RELAY_LOG = path.join(RELAY_DIR, "relay.log");
 const RELAY_PERSONA = path.join(RELAY_DIR, "persona.txt");
@@ -42,7 +44,6 @@ const WB_LOGIN_EXE = path.join(WB_BIN_DIR, "wb2api-login.exe");
 const WB_CONFIG = path.join(WB_WORK_DIR, "config.json");
 const WB_LOG = path.join(WB_WORK_DIR, "server.log");
 const WB_PORT = 7863;
-const WB_API_KEY = "wb-local-key";
 const WB_MODELS = ["glm-5.3", "glm-5.2", "cn:auto", "cn:fast-model"];
 const TRAE_PROVIDER_ID = "trae-openai-provider";
 const TRAE_RELAY = path.join(RES_ROOT, "trae", "relay.mjs");
@@ -50,7 +51,6 @@ const TRAE_RELAY = path.join(RES_ROOT, "trae", "relay.mjs");
 // 放在仓库树内有被一起提交的风险
 const TRAE_LOG = path.join(HOME, ".trae-relay", "relay.log");
 const TRAE_PORT = 18768;
-const TRAE_API_KEY = "trae-local-key";
 const DOUBAO_PROVIDER_ID = "doubao-openai-provider";
 const DOUBAO_RELAY = path.join(RES_ROOT, "doubao", "relay.mjs");
 // 同 Trae：日志落在用户目录；cookie 快照与 relay 配置都在 ~/.doubao-relay/，不进仓库
@@ -59,14 +59,11 @@ const DOUBAO_COOKIES = path.join(HOME, ".doubao-relay", "cookies-cdp.json");
 const DOUBAO_CDP = path.join(RES_ROOT, "doubao", "cdp.js");
 const DOUBAO_CDP_PORT = 9222;
 const DOUBAO_PORT = 18770;
-const DOUBAO_API_KEY = "doubao-local-key";
 // --- Comate（文心快码，comate/relay.mjs）：凭证由 relay 自行从 Comate IDE settings.json 读取 ---
 const COMATE_PROVIDER_ID = "comate-openai-provider";
 const COMATE_RELAY = path.join(RES_ROOT, "comate", "relay.mjs");
 const COMATE_LOG = path.join(HOME, ".comate-relay", "relay.log");
 const COMATE_PORT = 18774;
-// 入站 api_key 闸门（comate/relay.mjs 默认开启、内置同名钥匙；轮换走 env COMATE_RELAY_KEY）
-const COMATE_API_KEY = "comate-local";
 const COMATE_SETTINGS = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"),
   "Comate", "User", "settings.json");
 // --- Qoder CN（vendored 社区网关 qoder/qoder_proxy.py，COSY 签名；另含千问办公 qworkcn 区）---
@@ -313,7 +310,7 @@ function wbHttp(method, apiPath, body, timeoutMs = 8000) {
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({
       host: "127.0.0.1", port: WB_PORT, path: apiPath, method,
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${WB_API_KEY}`,
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${linkApiKey("workbuddy")}`,
                  ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
       timeout: timeoutMs,
     }, (res) => {
@@ -349,7 +346,7 @@ function traeHttp(method, apiPath, body, timeoutMs = 8000) {
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({
       host: "127.0.0.1", port: TRAE_PORT, path: apiPath, method,
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TRAE_API_KEY}`,
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${linkApiKey("trae")}`,
                  ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
       timeout: timeoutMs,
     }, (res) => {
@@ -393,7 +390,7 @@ function doubaoHttp(method, apiPath, body, timeoutMs = 8000) {
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({
       host: "127.0.0.1", port: DOUBAO_PORT, path: apiPath, method,
-      headers: { "Content-Type": "application/json", "x-api-key": DOUBAO_API_KEY,
+      headers: { "Content-Type": "application/json", "x-api-key": linkApiKey("doubao"),
                  ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
       timeout: timeoutMs,
     }, (res) => {
@@ -436,7 +433,7 @@ function comateHttp(method, apiPath, body, timeoutMs = 8000) {
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({
       host: "127.0.0.1", port: COMATE_PORT, path: apiPath, method,
-      headers: { "Content-Type": "application/json", "x-api-key": COMATE_API_KEY,
+      headers: { "Content-Type": "application/json", "x-api-key": linkApiKey("comate"),
                  ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}) },
       timeout: timeoutMs,
     }, (res) => {
@@ -536,6 +533,27 @@ function readRealmKeys() {
 }
 
 function qoderRealmKey(realm) { return readRealmKeys()[realm] || ""; }
+
+/**
+ * 「现在该用哪把钥」的唯一口径：ZCode 注册值、控制台自己发请求的 header、
+ * 盘点列表第一位（= keys:probe 的带钥探针）都用它，三者不能各拿各的。
+ * 优先级：控制台生成钥（~/.autoclaw-relay/inbound-keys.json）> 链路自有配置
+ * （workbuddy 读 wb2api config.json 的 api_key；qoder/千问办公读网关出口 Key）
+ * > 各链路内置常量（须与 relay 源码逐字一致，见 app/inbound-keys.js）。
+ */
+function linkApiKey(linkId) {
+  if (linkId === "workbuddy") {
+    try {
+      const k = JSON.parse(fs.readFileSync(WB_CONFIG, "utf8")).api_key;
+      if (typeof k === "string" && k.trim()) return k.trim();
+    } catch {}
+    return IK.BUILTIN.workbuddy;
+  }
+  if (linkId === "qoder" || linkId === "qwenwork") {
+    return qoderRealmKey(linkId === "qoder" ? "cn" : "qworkcn") || IK.BUILTIN[linkId];
+  }
+  return IK.activeKey(IK.readStore(INBOUND_KEYS_FILE), linkId) || IK.BUILTIN[linkId];
+}
 
 /**
  * 让网关里存在「绑定到本机两个出口」的 Key，并把明文留一份给控制台注册用。
@@ -918,11 +936,15 @@ function setupIpc() {
       let acRule = rules.find((r) => r.providerId === PROVIDER_ID);
       if (!acRule) {
         acRule = { providerId: PROVIDER_ID, providerName: "AutoClaw", enabled: true,
-          config: { group: "standard-personal", access: { type: "api-key", apiKey: "autoclaw-local" },
+          config: { group: "standard-personal", access: { type: "api-key", apiKey: linkApiKey("autoclaw") },
             api: { type: ZC.ZCODE_API.ANTHROPIC, baseUrl: "http://127.0.0.1:18766" },
             personalModelIds: [] } };
         rules.push(acRule);
       }
+      // python 注册器每次都把自己的 providerRule 直写回配置（apiKey 硬编码 autoclaw-local，
+      // 见 a_switch.py zcode_register_provider）——这里显式盖回当前口径：控制台生成过钥匙时，
+      // 最终落盘的必须是新钥（python 直写在前、JS 单次落盘在后，后写生效）。
+      acRule.config.access = { ...(acRule.config.access || {}), type: "api-key", apiKey: linkApiKey("autoclaw") };
       acRule.config.personalModelIds = [...new Set(acIds)];
       ZC.upsertModelEntries(entries, PROVIDER_ID,
         reg.catalog.map((x) => modelEntry(PROVIDER_ID, x.modelId, x.contextWindow || 500000, !!x.vision)));
@@ -962,7 +984,7 @@ function setupIpc() {
         out.push(["workbuddy", list.length ? {
           ok: true,
           rule: { providerId: WB_PROVIDER_ID, providerName: "WorkBuddy", enabled: true,
-            config: { group: "standard-personal", access: { type: "api-key", apiKey: WB_API_KEY },
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: linkApiKey("workbuddy") },
               api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${WB_PORT}/v1` },
               personalModelIds: list.map((m) => m[0]) } },
           entries: list.map(([id, ctx]) => modelEntry(WB_PROVIDER_ID, id, ctx)),
@@ -972,7 +994,7 @@ function setupIpc() {
         out.push(["trae", list.length ? {
           ok: true,
           rule: { providerId: TRAE_PROVIDER_ID, providerName: "Trae", enabled: true,
-            config: { group: "standard-personal", access: { type: "api-key", apiKey: TRAE_API_KEY },
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: linkApiKey("trae") },
               api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${TRAE_PORT}/v1` },
               personalModelIds: list.map((m) => m.id) } },
           // Trae 目录里 max 常为 0（如 glm-5.3 = {dev:200000,max:0}），真实可用值在 dev
@@ -985,7 +1007,7 @@ function setupIpc() {
         out.push(["doubao", ids.length ? {
           ok: true,
           rule: { providerId: DOUBAO_PROVIDER_ID, providerName: "豆包工作", enabled: true,
-            config: { group: "standard-personal", access: { type: "api-key", apiKey: DOUBAO_API_KEY },
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: linkApiKey("doubao") },
               api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${DOUBAO_PORT}/v1` },
               personalModelIds: ids } },
           entries: list.map((m) => modelEntry(DOUBAO_PROVIDER_ID, m.id, 16000)),
@@ -996,7 +1018,7 @@ function setupIpc() {
         out.push(["comate", ids.length ? {
           ok: true,
           rule: { providerId: COMATE_PROVIDER_ID, providerName: "Comate 文心快码", enabled: true,
-            config: { group: "standard-personal", access: { type: "api-key", apiKey: COMATE_API_KEY },
+            config: { group: "standard-personal", access: { type: "api-key", apiKey: linkApiKey("comate") },
               api: { type: ZC.ZCODE_API.OPENAI_CHAT, baseUrl: `http://127.0.0.1:${COMATE_PORT}/v1` },
               personalModelIds: ids } },
           entries: list.map((m) => modelEntry(COMATE_PROVIDER_ID, m.id, 200000)),
@@ -1569,51 +1591,67 @@ function setupIpc() {
     return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model, available: models };
   });
 
-  // --- 入站 api_key（七条链路统一闸门的钥匙盘点 / 鉴权体检 / 轮换说明）---
+  // --- 入站 api_key（七条链路统一闸门的钥匙盘点 / 鉴权体检 / 生成）---
   // 盘点：每条链路 ZCode 注册用的钥匙值 + 来源。所有钥匙本就是明文落在本机
-  // （ZCode 的 provider_config.json、~/.autoclaw-relay/qoder-realm-keys.json），
+  // （ZCode 的 provider_config.json、~/.autoclaw-relay/ 下的两个档案），
   // 这里只是把散在各处的值聚到一个视图里，不新增暴露面。
+  // 列表第一位 = 当前主钥（linkApiKey 的口径，keys:probe 的带钥探针也用它）。
+  const pushKey = (arr, value, source) => {
+    const v = typeof value === "string" ? value.trim() : "";
+    if (v && !arr.some((k) => k.value === v)) arr.push({ value: v, source });
+  };
+  const genKeyOf = (linkId) => IK.activeKey(IK.readStore(INBOUND_KEYS_FILE), linkId);
   const KEY_INVENTORY = [
     { id: "autoclaw", label: "AutoClaw", port: 18766, keys: () => {
-      const keys = [{ value: "autoclaw-local", source: "内置（闸门 & ZCode 注册）" }];
-      const t = process.env.AUTOCLAW_PROXY_TOKEN || "autoclaw-dsh";
-      if (t) keys.push({ value: String(t), source: "PROXY_TOKEN（dsh 共用）" });
-      if (process.env.AUTOCLAW_INBOUND_KEYS) for (const k of process.env.AUTOCLAW_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "AUTOCLAW_INBOUND_KEYS 轮换钥" });
+      const gen = genKeyOf("autoclaw");
+      const keys = [];
+      pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
+      pushKey(keys, "autoclaw-local", gen ? "内置兜底（生成后仍有效）" : "内置（闸门 & ZCode 注册）");
+      pushKey(keys, process.env.AUTOCLAW_PROXY_TOKEN || "autoclaw-dsh", "PROXY_TOKEN（dsh 共用）");
+      if (process.env.AUTOCLAW_INBOUND_KEYS) for (const k of process.env.AUTOCLAW_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "AUTOCLAW_INBOUND_KEYS 轮换钥");
       return keys;
     } },
-    { id: "workbuddy", label: "WorkBuddy", port: WB_PORT, keys: () => {
-      // wb2api 是上游 Go 二进制，只有 config.json 的 api_key 单钥，没有 env 追加通道；
-      // 轮换 = 改 ~/.workbuddy-gateway/config.json 的 api_key 后重启网关
-      const keys = [{ value: WB_API_KEY, source: "wb2api config.json api_key" }];
-      return keys;
-    } },
+    { id: "workbuddy", label: "WorkBuddy", port: WB_PORT, keys: () => [
+      // wb2api 是上游 Go 二进制，只有 config.json 的 api_key 单钥（Bearer 形状）、
+      // 没有 env 追加通道；「生成」= 改写该文件并重启网关
+      { value: linkApiKey("workbuddy"), source: "wb2api config.json api_key" },
+    ] },
     { id: "trae", label: "Trae", port: TRAE_PORT, keys: () => {
-      const keys = [{ value: TRAE_API_KEY, source: "内置（闸门 & ZCode 注册）" }];
-      if (process.env.TRAE_INBOUND_KEYS) for (const k of process.env.TRAE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "TRAE_INBOUND_KEYS 轮换钥" });
+      const gen = genKeyOf("trae");
+      const keys = [];
+      pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
+      pushKey(keys, "trae-local-key", gen ? "内置兜底（生成后仍有效）" : "内置（闸门 & ZCode 注册）");
+      if (process.env.TRAE_INBOUND_KEYS) for (const k of process.env.TRAE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "TRAE_INBOUND_KEYS 轮换钥");
       return keys;
     } },
     { id: "doubao", label: "豆包工作", port: DOUBAO_PORT, keys: () => {
-      const keys = [{ value: DOUBAO_API_KEY, source: "内置（闸门 & ZCode 注册）" }];
+      const gen = genKeyOf("doubao");
+      const keys = [];
+      pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
+      pushKey(keys, "doubao-local-key", gen ? "内置兜底（生成后仍有效）" : "内置（闸门 & ZCode 注册）");
       let fileKey = null;
       try { fileKey = JSON.parse(fs.readFileSync(path.join(HOME, ".doubao-relay", "config.json"), "utf8")).key; } catch {}
-      if (fileKey && fileKey !== DOUBAO_API_KEY) keys.push({ value: String(fileKey), source: "~/.doubao-relay/config.json" });
-      if (process.env.DOUBAO_RELAY_KEY && process.env.DOUBAO_RELAY_KEY !== fileKey) keys.push({ value: process.env.DOUBAO_RELAY_KEY, source: "DOUBAO_RELAY_KEY 环境变量" });
-      if (process.env.DOUBAO_INBOUND_KEYS) for (const k of process.env.DOUBAO_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "DOUBAO_INBOUND_KEYS 轮换钥" });
+      pushKey(keys, fileKey, "~/.doubao-relay/config.json");
+      pushKey(keys, process.env.DOUBAO_RELAY_KEY, "DOUBAO_RELAY_KEY 环境变量");
+      if (process.env.DOUBAO_INBOUND_KEYS) for (const k of process.env.DOUBAO_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "DOUBAO_INBOUND_KEYS 轮换钥");
       return keys;
     } },
     { id: "comate", label: "Comate", port: COMATE_PORT, keys: () => {
-      const keys = [{ value: COMATE_API_KEY, source: "内置（闸门 & ZCode 注册）" }];
-      if (process.env.COMATE_RELAY_KEY) keys.push({ value: process.env.COMATE_RELAY_KEY, source: "COMATE_RELAY_KEY 环境变量" });
-      if (process.env.COMATE_INBOUND_KEYS) for (const k of process.env.COMATE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "COMATE_INBOUND_KEYS 轮换钥" });
+      const gen = genKeyOf("comate");
+      const keys = [];
+      pushKey(keys, gen, "控制台生成（~/.autoclaw-relay/inbound-keys.json）");
+      pushKey(keys, "comate-local", gen ? "内置兜底（生成后仍有效）" : "内置（闸门 & ZCode 注册）");
+      pushKey(keys, process.env.COMATE_RELAY_KEY, "COMATE_RELAY_KEY 环境变量");
+      if (process.env.COMATE_INBOUND_KEYS) for (const k of process.env.COMATE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) pushKey(keys, k, "COMATE_INBOUND_KEYS 轮换钥");
       return keys;
     } },
     { id: "qoder", label: "Qoder CN", port: QODER_PORT, keys: () => {
       const k = qoderRealmKey("cn");
-      return [{ value: k || "qoder-local", source: k ? "出口 Key（~/.autoclaw-relay/qoder-realm-keys.json）" : "兜底 qoder-local（出口 Key 未生成）" }];
+      return [{ value: k || "qoder-local", source: k ? "出口 Key（~/.autoclaw-relay/qoder-realm-keys.json）" : "兜底 qoder-local（出口 Key 未生成；点「生成」即用控制台流程补齐）" }];
     } },
     { id: "qwenwork", label: "千问办公", port: QODER_PORT, keys: () => {
       const k = qoderRealmKey("qworkcn");
-      return [{ value: k || "qwenwork-local", source: k ? "出口 Key（~/.autoclaw-relay/qoder-realm-keys.json）" : "兜底 qwenwork-local（出口 Key 未生成）" }];
+      return [{ value: k || "qwenwork-local", source: k ? "出口 Key（~/.autoclaw-relay/qoder-realm-keys.json）" : "兜底 qwenwork-local（出口 Key 未生成；点「生成」即用控制台流程补齐）" }];
     } },
   ];
 
@@ -1628,7 +1666,13 @@ function setupIpc() {
         const out = {};
         for (const item of KEY_INVENTORY) {
           const registered = byId.get(pairs[item.id]);
-          out[item.id] = { registered: registered || null, matches: registered ? item.keys().some((k) => k.value === registered) : null };
+          const keys = item.keys();
+          out[item.id] = {
+            registered: registered || null,
+            matches: registered ? keys.some((k) => k.value === registered) : null,
+            // current：ZCode 注册的正是列表第一位（当前主钥），而非列表里的备用钥
+            current: registered ? (keys[0]?.value || "") === registered : null,
+          };
         }
         return out;
       } catch { return {}; }
@@ -1711,33 +1755,94 @@ function setupIpc() {
     return { ok: probes.every((p) => p.ok), probes, at: new Date().toISOString() };
   });
 
-  // 轮换：不做静默改钥（改钥 = 改 ZCode 注册值，两端必须同换），只报告可行的路径
+  /**
+   * 重启在跑的链路（停旧进程 → 走既有 start 处理器起新实例）：生成新钥后必须
+   * 让在跑实例重新读档案。未运行返回 false（不需要重启，start 时自然读新钥）。
+   * 停进程刻意不走 xxx:stop 处理器——它排队 queueZcodeSync({remove})，一次生成
+   * 就会先把供应商摘掉再挂回来（多余的中间态写盘，还给失败留缺口）。
+   */
+  async function restartLink(linkId) {
+    const alive = PLATFORM_ALIVE[linkId];
+    if (!alive || !alive()) return false;
+    const port = KEY_INVENTORY.find((l) => l.id === linkId)?.port;
+    try {
+      const out = execSync(`netstat -ano | findstr :${port} | findstr LISTENING`, { shell: "cmd.exe", timeout: 8000 }).toString();
+      const pid = out.trim().split(/\s+/).pop();
+      if (pid) execSync(`taskkill /F /PID ${pid}`, { shell: "cmd.exe" });
+    } catch (e) { throw new Error("停止旧实例失败：" + String((e && e.message) || e)); }
+    await new Promise((r) => setTimeout(r, 800));   // taskkill 是同步的，留点余量让端口真正释放
+    const startCh = linkId === "autoclaw" ? "relay:start" : `${linkId}:start`;
+    const st = await handlers[startCh](null);
+    if (st && st.ok === false) throw new Error(st.error || "启动失败");
+    return true;
+  }
+
+  /**
+   * 生成/指定新钥的落地（keys:generate 与 keys:rotate 共用）：
+   * 写档案或配置 → 在跑的链路重启吃进 → 排队把 ZCode 注册值切换到新钥。
+   * 三条通道：workbuddy 改 wb2api config.json（单钥）；qoder/千问办公走网关
+   * 出口 Key 的面板流程；其余四条写 ~/.autoclaw-relay/inbound-keys.json（档案
+   * 是「加钥」，内置兜底钥不受影响）。ZCode 侧一律要等 ZCode 重启才读新配置。
+   */
+  async function applyInboundKey(linkId, newKey) {
+    const link = KEY_INVENTORY.find((l) => l.id === linkId);
+    if (!link) return { ok: false, error: `未知链路 ${linkId}（可选：${KEY_INVENTORY.map((l) => l.id).join("、")}）` };
+    if (!IK.validKey(newKey)) return { ok: false, error: "钥匙形状不合法：可打印 ASCII、无空白、4..128 字符（控制台生成的都是这个形状）" };
+    if (linkId === "workbuddy") {
+      let cfg = {};
+      try { cfg = JSON.parse(fs.readFileSync(WB_CONFIG, "utf8")) || {}; } catch {}
+      cfg.api_key = newKey;
+      try { fs.writeFileSync(WB_CONFIG, JSON.stringify(cfg, null, 2)); } catch (e) { return { ok: false, error: `config.json 写入失败：${e.message}` }; }
+      let restarted = false;
+      try { restarted = await restartLink(linkId); } catch (e) { return { ok: false, error: `新钥已写入 config.json，但网关重启失败：${e.message}（手动重启 workbuddy 网关即可）` }; }
+      queueZcodeSync({ upsert: [linkId] });
+      return { ok: true, linkId, key: newKey, store: WB_CONFIG, restarted, note: restarted ? "已改写 wb2api config.json 并重启网关" : "已改写 wb2api config.json（网关未运行，启动后生效）" };
+    }
+    if (linkId === "qoder" || linkId === "qwenwork") {
+      const realm = linkId === "qoder" ? "cn" : "qworkcn";
+      const store = readRealmKeys();
+      store[realm] = newKey;
+      try { fs.writeFileSync(QODER_REALM_KEYS, JSON.stringify(store, null, 1), { mode: 0o600 }); } catch (e) { return { ok: false, error: `落盘失败：${e.message}` }; }
+      const ensure = await qoderEnsureRealmKeys();
+      if (!ensure.ok) return { ok: false, error: ensure.error };
+      queueZcodeSync({ upsert: [linkId] });
+      return { ok: true, linkId, key: newKey, store: QODER_REALM_KEYS, restarted: false, note: "出口 Key 已写网关（重启 ZCode 后生效）" };
+    }
+    const store = IK.readStore(INBOUND_KEYS_FILE);
+    store[linkId] = newKey;
+    try { IK.writeStore(INBOUND_KEYS_FILE, store); } catch (e) { return { ok: false, error: `档案落盘失败：${e.message}` }; }
+    let restarted = false;
+    try { restarted = await restartLink(linkId); } catch (e) { return { ok: false, error: `档案已更新，但链路重启失败：${e.message}（手动重启该链路即可生效）` }; }
+    queueZcodeSync({ upsert: [linkId] });
+    return { ok: true, linkId, key: newKey, store: INBOUND_KEYS_FILE, restarted, note: restarted ? "档案已更新、链路已重启（新钥即刻生效）" : "档案已更新（链路未运行，下次启动即生效）" };
+  }
+
+  // 生成：给指定链路生成一把随机新钥并全链路落地（档案 → 重启 → 重注册）。
+  // 生成是「加钥」语义：内置兜底钥永远有效，ZCode 注册值切到新钥；想换一把
+  // 再点一次即可，不存在「换钥后旧配置全废」的状态。
+  handle("keys:generate", async (_e, linkId) => {
+    const out = await applyInboundKey(linkId, IK.generateKey(linkId));
+    if (out.ok) out.hint = "ZCode 侧重启客户端后读新配置（或点「一键注册」立即写）；此后本卡片「重新盘点」即显示新钥";
+    return out;
+  });
+
+  // 轮换：指定 newKey 时与「生成」走同一条落地路径；不带 newKey 只报告可行路径，不做静默改钥
   handle("keys:rotate", async (_e, linkId, newKey) => {
     const link = KEY_INVENTORY.find((l) => l.id === linkId);
     if (!link) return { ok: false, error: `未知链路 ${linkId}（可选：${KEY_INVENTORY.map((l) => l.id).join("、")}）` };
-    if (linkId === "qoder" || linkId === "qwenwork") {
-      const realm = linkId === "qoder" ? "cn" : "qworkcn";
-      if (!newKey) return { ok: true, linkId, hint: "Qoder/千问办公的出口 Key 由控制台生成（qd-… 随机 36 位）。在网关看板（http://127.0.0.1:8791/dashboard）删掉 aswitch-" + realm + " 这条再点「一键注册」，控制台会生成新 Key 并重写 ZCode 注册值。" };
-      const store = readRealmKeys();
-      store[realm] = String(newKey).trim();
-      try { fs.writeFileSync(QODER_REALM_KEYS, JSON.stringify(store, null, 1), { mode: 0o600 }); } catch (e) { return { ok: false, error: `落盘失败：${e.message}` }; }
-      const ensure = await qoderEnsureRealmKeys();
-      queueZcodeSync({ upsert: [linkId] });
-      return ensure.ok ? { ok: true, linkId, rotated: true, note: "新 Key 已写网关并排队重注册（重启 ZCode 生效）" } : { ok: false, error: ensure.error };
+    if (newKey) {
+      const r = await applyInboundKey(linkId, String(newKey).trim());
+      if (r.ok) r.rotated = true;
+      return r;
     }
-    if (!newKey) {
-      return {
-        ok: true, linkId,
-        hint: linkId === "comate"
-          ? "Comate：重启 relay 前设 COMATE_RELAY_KEY=新钥（或 COMATE_INBOUND_KEYS=旧钥,新钥 平滑并存），再在 ZCode 里更新注册值"
-          : linkId === "doubao"
-            ? "豆包：DOUBAO_RELAY_KEY=新钥（或写 ~/.doubao-relay/config.json 的 key），重启 relay 后在 ZCode 里更新注册值"
-            : linkId === "autoclaw"
-              ? "AutoClaw：AUTOCLAW_PROXY_TOKEN / AUTOCLAW_INBOUND_KEYS=逗号追加（旧钥并存），重启 relay 后在 ZCode 里更新注册值"
-              : `${link.label}：${link.id.toUpperCase()}_INBOUND_KEYS=旧钥,新钥 平滑并存，重启 relay 后在 ZCode 里更新注册值`,
-      };
-    }
-    return { ok: false, error: "env 型钥匙不支持控制台直改（改了 relay 不重启不生效）；请按提示用环境变量轮换，或用 Qoder 出口 Key 的看板流程" };
+    return {
+      ok: true, linkId,
+      hint: linkId === "workbuddy"
+        ? "WorkBuddy：点「生成」由控制台改写 wb2api config.json 并重启网关；手动方式同此（改 api_key 后重启 wb2api.exe）"
+        : linkId === "qoder" || linkId === "qwenwork"
+          ? "Qoder/千问办公：点「生成」由控制台重建出口 Key（写本地明文 → 写网关 → 重注册）"
+          : `${link.label}：点「生成」由控制台生成随机新钥，写入 ~/.autoclaw-relay/inbound-keys.json 并自动重启该链路；手动方式：${link.id.toUpperCase()}_INBOUND_KEYS=旧钥,新钥 平滑并存，重启 relay 后在 ZCode 里更新注册值`,
+    };
   });
 
   handle("logs:tail", async (_e, which) => {
@@ -1792,18 +1897,23 @@ app.whenReady().then(() => {
       const t = async (name, ok) => { results.push([name, !!ok]); prog(`${name}: ${ok ? "PASS" : "FAIL"}`); };
       prog("selftest start");
       // 定向自测：ASWITCH_SELFTEST_ONLY="zcode:register,trae:smoke" 只跑指定处理器，
-      // 便于快速迭代单个按钮（全量自测会重启 relay，耗时较长）
+      // 便于快速迭代单个按钮（全量自测会重启 relay，耗时较长）。
+      // 需要带参的处理器用 "=" 传字符串参数（多参数再按 "=" 分段）：
+      // keys:generate=trae / keys:rotate=trae=<新钥>
       const only = (process.env.ASWITCH_SELFTEST_ONLY || "").split(",").map((s) => s.trim()).filter(Boolean);
       if (only.length) {
-        for (const ch of only) {
+        for (const spec of only) {
+          const eq = spec.indexOf("=");
+          const ch = eq >= 0 ? spec.slice(0, eq) : spec;
+          const args = eq >= 0 ? spec.slice(eq + 1).split("=") : [];
           try {
-            const out = await invoke(ch);
-            prog(`only ${ch} -> ${JSON.stringify(out).slice(0, 400)}`);
-            console.log(`==== ONLY ${ch} ====`);
+            const out = await invoke(ch, ...args);
+            prog(`only ${spec} -> ${JSON.stringify(out).slice(0, 400)}`);
+            console.log(`==== ONLY ${spec} ====`);
             console.log(JSON.stringify(out, null, 1).slice(0, 8000));
           } catch (e) {
-            prog(`only ${ch} ERROR: ${e.message}`);
-            console.log(`==== ONLY ${ch} ERROR: ${e.message} ====`);
+            prog(`only ${spec} ERROR: ${e.message}`);
+            console.log(`==== ONLY ${spec} ERROR: ${e.message} ====`);
           }
         }
         app.exit(0);
@@ -1886,6 +1996,13 @@ app.whenReady().then(() => {
       prog(`zcode:check providers=${(zc.providers || []).map((p) => `${p.providerId}:${p.apiType || "none"}`).join(",")} manual=${zc.hasManualRules}`);
       await t("zcode:check", zc.ok === true && zc.hasManualRules === true && zc.modelRuleCount > 0);
       prog(`zcode:register detail backup=${rg.backup}`);
+      // 生成 api_key：给 trae 生成一把随机钥（写档案 → 重启 trae 吃进 → 排队重注册），
+      // 紧接着的 keys:probe 会用「生成后的当前主钥」带钥复测；两行一起覆盖生成链路端到端
+      const kg = await invoke("keys:generate", "trae");
+      const trk = ((await invoke("keys:query")).links || []).find((l) => l.id === "trae");
+      const kgActive = (trk?.keys || [])[0]?.value === kg.key;
+      prog(`keys:generate trae key=${kg.key ? kg.key.slice(0, 12) + "…" : "-"} restarted=${kg.restarted} store=${kg.store ? "ok" : "-"} active=${kgActive} ${kg.error || kg.note || ""}`);
+      await t("keys:generate", kg.ok === true && /^tr-[0-9a-f]{36}$/.test(String(kg.key)) && kgActive);
       // 入站 api_key：全部活着的链路匿名必须 401、带盘点钥匙必须越过闸门（不消耗上游额度）
       const kp = await invoke("keys:probe");
       prog(`keys:probe ${(kp.probes || []).map((p) => `${p.label}:${p.ok ? "ok" : p.detail}`).join(" | ")}`);

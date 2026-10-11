@@ -100,9 +100,18 @@ const STATE_DIR = join(homedir(), ".comate-relay");
 // comate:start 起来就探活，不带钥匙）。默认开启；COMATE_RELAY_KEY="" 或
 // COMATE_INBOUND_AUTH=0 关闭（离线纯函数测试与 test_stream 用 0）。
 // 轮换：COMATE_RELAY_KEY=新钥，或 COMATE_INBOUND_KEYS=逗号追加多把并存。
+// 控制台「生成」的钥读 ~/.autoclaw-relay/inbound-keys.json（键 = 链路 id）：
+// 生成是加钥，内置钥永久兜底；生成后控制台会重启本链路把新钥吃进来，手动
+// 启动的实例重启一次同样生效（启动时读一次档案）。
 const INBOUND_AUTH = process.env.COMATE_INBOUND_AUTH !== "0";
+function consoleStoreKey() {
+  try {
+    const v = JSON.parse(readFileSync(join(homedir(), ".autoclaw-relay", "inbound-keys.json"), "utf8"))?.comate;
+    return typeof v === "string" ? v.trim() : "";
+  } catch { return ""; }
+}
 const INBOUND_KEYS = new Set(
-  ["comate-local", process.env.COMATE_RELAY_KEY || ""]
+  ["comate-local", process.env.COMATE_RELAY_KEY || "", consoleStoreKey()]
     .concat((process.env.COMATE_INBOUND_KEYS || "").split(","))
     .map((s) => s.trim()).filter(Boolean),
 );

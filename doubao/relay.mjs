@@ -308,9 +308,18 @@ const sse = (res, event, data) => res.write(`event: ${event}\ndata: ${JSON.strin
 // ∪ DOUBAO_INBOUND_KEYS（逗号追加轮换），x-api-key 或 Authorization: Bearer 均可。
 // 默认开启；DOUBAO_INBOUND_AUTH=0 关闭（离线测试用）；/health、/admin/* 豁免
 // （豁免靠路由顺序：admin 分支在 checkKey 之前）。
+// 控制台「生成」的钥读 ~/.autoclaw-relay/inbound-keys.json（键 = 链路 id）：
+// 生成是加钥，内置钥与 config.json 的 key 永久兜底；生成后控制台会重启本
+// 链路把新钥吃进来（启动时读一次档案）。
 const INBOUND_AUTH = process.env.DOUBAO_INBOUND_AUTH !== "0";
+function consoleStoreKey() {
+  try {
+    const v = JSON.parse(readFileSync(join(homedir(), ".autoclaw-relay", "inbound-keys.json"), "utf8"))?.doubao;
+    return typeof v === "string" ? v.trim() : "";
+  } catch { return ""; }
+}
 const INBOUND_KEYS = new Set(
-  ["doubao-local-key", RELAY_KEY]
+  ["doubao-local-key", RELAY_KEY, consoleStoreKey()]
     .concat((process.env.DOUBAO_INBOUND_KEYS || "").split(","))
     .map((s) => s.trim()).filter(Boolean),
 );

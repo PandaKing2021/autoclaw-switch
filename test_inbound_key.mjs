@@ -10,7 +10,10 @@
 // 非环回监听仍 401（入站钥匙与旧 PROXY_TOKEN 并存不冲突）；
 // /health、OPTIONS 预检豁免；AUTOCLAW_INBOUND_KEYS 追加轮换钥；
 // *_INBOUND_AUTH=0 关闭开关；comate /v1/models 带钥 200（假上游目录）；
-// trae / doubao（C 档补闸）：三种模型端点都拦、/admin/* 豁免、轮换钥并存。
+// trae / doubao（C 档补闸）：三种模型端点都拦、/admin/* 豁免、轮换钥并存；
+// 控制台「生成」档案（~/.autoclaw-relay/inbound-keys.json，键 = 链路 id）：
+// 四条 env 链路启动时读它并钥，生成钥与内置兜底钥并存（HOME/USERPROFILE
+// 指向假目录做隔离，绝不碰真实档案）。
 import { spawn } from "node:child_process";
 import http from "node:http";
 import fs from "node:fs";
@@ -80,15 +83,32 @@ const fakeUpstream = http.createServer((rq, rs) => {
 await new Promise((r) => fakeUpstream.listen(0, "127.0.0.1", r));
 const FAKE_PORT = fakeUpstream.address().port;
 
+// ------------------------------------------ 控制台「生成」档案的假 home
+// 形状同 app/inbound-keys.js 的生成钥（前缀 + 36 位 hex），内容固定便于断言。
+// relay 只把它当「集合里再多一把钥」，没有任何额外语义。
+const storeKey = (id) => `${id}-${"0".repeat(36)}`;
+function fakeHomeWithStore(ids) {
+  const home = tmp("asw-inbound-home");
+  const store = {};
+  for (const id of ids) store[id] = storeKey(id);
+  fs.mkdirSync(path.join(home, ".autoclaw-relay"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify(store));
+  return home;
+}
+
 // ---------------------------------------------------------- AutoClaw 两份实例
 const baseA = {
   AUTOCLAW_BIND_HOST: "127.0.0.1",
   AUTOCLAW_STATE_DIR: tmp("asw-inbound-state"),
   AUTOCLAW_LOG_FILE: path.join(tmp("asw-inbound-log"), "server.log"),
 };
+// bridge 实例（= 控制台部署的 server.mjs 本体）把 HOME 指进带档案的假目录：
+// 生成钥通道只在 bridge 里（relay/server.mjs 是上游本体，控制台不部署它）
+const acHome = fakeHomeWithStore(["autoclaw"]);
 const autoclawInstances = [
   ["relay/server.mjs", { ...baseA, AUTOCLAW_PORT: "18899" }],
-  ["bridge/server_2x.mjs", { ...baseA, AUTOCLAW_PORT: "18900", AUTOCLAW_INBOUND_KEYS: "rotated-key-1, rotated-key-2" }],
+  ["bridge/server_2x.mjs", { ...baseA, AUTOCLAW_PORT: "18900", AUTOCLAW_INBOUND_KEYS: "rotated-key-1, rotated-key-2",
+    HOME: acHome, USERPROFILE: acHome }],
 ];
 for (const [script, env] of autoclawInstances) {
   const s = startScript(script, env);
@@ -105,6 +125,8 @@ for (const [script, env] of autoclawInstances) {
   ok(`[${tag}] GET /fwd 非模型路径不被闸门拦`, gated(await req(s.port, "GET", "/fwd")) === false);
   if (tag === "bridge") {
     ok("[bridge] AUTOCLAW_INBOUND_KEYS 轮换钥生效", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": "rotated-key-2" })));
+    ok("[bridge] 「生成」档案钥 (autoclaw-000…) 越过闸门", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("autoclaw") })));
+    ok("[bridge] 档案钥与内置兜底钥并存", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": "autoclaw-local" })));
   }
   s.stop();
 }
@@ -164,6 +186,9 @@ for (const [script, env] of autoclawInstances) {
   fs.mkdirSync(path.join(appdata, "Comate", "User"), { recursive: true });
   fs.writeFileSync(path.join(appdata, "Comate", "User", "settings.json"),
     JSON.stringify({ "baidu.comate.license": "test-license", "baidu.comate.username": "tester" }));
+  // 同一假 home 里放一份「生成」档案：comate 启动时并钥
+  fs.mkdirSync(path.join(appdata, ".autoclaw-relay"), { recursive: true });
+  fs.writeFileSync(path.join(appdata, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify({ comate: storeKey("comate") }));
   const s = startScript("comate/relay.mjs", {
     APPDATA: appdata, COMATE_RELAY_PORT: "18904", COMATE_RELAY_HOST: "127.0.0.1",
     COMATE_RELAY_BASE: `http://127.0.0.1:${FAKE_PORT}`, COMATE_RELAY_KEY: "rotated-comate-key",
@@ -172,6 +197,7 @@ for (const [script, env] of autoclawInstances) {
   await s.wait();
   ok("[comate] 轮换钥生效", (await req(s.port, "GET", "/v1/models", { "x-api-key": "rotated-comate-key" })).status === 200);
   ok("[comate] 内置旧钥仍在（并存）", (await req(s.port, "GET", "/v1/models", { "x-api-key": "comate-local" })).status === 200);
+  ok("[comate] 「生成」档案钥 (comate-000…) 并存生效", (await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("comate") })).status === 200);
   s.stop();
 
   const s2 = startScript("comate/relay.mjs", {
@@ -192,21 +218,24 @@ for (const [script, env] of autoclawInstances) {
   const storage = path.join(home, "TRAE SOLO CN", "User");
   fs.mkdirSync(storage, { recursive: true });
   fs.writeFileSync(path.join(storage, "storage.json"), JSON.stringify({}));
-  const s = startScript("trae/relay.mjs", {
-    TRAE_RELAY_PORT: "18906", TRAE_RELAY_HOST: "127.0.0.1", TRAE_STORAGE: path.join(storage, "storage.json"),
-  }, "/health");
+  // 假 home 里放一份「生成」档案（HOME/USERPROFILE 都指过来，Windows 上 homedir() 认 USERPROFILE）
+  fs.mkdirSync(path.join(home, ".autoclaw-relay"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify({ trae: storeKey("trae") }));
+  const envBase = { HOME: home, USERPROFILE: home, TRAE_RELAY_HOST: "127.0.0.1", TRAE_STORAGE: path.join(storage, "storage.json") };
+  const s = startScript("trae/relay.mjs", { ...envBase, TRAE_RELAY_PORT: "18906" }, "/health");
   await s.wait();
   ok("[trae] 无钥 GET /v1/models → 401", gated(await req(s.port, "GET", "/v1/models")));
   ok("[trae] 错钥 POST /v1/chat/completions → 401", gated(await req(s.port, "POST", "/v1/chat/completions", { "x-api-key": "bad" })));
   ok("[trae] 无钥 POST /v1/messages → 401（anthropic 形状报文）", gated(await req(s.port, "POST", "/v1/messages")));
   ok("[trae] trae-local-key (x-api-key) 越过闸门", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": "trae-local-key" })));
   ok("[trae] Bearer 形状同权", passed(await req(s.port, "GET", "/v1/models", { authorization: "Bearer trae-local-key" })));
+  ok("[trae] 「生成」档案钥 (trae-000…) 越过闸门（与内置钥并存）", passed(await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("trae") })));
   ok("[trae] /health 无钥放行", (await req(s.port, "GET", "/health")).status === 200);
   s.stop();
 
   // 轮换钥并存 + 关闭开关
   const s2 = startScript("trae/relay.mjs", {
-    TRAE_RELAY_PORT: "18906", TRAE_RELAY_HOST: "127.0.0.1", TRAE_STORAGE: path.join(storage, "storage.json"),
+    ...envBase, TRAE_RELAY_PORT: "18906",
     TRAE_INBOUND_KEYS: "rotated-trae-1", TRAE_INBOUND_AUTH: "0",
   }, "/health");
   await s2.wait();
@@ -214,7 +243,7 @@ for (const [script, env] of autoclawInstances) {
   s2.stop();
 
   const s3 = startScript("trae/relay.mjs", {
-    TRAE_RELAY_PORT: "18906", TRAE_RELAY_HOST: "127.0.0.1", TRAE_STORAGE: path.join(storage, "storage.json"),
+    ...envBase, TRAE_RELAY_PORT: "18906",
     TRAE_INBOUND_KEYS: "rotated-trae-1",
   }, "/health");
   await s3.wait();
@@ -229,6 +258,9 @@ for (const [script, env] of autoclawInstances) {
 // ~/.doubao-relay 是硬编码 homedir()/.doubao-relay，把 HOME 指进假目录即可。
 {
   const home = tmp("doubao-inbound-home");
+  // 假 home 里放一份「生成」档案：doubao 启动时并钥（档案与内置钥、config.json key 三者并存）
+  fs.mkdirSync(path.join(home, ".autoclaw-relay"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".autoclaw-relay", "inbound-keys.json"), JSON.stringify({ doubao: storeKey("doubao") }));
   const s = startScript("doubao/relay.mjs", {
     HOME: home, USERPROFILE: home,
     DOUBAO_RELAY_PORT: "18907", DOUBAO_RELAY_HOST: "127.0.0.1",
@@ -238,6 +270,7 @@ for (const [script, env] of autoclawInstances) {
   ok("[doubao] 错钥 POST /v1/chat/completions → 401", gated(await req(s.port, "POST", "/v1/chat/completions", { "x-api-key": "bad" })));
   ok("[doubao] doubao-local-key (x-api-key) 越过闸门（200=合成目录）", (await req(s.port, "GET", "/v1/models", { "x-api-key": "doubao-local-key" })).status === 200);
   ok("[doubao] Bearer 形状同权", (await req(s.port, "GET", "/v1/models", { authorization: "Bearer doubao-local-key" })).status === 200);
+  ok("[doubao] 「生成」档案钥 (doubao-000…) 越过闸门（与内置钥并存）", (await req(s.port, "GET", "/v1/models", { "x-api-key": storeKey("doubao") })).status === 200);
   ok("[doubao] /health 无钥放行", (await req(s.port, "GET", "/health")).status === 200);
   // /admin/* 豁免的证明：匿名 POST 没被闸门 401 拦下（空 HOME 下 cookie 缺失 → 500 业务错误，非 401）
   ok("[doubao] /admin/* 仍豁免（匿名进业务路径=500 缺 cookie，非闸门 401）",

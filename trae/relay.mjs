@@ -64,9 +64,19 @@ const AUTH_KEY = "iCubeAuthInfo://icube.cloudide";
 // /v1/messages 必须带 x-api-key 或 Authorization: Bearer，常数时间比对。
 // /health 与 / 豁免（控制台 trae:start 起来就探活，不带钥匙）。
 // 默认开启；TRAE_INBOUND_AUTH=0 关闭；轮换：TRAE_INBOUND_KEYS=逗号追加多把并存。
+//
+// 控制台「生成」的钥读 ~/.autoclaw-relay/inbound-keys.json（键 = 链路 id）：
+// 生成是加钥，内置钥永久兜底；生成后控制台会重启本链路把新钥吃进来，手动
+// 启动的实例重启一次同样生效（启动时读一次档案）。
 const INBOUND_AUTH = process.env.TRAE_INBOUND_AUTH !== "0";
+function consoleStoreKey() {
+  try {
+    const v = JSON.parse(readFileSync(join(homedir(), ".autoclaw-relay", "inbound-keys.json"), "utf8"))?.trae;
+    return typeof v === "string" ? v.trim() : "";
+  } catch { return ""; }
+}
 const INBOUND_KEYS = new Set(
-  ["trae-local-key"]
+  ["trae-local-key", consoleStoreKey()]
     .concat((process.env.TRAE_INBOUND_KEYS || "").split(","))
     .map((s) => s.trim()).filter(Boolean),
 );

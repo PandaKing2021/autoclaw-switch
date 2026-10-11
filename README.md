@@ -109,9 +109,10 @@ Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + 日志 + 顶
 
 ```
 cd app && npm start                     # 启动（等价于 npx electron .）
-ASWITCH_SELFTEST=1 npx electron .       # 27 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 闸门断言 + 七链路鉴权体检 + 日志 + relay 停复）
-ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # 只跑指定处理器
+ASWITCH_SELFTEST=1 npx electron .       # 29 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 闸门断言 + 生成钥 + 七链路鉴权体检 + 日志 + relay 停复）
+ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # 只跑指定处理器（带参数写 keys:generate=trae，`=` 后按 `=` 再拆）
 node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，19 条用例）
+node app/test_inbound_keys.js           # 「生成 api_key」钥存储/生成器的纯净回归（20 条用例）
 node test_model_catalog.mjs             # 模型命名一致性检查（离线 11 条；--live 连同在跑的网关一起验）
 ```
 
@@ -358,15 +359,17 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 | WorkBuddy `:7863` | wb2api 原生 `api_key`（config.json，`wb-local-key`） | —（Go 二进制单钥，改 config 后重启） | config.json 置空 |
 | Qoder/千问 `:8791` | 两把出口 Key（`~/.autoclaw-relay/qoder-realm-keys.json`，绑 Key 即选出口） | 面板 API Keys 页 | 面板 `auth_disabled` |
 
-控制台「入站 api_key」卡片把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账标记一致/不一致），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:probe` / `keys:rotate` 三个通道，`keys:probe` 同时进了全量自测（第 28 项）。
+**生成 api_key（控制台「入站 api_key」卡片，2026-10-11 起）**：每行首位的「生成」按钮为本链路造一把随机新钥（形如 `tr-<36 位 hex>`，前缀区分平台），走的是**加钥**而不是换锁：新钥落盘 `~/.autoclaw-relay/inbound-keys.json`（0600，运行时数据不入库），随即自动重启该链路让它读到新钥，再把 ZCode 注册值切到新钥——**内置兜底钥不会被撤销**（它是 relay 源码里的常量，控制台无权删），只是从"主"降为"备"，闸门对「存储钥 ∪ 内置钥 ∪ env 轮换钥」一并放行。四条 env 型链路（AutoClaw/Trae/豆包/Comate）启动时读上述存储文件；WorkBuddy 是 Go 二进制单钥，生成即改写 wb2api 的 `config.json` 并重启网关；Qoder/千问办公按「出口 Key」分流，生成会重导一把出口 Key（写本地明文 → 写网关 → 重注册）——这两家不能多钥并存。生成后立即生效的前提是链路由控制台托管，`node xxx/relay.mjs` 手拉起的那份不吃即时重启，重启一次即跟随；随后点「一键注册」（或重启 ZCode）让客户端读新注册值。「重新盘点」即会看到新钥升到首位、内置钥标「备」。
 
-闸门回归：`node test_inbound_key.mjs`（零出站 50 条：401/放行判别式、双头形状、OPTIONS 204、`/health` 豁免、轮换钥、关闭开关、非环回监听下新旧两套鉴权并存、trae 三端点全拦、doubao 目录端点入闸 + `/admin` 豁免）。
+控制台「入站 api_key」卡片把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账：✓ 注册一致 / ✗ 注册不一致 / ◇ 注册为备用钥 / 未注册 四态），首行「生成」按钮一键换新钥（生成 → 重启该链路 → 切 ZCode 注册值，见上），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:generate` / `keys:probe` / `keys:rotate` 四个通道；`keys:generate` 与 `keys:probe` 同时进了全量自测（第 28、29 项）。
+
+闸门回归：`node test_inbound_key.mjs`（零出站 55 条：401/放行判别式、双头形状、OPTIONS 204、`/health` 豁免、轮换钥、关闭开关、非环回监听下新旧两套鉴权并存、trae 三端点全拦、doubao 目录端点入闸 + `/admin` 豁免、四条 env 链路的「生成」存储钥越过闸门且与内置钥并存）。生成器与存储模块另有 `node app/test_inbound_keys.js`（20 条：随机钥形状/平台前缀、非法值拒绝、存储读写与损坏兜底、以及"四家 relay 源码确实读这个文件"的漂移守门）。
 
 ### 控制台 / 自测
 
-`ASWITCH_SELFTEST=1 npx electron .` 顺序执行各 IPC 处理器（等同逐个点按钮），`ASWITCH_SELFTEST_ONLY="keys:probe"` 可单跑指定通道。27 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 入站闸门断言 + 日志 + relay 停复）+ `keys:probe`（七链路鉴权体检）。
+`ASWITCH_SELFTEST=1 npx electron .` 顺序执行各 IPC 处理器（等同逐个点按钮），`ASWITCH_SELFTEST_ONLY="keys:probe"` 可单跑指定通道。27 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + 体检 + 入站闸门断言 + 日志 + relay 停复）+ `keys:generate`（生成新钥端到端：生成 → 重启 → 复测 → 盘点换位，第 28 项）+ `keys:probe`（七链路鉴权体检，第 29 项）。
 
-回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node test_inbound_key.mjs`（入站 api_key 闸门，零出站 50 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
+回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node app/test_inbound_keys.js`（生成钥存储与生成器，20 条）、`node test_inbound_key.mjs`（入站 api_key 闸门，零出站 55 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
 
 注意在 Git Bash 里用 `curl -d '中文'` 会因为控制台代码页是 GBK 而发出乱码字节，测试中文请用 Node 脚本或 `--data-binary @utf8文件`。
 
@@ -374,7 +377,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 
 | 症状 | 原因与处置 |
 |---|---|
-| `unauthorized: missing or invalid api key`（401，任意网关） | 入站闸门在岗但请求没带/带错钥匙——ZCode 走注册值无需配置；手动 curl 用 `x-api-key` 或 `Authorization: Bearer`（wb2api 只认后者）。钥匙清单看控制台「入站 api_key」卡片或 `keys:query`；带钥仍被拦就是钥匙与网关不一致（改过 env 没重启 relay，或注册值过期），「鉴权体检」会点名 |
+| `unauthorized: missing or invalid api key`（401，任意网关） | 入站闸门在岗但请求没带/带错钥匙——ZCode 走注册值无需配置；手动 curl 用 `x-api-key` 或 `Authorization: Bearer`（wb2api 只认后者）。钥匙清单看控制台「入站 api_key」卡片或 `keys:query`；带钥仍被拦就是钥匙与网关不一致（改过 env 没重启 relay，或注册值过期；「生成」换过新钥的话，控制台托管的重启是自动的，手动拉起的 relay 要自己重启一次），「鉴权体检」会点名 |
 | 401 Invalid token | 应用轮换了 access token。凭证同步器正常时会自动跟进；若没在跑，重新打开 AutoClaw 登录一次，或重跑 `bridge/make_compat_auth.py` |
 | 402 积分不足 | 终态错误，等每日赠送（每日登录 1000 分）或充值，反代不会重试 |
 | 406 空响应 | 2.x 闸门五要素缺一（见上文）；最常见是 persona.txt 没部署——控制台点「启动」会自动从已安装客户端提取（日志里搜 `persona:`） |
@@ -415,7 +418,9 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 ├── app/                           ← Electron 管理控制台（七平台统一面板 + ZCode 注册）
 │   ├── main.js / preload.js       生命周期管理 + IPC（含 ASWITCH_SELFTEST 自测模式）
 │   ├── zcode-config.js            ★ ZCode 配置写入闸门（纯 Node：枚举/结构/原子/回滚 + 动态注销）
+│   ├── inbound-keys.js            ★ 入站钥匙存储与生成器（「生成 api_key」的纯 Node 核心，relay 与主进程共用）
 │   ├── test_zcode_config.js       配置闸门与主进程源码卫生的沙箱回归测试（19 条用例）
+│   ├── test_inbound_keys.js       生成钥存储/生成器与四家 relay 读档的漂移守门（20 条用例）
 │   ├── test_client.mjs            CDP 端的 GUI 自测脚本（需控制台带 --remote-debugging-port=9222）
 │   └── renderer/                  状态面板 UI（index.html / ui.js / style.css）
 ├── bridge/                        ← AutoClaw 2.x 适配层
@@ -458,6 +463,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 │                                    控制台的「一键注册 / 余额查询 / 凭证同步」也加载它
 ├── models-catalog.json            ★ 模型统一命名规范 + 七平台规范名对照（单一事实源）
 ├── test_model_catalog.mjs           命名一致性守门（离线 11 条；--live 连网关一起验）
+├── test_inbound_key.mjs             入站 api_key 闸门的零出站回归（55 条）
 ├── a_switch_app.py                ← A-SWITCH 1.x GUI（pywebview）
 ├── relay/server.mjs               ← 上游主线的双线统一反代（国内/国际通用；a_switch.py 一键反代部署的就是它）
 ├── A-SWITCH.spec / tools/ / assets/   PyInstaller 打包配置、邮件辅助脚本、图标
@@ -470,7 +476,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 
 **`workbuddy/` 需要自备**：该目录不进版本库（`*.exe` 与上游 Go 源码都不提交），但属于本项目的 Release 资产——把 Release 里的 `workbuddy-manager-v1.0.79/upstream/`（含源码快照、MIT 许可、`UPSTREAM-SRC.txt` 的构建与打包说明）解压到仓库根，或只把 `wb2api.exe`、`wb2api-login.exe` 放进 `workbuddy/workbuddy-manager-v1.0.79/upstream/` 即可。该目录同时是开发态的 wb2api 工作目录（`config.json` 就在它旁边）；打包版改用 `~/.workbuddy-gateway/` 当工作目录并自动播种配置。
 
-运行时数据（自动生成，均带敏感信息，不入库）：`~/.autoclaw-relay/`（部署的反代、persona、日志、Qoder/千问办公的出口 Key `qoder-realm-keys.json`）、`~/.openclaw-autoclaw/`（凭证源）、`~/.trae-relay/`（Trae 日志与会话转储）、`~/.doubao-relay/`（豆包 cookie、固定会话、日志）、`~/.comate-relay/`（Comate 日志与设备指纹）、`~/.qoder-relay/`（Qoder/千问办公账号池与网关日志，含真实令牌，绝不外传）、`~/.zcode/v2/provider_config.json`（ZCode 注册，备份为 `.bak-autoclaw`）。
+运行时数据（自动生成，均带敏感信息，不入库）：`~/.autoclaw-relay/`（部署的反代、persona、日志、控制台生成的入站钥 `inbound-keys.json`（0600）、Qoder/千问办公的出口 Key `qoder-realm-keys.json`）、`~/.openclaw-autoclaw/`（凭证源）、`~/.trae-relay/`（Trae 日志与会话转储）、`~/.doubao-relay/`（豆包 cookie、固定会话、日志）、`~/.comate-relay/`（Comate 日志与设备指纹）、`~/.qoder-relay/`（Qoder/千问办公账号池与网关日志，含真实令牌，绝不外传）、`~/.zcode/v2/provider_config.json`（ZCode 注册，备份为 `.bak-autoclaw`）。
 
 ## 免责声明
 

@@ -54,4 +54,8 @@ footer { padding: 10px 22px; color: var(--dim); font-size: 11px; border-top: 1px
 .keyrow .kzcode { flex: none; font-size: 11px; }
 .keyrow .kzcode.match { color: var(--ok); }
 .keyrow .kzcode.mismatch { color: var(--err); }
+.keyrow .kzcode.stale { color: var(--warn); }
 .keyrow .kzcode.none { color: var(--dim); }
+.keyrow .kgen { flex: none; font-size: 11px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 5px; background: #20242e; color: var(--fg); cursor: pointer; }
+.keyrow .kgen:hover { border-color: var(--accent); color: var(--accent); }
+.keyrow .kgen:disabled { opacity: .55; cursor: default; }
