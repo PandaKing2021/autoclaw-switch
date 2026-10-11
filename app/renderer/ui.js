@@ -353,6 +353,50 @@ $("btn-zcheck").onclick = async () => {
   } catch (e) { $("zcheck-note").textContent = "❌ 异常：" + e.message; }
   btn.disabled = false;
 };
+
+// --- 入站 api_key 卡片：钥匙盘点渲染 + 点击复制 + 鉴权体检 ---
+async function refreshKeys() {
+  try {
+    const r = await window.api.keysQuery();
+    if (!r.ok) { $("keys-list").textContent = "盘点失败：" + (r.error || "?"); return; }
+    $("keys-list").innerHTML = r.links.map((l) => l.keys.map((k, i) => {
+      const z = l.zcode || {};
+      const zc = z.registered == null ? '<span class="kzcode none" title="未注册进 ZCode 或配置不可读">未注册</span>'
+        : z.matches === true ? '<span class="kzcode match" title="与 ZCode 注册值一致">✓ 注册一致</span>'
+        : '<span class="kzcode mismatch" title="ZCode 注册值已和这里盘点的不一致——改过钥匙就重新点「一键注册」">✗ 注册不一致</span>';
+      return `<div class="keyrow"><span class="klabel">${l.label}${i > 0 ? "（备）" : ""}</span>`
+        + `<span class="kvalue" title="${l.label} · ${k.source}｜点击复制" data-copy="${k.value.replace(/"/g, "&quot;")}">${k.value}</span>${i === 0 ? zc : ""}</div>`;
+    }).join("")).join("");
+    document.querySelectorAll("#keys-list .kvalue").forEach((el) => {
+      el.onclick = async () => {
+        try { await navigator.clipboard.writeText(el.dataset.copy); el.title = "已复制 ✓（" + el.title; setTimeout(() => {}, 0); } catch { /* 无剪贴板权限时降级：用户可手动选中 */ }
+      };
+    });
+    setPill("keys-pill", "unknown", "已盘点");
+  } catch (e) { $("keys-list").textContent = "盘点异常：" + e.message; }
+}
+$("btn-keys-reload").onclick = async () => {
+  const btn = $("btn-keys-reload"); btn.disabled = true;
+  $("keys-pill").className = "pill unknown"; $("keys-pill").textContent = "盘点中…";
+  await refreshKeys();
+  btn.disabled = false;
+};
+$("btn-keys-probe").onclick = async () => {
+  const btn = $("btn-keys-probe"); btn.disabled = true;
+  setPill("keys-pill", "unknown", "体检中…");
+  $("keys-note").textContent = "鉴权体检中（每条链路两发探针：匿名必须 401，带钥越过闸门）…";
+  try {
+    const r = await window.api.keysProbe();
+    const lines = (r.probes || []).map((p) => `${p.ok ? "✓" : "✗"} ${p.label}：${p.detail}`
+      + `（匿名 ${p.anonStatus ?? "-"} / 带钥 ${p.keyProbeStatus ?? "-"}）`);
+    $("keys-note").textContent = (r.ok ? "✅ 七条链路闸门全部在岗、钥匙全部有效\n" : "⚠️ 有链路未达标\n") + lines.join("\n");
+    setPill("keys-pill", r.ok ? "ok" : "warn", r.ok ? "闸门正常" : "有未达标");
+  } catch (e) {
+    $("keys-note").textContent = "❌ 体检异常：" + e.message;
+    setPill("keys-pill", "err", "异常");
+  }
+  btn.disabled = false;
+};
 // 首次使用/冷启动：把“还没起来的服务”直接点名，并指向右上角的一键启动
 let startAllRan = false;
 function setBootNote(text) {
@@ -412,4 +456,5 @@ setInterval(refreshStatus, 3000);
 setInterval(() => { if ($("autorefresh").checked) refreshLog(); }, 3000);
 refreshStatus();
 refreshPoints();
+refreshKeys();
 refreshLog();

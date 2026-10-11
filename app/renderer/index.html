@@ -173,6 +173,24 @@
     </section>
 
     <section class="grid">
+      <!-- 入站 api_key（七条链路闸门的钥匙盘点 / 鉴权体检） -->
+      <div class="card">
+        <div class="card-head"><h2>入站 api_key</h2><span id="keys-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>闸门语义</label><span>模型路径必须带钥匙（否则 401），/health 豁免</span></div>
+          <div><label>生效位置</label><span class="mono">ZCode access.apiKey = 闸门钥匙</span></div>
+        </div>
+        <div class="sec">钥匙盘点（悬停看来源，点击复制）</div>
+        <div id="keys-list" class="keyslist">未加载</div>
+        <div class="btns">
+          <button id="btn-keys-probe" class="btn ok">鉴权体检</button>
+          <button id="btn-keys-reload" class="btn">重新盘点</button>
+        </div>
+        <div id="keys-note" class="note"></div>
+      </div>
+    </section>
+
+    <section class="grid">
       <!-- ZCode -->
       <div class="card">
         <div class="card-head"><h2>ZCode 供应商注册</h2><span id="zcode-pill" class="pill unknown">-</span></div>

@@ -1569,6 +1569,177 @@ function setupIpc() {
     return { ok: r.ok && Array.isArray(r.j?.choices) && r.j.choices.length > 0, status: r.status, reply, stop, model, available: models };
   });
 
+  // --- 入站 api_key（七条链路统一闸门的钥匙盘点 / 鉴权体检 / 轮换说明）---
+  // 盘点：每条链路 ZCode 注册用的钥匙值 + 来源。所有钥匙本就是明文落在本机
+  // （ZCode 的 provider_config.json、~/.autoclaw-relay/qoder-realm-keys.json），
+  // 这里只是把散在各处的值聚到一个视图里，不新增暴露面。
+  const KEY_INVENTORY = [
+    { id: "autoclaw", label: "AutoClaw", port: 18766, keys: () => {
+      const keys = [{ value: "autoclaw-local", source: "内置（闸门 & ZCode 注册）" }];
+      const t = process.env.AUTOCLAW_PROXY_TOKEN || "autoclaw-dsh";
+      if (t) keys.push({ value: String(t), source: "PROXY_TOKEN（dsh 共用）" });
+      if (process.env.AUTOCLAW_INBOUND_KEYS) for (const k of process.env.AUTOCLAW_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "AUTOCLAW_INBOUND_KEYS 轮换钥" });
+      return keys;
+    } },
+    { id: "workbuddy", label: "WorkBuddy", port: WB_PORT, keys: () => {
+      // wb2api 是上游 Go 二进制，只有 config.json 的 api_key 单钥，没有 env 追加通道；
+      // 轮换 = 改 ~/.workbuddy-gateway/config.json 的 api_key 后重启网关
+      const keys = [{ value: WB_API_KEY, source: "wb2api config.json api_key" }];
+      return keys;
+    } },
+    { id: "trae", label: "Trae", port: TRAE_PORT, keys: () => {
+      const keys = [{ value: TRAE_API_KEY, source: "内置（闸门 & ZCode 注册）" }];
+      if (process.env.TRAE_INBOUND_KEYS) for (const k of process.env.TRAE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "TRAE_INBOUND_KEYS 轮换钥" });
+      return keys;
+    } },
+    { id: "doubao", label: "豆包工作", port: DOUBAO_PORT, keys: () => {
+      const keys = [{ value: DOUBAO_API_KEY, source: "内置（闸门 & ZCode 注册）" }];
+      let fileKey = null;
+      try { fileKey = JSON.parse(fs.readFileSync(path.join(HOME, ".doubao-relay", "config.json"), "utf8")).key; } catch {}
+      if (fileKey && fileKey !== DOUBAO_API_KEY) keys.push({ value: String(fileKey), source: "~/.doubao-relay/config.json" });
+      if (process.env.DOUBAO_RELAY_KEY && process.env.DOUBAO_RELAY_KEY !== fileKey) keys.push({ value: process.env.DOUBAO_RELAY_KEY, source: "DOUBAO_RELAY_KEY 环境变量" });
+      if (process.env.DOUBAO_INBOUND_KEYS) for (const k of process.env.DOUBAO_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "DOUBAO_INBOUND_KEYS 轮换钥" });
+      return keys;
+    } },
+    { id: "comate", label: "Comate", port: COMATE_PORT, keys: () => {
+      const keys = [{ value: COMATE_API_KEY, source: "内置（闸门 & ZCode 注册）" }];
+      if (process.env.COMATE_RELAY_KEY) keys.push({ value: process.env.COMATE_RELAY_KEY, source: "COMATE_RELAY_KEY 环境变量" });
+      if (process.env.COMATE_INBOUND_KEYS) for (const k of process.env.COMATE_INBOUND_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) keys.push({ value: k, source: "COMATE_INBOUND_KEYS 轮换钥" });
+      return keys;
+    } },
+    { id: "qoder", label: "Qoder CN", port: QODER_PORT, keys: () => {
+      const k = qoderRealmKey("cn");
+      return [{ value: k || "qoder-local", source: k ? "出口 Key（~/.autoclaw-relay/qoder-realm-keys.json）" : "兜底 qoder-local（出口 Key 未生成）" }];
+    } },
+    { id: "qwenwork", label: "千问办公", port: QODER_PORT, keys: () => {
+      const k = qoderRealmKey("qworkcn");
+      return [{ value: k || "qwenwork-local", source: k ? "出口 Key（~/.autoclaw-relay/qoder-realm-keys.json）" : "兜底 qwenwork-local（出口 Key 未生成）" }];
+    } },
+  ];
+
+  handle("keys:query", async () => {
+    const cfgMatch = (() => {
+      // ZCode 注册值对账：access.apiKey 应与这里盘点的一致（不一致 = 注册后改过钥匙，需要重新注册）
+      try {
+        const cfg = JSON.parse(fs.readFileSync(ZCODE_CFG, "utf8"));
+        const rules = cfg?.config?.providerConfigRules?.providerRules || [];
+        const byId = new Map(rules.map((r) => [r.providerId, r?.config?.access?.apiKey || ""]));
+        const pairs = { autoclaw: PROVIDER_ID, workbuddy: WB_PROVIDER_ID, trae: TRAE_PROVIDER_ID, doubao: DOUBAO_PROVIDER_ID, comate: COMATE_PROVIDER_ID, qoder: QODER_PROVIDER_ID, qwenwork: QWENWORK_PROVIDER_ID };
+        const out = {};
+        for (const item of KEY_INVENTORY) {
+          const registered = byId.get(pairs[item.id]);
+          out[item.id] = { registered: registered || null, matches: registered ? item.keys().some((k) => k.value === registered) : null };
+        }
+        return out;
+      } catch { return {}; }
+    })();
+    return {
+      ok: true,
+      links: KEY_INVENTORY.map(({ id, label, port, keys }) => ({
+        id, label, port, keys: keys(), zcode: cfgMatch[id] || null,
+      })),
+    };
+  });
+
+  // 鉴权体检：每条链路两个探针——匿名打模型端点必须 401（闸门在岗），
+  // 带盘点钥匙再打必须不是 401 特征（钥匙被闸门认可）。判定只看状态码与
+  // 特征串，不消耗上游额度：401 的报文在闸门层就生成，业务路径拿到的任何
+  // 非闸门响应（200 目录 / 502 上游缺失 / 503）都算“越过闸门”。
+  async function keyProbe(link) {
+    const keys = link.keys();
+    const probe = (method, pathname, headers, timeoutMs = 12000) => new Promise((resolve) => {
+      const data = method === "POST" ? JSON.stringify({ model: "probe", max_tokens: 1, messages: [{ role: "user", content: "ping" }] }) : null;
+      const rq = http.request({
+        host: "127.0.0.1", port: link.port, path: pathname, method,
+        headers: { ...(data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}), ...headers },
+        timeout: timeoutMs,
+      }, (res) => {
+        let b = ""; res.on("data", (c) => (b += c));
+        res.on("end", () => resolve({ status: res.statusCode, body: b }));
+      });
+      rq.on("error", (e) => resolve({ status: 0, body: String(e.message) }));
+      rq.setTimeout(timeoutMs, () => { rq.destroy(); resolve({ status: -1, body: "timeout" }); });
+      if (data) rq.write(data); rq.end();
+    });
+    const GATE_MSG = "missing or invalid api key";
+    const gated = (r) => r.status === 401 && r.body.includes(GATE_MSG);
+    // 各家闸门管什么路径不一样：anthropic 系打 /v1/messages，openai 系打 /v1/models
+    const anthro = ["autoclaw", "comate"].includes(link.id) || link.id === "trae";
+    const path = anthro ? "/v1/messages" : "/v1/models";
+    const method = anthro ? "POST" : "GET";
+    const extra = link.id === "autoclaw" ? { "anthropic-version": "2023-06-01" } : {};
+    const anon = await probe(method, path, extra);
+    // wb2api 的 401 报文是 "missing or invalid API key"（大写 API），qoder 网关是 "invalid api key"——
+    // 两个特征都认；保险兜底：任何 401 都视为闸门在岗（闸门层报文 vs 上游 401 无法区分时宁可误报闸门开）
+    const gateOn = anon.status === 401;
+    // wb2api 只认 Authorization: Bearer（带 x-api-key 头反而被它拒），其余网关两种形状等价——
+    // 这里统一双头带钥，只有 workbuddy 单走 Bearer
+    const keyHeaders = link.id === "workbuddy"
+      ? { authorization: `Bearer ${keys[0].value}` }
+      : { "x-api-key": keys[0].value, authorization: `Bearer ${keys[0].value}` };
+    const withKey = keys.length ? await probe(method, path, { ...extra, ...keyHeaders }) : null;
+    // 带钥仍 401 且报文是闸门特征才算“钥匙被拦”：带钥后的 401 也可能来自上游
+    // （AutoClaw 欠费返回「云端上游 返回 401: Invalid token」、wb2api 转发上游 401），
+    // 那恰好证明请求已越过闸门，不该判钥匙无效。
+    const gateBody = (r) => r && r.status === 401
+      && (r.body.includes("missing or invalid api key")
+        || r.body.includes("missing or invalid API key")
+        || r.body.includes('"invalid api key"'));
+    const keyOk = withKey ? !gateBody(withKey) : false;
+    return {
+      id: link.id, label: link.label, port: link.port,
+      running: anon.status !== 0 && anon.status !== -1,
+      gate: anon.status === 0 ? "unreachable" : gateOn ? "on" : "off/legacy",
+      anonStatus: anon.status,
+      keyFirst: keys[0]?.value || "",
+      keyProbeStatus: withKey ? withKey.status : null,
+      ok: anon.status !== 0 && anon.status !== -1 && gateOn && keyOk,
+      detail: anon.status === 0 ? "网关未运行"
+        : !gateOn ? "匿名请求未被拦下（闸门关闭或旧代码）"
+        : !keyOk ? `带钥匙仍被闸门拦下（${withKey.status}）——盘点值与网关实际钥匙不一致`
+        : withKey && withKey.status === 401 ? "闸门在岗、钥匙有效（上游拒绝：账号欠费/登录态失效，见对应链路冒烟）"
+        : withKey && (withKey.status === 502 || withKey.status === 503) ? "闸门在岗、钥匙有效（上游不可达/未登录，见对应链路冒烟）"
+        : "闸门在岗且钥匙有效",
+    };
+  }
+
+  handle("keys:probe", async () => {
+    const probes = [];
+    for (const link of KEY_INVENTORY) {
+      try { probes.push(await keyProbe(link)); } catch (e) { probes.push({ id: link.id, label: link.label, ok: false, detail: String((e && e.message) || e) }); }
+    }
+    return { ok: probes.every((p) => p.ok), probes, at: new Date().toISOString() };
+  });
+
+  // 轮换：不做静默改钥（改钥 = 改 ZCode 注册值，两端必须同换），只报告可行的路径
+  handle("keys:rotate", async (_e, linkId, newKey) => {
+    const link = KEY_INVENTORY.find((l) => l.id === linkId);
+    if (!link) return { ok: false, error: `未知链路 ${linkId}（可选：${KEY_INVENTORY.map((l) => l.id).join("、")}）` };
+    if (linkId === "qoder" || linkId === "qwenwork") {
+      const realm = linkId === "qoder" ? "cn" : "qworkcn";
+      if (!newKey) return { ok: true, linkId, hint: "Qoder/千问办公的出口 Key 由控制台生成（qd-… 随机 36 位）。在网关看板（http://127.0.0.1:8791/dashboard）删掉 aswitch-" + realm + " 这条再点「一键注册」，控制台会生成新 Key 并重写 ZCode 注册值。" };
+      const store = readRealmKeys();
+      store[realm] = String(newKey).trim();
+      try { fs.writeFileSync(QODER_REALM_KEYS, JSON.stringify(store, null, 1), { mode: 0o600 }); } catch (e) { return { ok: false, error: `落盘失败：${e.message}` }; }
+      const ensure = await qoderEnsureRealmKeys();
+      queueZcodeSync({ upsert: [linkId] });
+      return ensure.ok ? { ok: true, linkId, rotated: true, note: "新 Key 已写网关并排队重注册（重启 ZCode 生效）" } : { ok: false, error: ensure.error };
+    }
+    if (!newKey) {
+      return {
+        ok: true, linkId,
+        hint: linkId === "comate"
+          ? "Comate：重启 relay 前设 COMATE_RELAY_KEY=新钥（或 COMATE_INBOUND_KEYS=旧钥,新钥 平滑并存），再在 ZCode 里更新注册值"
+          : linkId === "doubao"
+            ? "豆包：DOUBAO_RELAY_KEY=新钥（或写 ~/.doubao-relay/config.json 的 key），重启 relay 后在 ZCode 里更新注册值"
+            : linkId === "autoclaw"
+              ? "AutoClaw：AUTOCLAW_PROXY_TOKEN / AUTOCLAW_INBOUND_KEYS=逗号追加（旧钥并存），重启 relay 后在 ZCode 里更新注册值"
+              : `${link.label}：${link.id.toUpperCase()}_INBOUND_KEYS=旧钥,新钥 平滑并存，重启 relay 后在 ZCode 里更新注册值`,
+      };
+    }
+    return { ok: false, error: "env 型钥匙不支持控制台直改（改了 relay 不重启不生效）；请按提示用环境变量轮换，或用 Qoder 出口 Key 的看板流程" };
+  });
+
   handle("logs:tail", async (_e, which) => {
     if (which === "watch") return tailFile(WATCH_LOG, 120);
     if (which === "console") return tailFile(path.join(RELAY_DIR, "console.log"), 120);
@@ -1715,6 +1886,10 @@ app.whenReady().then(() => {
       prog(`zcode:check providers=${(zc.providers || []).map((p) => `${p.providerId}:${p.apiType || "none"}`).join(",")} manual=${zc.hasManualRules}`);
       await t("zcode:check", zc.ok === true && zc.hasManualRules === true && zc.modelRuleCount > 0);
       prog(`zcode:register detail backup=${rg.backup}`);
+      // 入站 api_key：全部活着的链路匿名必须 401、带盘点钥匙必须越过闸门（不消耗上游额度）
+      const kp = await invoke("keys:probe");
+      prog(`keys:probe ${(kp.probes || []).map((p) => `${p.label}:${p.ok ? "ok" : p.detail}`).join(" | ")}`);
+      await t("keys:probe", kp.ok === true);
       const l1 = await invoke("logs:tail", "relay");
       const l2 = await invoke("logs:tail", "watch");
       const l3 = await invoke("logs:tail", "trae");

@@ -13,7 +13,7 @@
 //     把历史拍平成一条消息发出去；上游的 conversation_id 只是传输草稿纸，
 //     不构成任何跨请求的隐藏状态。
 import { createServer } from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, existsSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -302,9 +302,28 @@ const readBody = (req) => new Promise((resolve, reject) => {
 });
 const sse = (res, event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
+// ---------------- 入站 api_key 闸门（2026-10-11 与 A/B 档对齐） ----------------
+// 原 checkKey 是明文 === 单钥比对；现在升级为常数时间多钥集合：内置
+// doubao-local-key（= 注册进 ZCode 的 access.apiKey）∪ DOUBAO_RELAY_KEY（env/文件）
+// ∪ DOUBAO_INBOUND_KEYS（逗号追加轮换），x-api-key 或 Authorization: Bearer 均可。
+// 默认开启；DOUBAO_INBOUND_AUTH=0 关闭（离线测试用）；/health、/admin/* 豁免
+// （豁免靠路由顺序：admin 分支在 checkKey 之前）。
+const INBOUND_AUTH = process.env.DOUBAO_INBOUND_AUTH !== "0";
+const INBOUND_KEYS = new Set(
+  ["doubao-local-key", RELAY_KEY]
+    .concat((process.env.DOUBAO_INBOUND_KEYS || "").split(","))
+    .map((s) => s.trim()).filter(Boolean),
+);
 function checkKey(req) {
-  const given = req.headers["x-api-key"] || String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  return given === RELAY_KEY;
+  if (!INBOUND_AUTH) return true;
+  const given = (req.headers["x-api-key"]
+    || String(req.headers.authorization || "").replace(/^Bearer\s+/i, "")).trim();
+  if (!given) return false;
+  for (const k of INBOUND_KEYS) {
+    const a = Buffer.from(given, "utf8"), b = Buffer.from(k, "utf8");
+    if (a.length === b.length && timingSafeEqual(a, b)) return true;
+  }
+  return false;
 }
 
 const resolveModel = (requested) => {
@@ -439,6 +458,13 @@ const server = createServer(async (req, res) => {
         models: MODELS.map((m) => m.id),
       });
     }
+    if (req.method === "POST" && url.pathname === "/admin/reload-cookies") {
+      loadCookies(true);
+      return json(res, 200, { ok: true, cookies: cookieHealth() });
+    }
+    // 入站闸门：/health 与 /admin/* 豁免（管理面），其余模型路径（含 /v1/models）
+    // 都要钥匙——与 A/B 档对齐，匿名模型目录也不再泄露
+    if (!checkKey(req)) return json(res, 401, { error: { message: "unauthorized: missing or invalid api key (x-api-key or Authorization: Bearer)" } });
     if (req.method === "GET" && url.pathname === "/v1/models") {
       return json(res, 200, {
         object: "list",
@@ -448,20 +474,6 @@ const server = createServer(async (req, res) => {
         })),
       });
     }
-    if (req.method === "POST" && url.pathname === "/admin/conversation") {
-      const b = await readBody(req);
-      state.conversationId = String(b.conversationId || "");
-      const cfg = { ...fileConfig, conversationId: state.conversationId };
-      mkdirSync(DIR, { recursive: true });
-      writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
-      log("conversation set to", state.conversationId || "(auto)");
-      return json(res, 200, { ok: true, conversationId: state.conversationId });
-    }
-    if (req.method === "POST" && url.pathname === "/admin/reload-cookies") {
-      loadCookies(true);
-      return json(res, 200, { ok: true, cookies: cookieHealth() });
-    }
-    if (!checkKey(req)) return json(res, 401, { error: { message: "invalid api key" } });
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") return handleChat(req, res);
     if (req.method === "POST" && url.pathname === "/v1/messages") return handleAnthropic(req, res);
     json(res, 404, { error: { message: "not found: " + url.pathname } });

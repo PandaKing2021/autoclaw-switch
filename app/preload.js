@@ -32,5 +32,8 @@ contextBridge.exposeInMainWorld("api", {
   qoderSmoke: () => ipcRenderer.invoke("qoder:smoke"),
   qoderSyncAccounts: () => ipcRenderer.invoke("qoder:sync-accounts"),
   qwenworkSmoke: () => ipcRenderer.invoke("qwenwork:smoke"),
+  keysQuery: () => ipcRenderer.invoke("keys:query"),
+  keysProbe: () => ipcRenderer.invoke("keys:probe"),
+  keysRotate: (linkId, newKey) => ipcRenderer.invoke("keys:rotate", linkId, newKey),
   tailLog: (which) => ipcRenderer.invoke("logs:tail", which),
 });

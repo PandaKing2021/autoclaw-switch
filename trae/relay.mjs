@@ -24,7 +24,7 @@
  *
  *   node relay.mjs [--port 18768] [--host 127.0.0.1]
  */
-import { createDecipheriv, createHash } from "node:crypto";
+import { createDecipheriv, createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -56,6 +56,31 @@ const STORAGE =
     "storage.json",
   );
 const AUTH_KEY = "iCubeAuthInfo://icube.cloudide";
+
+// ---------------- 入站 api_key 闸门（C 档反代，2026-10-11 补齐） ----------------
+// Trae 是 C 档（上游结构性无工具通道），但对外仍是标准 anthropic/openai 模型
+// 端点，此前完全无鉴权——本机任何进程都能匿名打推理。现在把注册进 ZCode 的
+// access.apiKey（trae-local-key）真正当成入站钥匙：/v1/models、/v1/chat/completions、
+// /v1/messages 必须带 x-api-key 或 Authorization: Bearer，常数时间比对。
+// /health 与 / 豁免（控制台 trae:start 起来就探活，不带钥匙）。
+// 默认开启；TRAE_INBOUND_AUTH=0 关闭；轮换：TRAE_INBOUND_KEYS=逗号追加多把并存。
+const INBOUND_AUTH = process.env.TRAE_INBOUND_AUTH !== "0";
+const INBOUND_KEYS = new Set(
+  ["trae-local-key"]
+    .concat((process.env.TRAE_INBOUND_KEYS || "").split(","))
+    .map((s) => s.trim()).filter(Boolean),
+);
+function inboundKeyOk(req) {
+  const given = (req.headers["x-api-key"]
+    || String(req.headers.authorization || "").replace(/^Bearer\s+/i, "")).trim();
+  if (!given) return false;
+  for (const k of INBOUND_KEYS) {
+    const a = Buffer.from(given, "utf8"), b = Buffer.from(k, "utf8");
+    if (a.length === b.length && timingSafeEqual(a, b)) return true;
+  }
+  return false;
+}
+const INBOUND_MODEL_PATHS = ["/v1/models", "/v1/chat/completions", "/v1/messages"];
 
 // ---------------------------------------------------------------- byteCrypto
 
@@ -624,6 +649,14 @@ const server = createServer(async (req, res) => {
         mode: "stateless",
         models,
       });
+    }
+    // 入站闸门：/health 与 / 之上的所有模型端点都要钥匙（OPTIONS 不经过本处理分支）
+    if (INBOUND_AUTH && INBOUND_MODEL_PATHS.includes(url.pathname) && !inboundKeyOk(req)) {
+      const isAnthropic = url.pathname === "/v1/messages";
+      const body = isAnthropic
+        ? { type: "error", error: { type: "authentication_error", message: "unauthorized: missing or invalid api key (x-api-key or Authorization: Bearer)" } }
+        : { error: { message: "unauthorized: missing or invalid api key (x-api-key or Authorization: Bearer)" } };
+      return json(res, 401, body);
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       const catalog = await listModels();
