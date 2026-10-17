@@ -17,6 +17,8 @@ function fmtExp(ts) {
   return `${d.toLocaleDateString()}（余 ${Math.floor(ms / 3600000)} 小时）`;
 }
 function setPill(id, cls, text) { const el = $(id); el.className = "pill " + cls; el.textContent = text; }
+/** HTML 转义：余额卡片用 innerHTML 渲染，上游文案（报错、昵称）里可能有 <>&"，不转义会被当标签吞掉 */
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
 /** 模型目录 chips：超过 12 个折叠成 +N；网关没起来时清单为空，计数显示 "-" */
 function renderModels(key, models) {
   const list = models || [];
@@ -196,13 +198,13 @@ async function refreshBalance() {
       const known = l.available === true;
       // 三种状态分清：有真实读数 / 上游根本没有额度接口 / 有接口但这次没拿到数
       const valueHtml = known
-        ? `<span class="bavalue">${l.value}</span><span class="baunit">${l.unit || ""}</span>`
+        ? `<span class="bavalue">${esc(l.value)}</span><span class="baunit">${esc(l.unit || "")}</span>`
         : l.noApi ? `<span class="bavalue">无接口</span>`
         : `<span class="bavalue">—</span>`;
-      const errHtml = l.error ? `<div class="baerr" title="${String(l.error).replace(/"/g, "&quot;")}">⚠️ ${l.error}</div>` : "";
+      const errHtml = l.error ? `<div class="baerr" title="${esc(l.error)}">⚠️ ${esc(l.error)}</div>` : "";
       return `<div class="barow ${known ? "known" : "unknown"}">`
-        + `<div class="batop"><span class="balabel">${l.label}</span>${valueHtml}</div>`
-        + (l.detail ? `<div class="badetail">${l.detail}</div>` : "") + errHtml + `</div>`;
+        + `<div class="batop"><span class="balabel">${esc(l.label)}</span>${valueHtml}</div>`
+        + (l.detail ? `<div class="badetail">${esc(l.detail)}</div>` : "") + errHtml + `</div>`;
     }).join("");
     const known = rows.filter((l) => l.available === true).length;
     const noApi = rows.filter((l) => l.noApi === true).length;
