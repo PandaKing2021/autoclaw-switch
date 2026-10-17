@@ -85,7 +85,8 @@ const RELAY_SRC = path.join(BRIDGE_DIR, "server_2x.mjs");   // relay 源码随�
 const CODEX_FRONT = path.join(BRIDGE_DIR, "codex_front.mjs");
 const CODEX_FRONT_PORT = CX.FRONT_PORT;                     // 18776（与 codex-config.js 的唯一口径一致）
 const CODEX_FRONT_LOG = path.join(RELAY_DIR, "codex-front.log");
-const CODEX_STATE = path.join(RELAY_DIR, "codex-state.json");   // 顶层键旧值快照（0600，runtime 数据不进仓库）
+// 顶层键旧值快照（0600，runtime 数据不进仓库）；自测会把它指到临时目录，免得动到用户真实快照
+const codexStatePath = () => process.env.ASWITCH_CODEX_STATE || path.join(RELAY_DIR, "codex-state.json");
 let codexFrontProc = null;
 /** config.toml 的落点：尊重 CODEX_HOME（Codex 自己的口径），没有就是 ~/.codex */
 const codexCfgPath = () => path.join(process.env.CODEX_HOME || path.join(HOME, ".codex"), "config.toml");
@@ -913,13 +914,102 @@ function setupIpc() {
     return { ok: true };
   });
 
-  handle("points:refresh", async () => {
+  /** AutoClaw 积分快照（points:refresh 与「余额总览」共用同一份解析口径） */
+  async function pointsSnapshot() {
     const r = await pythonOneShot(POINTS_SNIPPET);
     if (!r.ok && r.error) return { ok: false, error: r.error };   // python 缺失/超时等：直接说原因，别退化成“解析失败”
     try {
       const line = (r.out || "").trim().split("\n").filter((l) => l.startsWith("{")).pop();
       return JSON.parse(line || "{}");
     } catch { return { ok: false, error: r.err || r.out || "解析失败" }; }
+  }
+  handle("points:refresh", pointsSnapshot);
+
+  // ===================== 余额 / 额度总览 =====================
+  // 七条链路的「还能用多少」来源不一：AutoClaw 走 A-SWITCH 的积分接口，WorkBuddy 走
+  // wb2api /status，Qoder CN 与千问办公共用网关账号池的额度接口（要面板会话）。Comate
+  // 上游只回 license 有效性、Trae 的 183 个远程端点里没有计费、豆包是网页接口——这三条
+  // 没有额度接口，如实标注并把能拿到的登录态事实一并给出，不编造数字。
+  async function qoderPanelToken() {
+    const l = await qoderHttp("POST", "/panel/login", { password: QODER_PANEL_PASSWORD }, 10000);
+    return l.j?.token || "";
+  }
+
+  /** 一个出口（cn / qworkcn）的账号池额度汇总。实时刷新失败时上游仍回缓存额度，
+   *  所以有数字就照给，只把「这次实时刷新为什么失败」记进 error，别把缓存当实时。 */
+  async function qoderRealmBalance(realm) {
+    if (!qoderAlive()) return { ok: false, error: "网关未运行" };
+    const token = await qoderPanelToken();
+    if (!token) return { ok: false, error: "面板登录失败（默认密码 admin 被改过？在网关看板里改回）" };
+    const r = await qoderHttp("POST", "/accounts/credits", { realm }, 60000, { "X-Panel-Token": token });
+    const results = r.j?.results || [];
+    if (!results.length) return { ok: false, error: r.j?.error?.message || `账号池里没有 ${realm} 账号（点「同步账号」）` };
+    let remain = 0, size = 0, exceeded = false, updatedAt = 0, live = 0;
+    const plans = new Set();
+    let liveError = "";
+    for (const x of results) {
+      const c = x.credits || {};
+      if (c.remain != null) remain += Number(c.remain) || 0;
+      if (c.size != null) size += Number(c.size) || 0;
+      if (c.exceeded) exceeded = true;
+      if (c.updated_at) updatedAt = Math.max(updatedAt, Number(c.updated_at) || 0);
+      if (x.plan) plans.add(x.plan);
+      if (x.ok) live++; else if (x.error && !liveError) liveError = String(x.error).slice(0, 120);
+    }
+    return { ok: true, remain, size, accounts: results.length, live, exceeded, updatedAt, plans: [...plans], error: liveError };
+  }
+
+  handle("balance:all", async () => {
+    const [ac, wb, qd, qw, cm, tr, db] = await Promise.all([
+      pointsSnapshot().catch((e) => ({ ok: false, error: String((e && e.message) || e) })),
+      (async () => {
+        try {
+          const st = await wbHttp("GET", "/status");
+          const a = (st.j?.accounts || [])[0];
+          return a ? { ok: true, credits: a.credits, nickname: a.nickname || a.uid } : { ok: false, error: "无账号（WorkBuddy 未登录？）" };
+        } catch { return { ok: false, error: "网关未运行" }; }
+      })(),
+      qoderRealmBalance("cn").catch((e) => ({ ok: false, error: String((e && e.message) || e) })),
+      qoderRealmBalance("qworkcn").catch((e) => ({ ok: false, error: String((e && e.message) || e) })),
+      comateHealth().catch(() => ({ running: false, ok: false })),
+      traeHealth().catch(() => ({ running: false, ok: false })),
+      doubaoHealth().catch(() => ({ running: false, ok: false })),
+    ]);
+    const quotaRow = (id, label, q) => ({
+      id, label, unit: "额度", available: q.ok === true, noApi: false,
+      value: q.ok ? `${q.remain} / ${q.size}` : "",
+      detail: q.ok
+        ? `账号 ${q.accounts} 个（实时刷到 ${q.live}）｜套餐 ${q.plans.join("/") || "-"}｜额度更新于 ${q.updatedAt ? new Date(q.updatedAt * 1000).toLocaleString("zh-CN") : "-"}`
+        : "",
+      error: q.error || "",
+    });
+    return {
+      ok: true, at: new Date().toISOString(),
+      links: [
+        { id: "autoclaw", label: "AutoClaw", unit: "分", available: ac.ok === true && ac.total != null, noApi: false,
+          value: ac.total != null ? String(ac.total) : "",
+          detail: ac.ok
+            ? (ac.total != null
+              ? `账号 ${ac.nickname || ac.user_id || "-"}${Array.isArray(ac.wallets) ? `｜钱包 ${ac.wallets.length} 个` : ""}`
+              : `账号 ${ac.nickname || ac.user_id || "-"}｜上游没返回钱包（账号欠费或未开通）`)
+            : "A-SWITCH 积分接口（走本机 Python）",
+          error: ac.error || "" },
+        { id: "workbuddy", label: "WorkBuddy", unit: "分", available: wb.ok === true && wb.credits != null, noApi: false,
+          value: wb.credits != null ? String(wb.credits) : "",
+          detail: wb.ok ? `账号 ${wb.nickname}` : "wb2api /status", error: wb.error || "" },
+        quotaRow("qoder", "Qoder CN", qd),
+        quotaRow("qwenwork", "千问办公", qw),
+        { id: "comate", label: "Comate", unit: "", available: false, noApi: true, value: "",
+          detail: `上游无额度接口｜登录态 ${cm.credential || "未知"}｜模型 ${cm.models_cached ?? "-"} 个`,
+          error: cm.running ? "" : "网关未运行" },
+        { id: "trae", label: "Trae", unit: "", available: false, noApi: true, value: "",
+          detail: `上游无额度接口（183 个远程端点无计费）｜凭证 ${tr.credential?.ok ? "有效" : "失效"}${tr.credential?.expiresAt ? `（到期 ${String(tr.credential.expiresAt).slice(0, 10)}）` : ""}`,
+          error: tr.running ? "" : "网关未运行" },
+        { id: "doubao", label: "豆包工作", unit: "", available: false, noApi: true, value: "",
+          detail: `上游无额度接口（网页接口）｜登录态 ${db.cookies?.ok ? `有效（${db.cookies.count} 条 cookie）` : "缺失"}`,
+          error: db.running ? "" : "网关未运行" },
+      ],
+    };
   });
 
   // ===================== ZCode 动态增删（链路开→注册，链路关→注销） =====================
@@ -1796,7 +1886,7 @@ function setupIpc() {
     let r;
     try {
       r = CX.activate(codexCfgPath(), {
-        linkId, model, token: linkApiKey(linkId), statePath: CODEX_STATE,
+        linkId, model, token: linkApiKey(linkId), statePath: codexStatePath(),
         writeCatalog: opts.writeCatalog !== false, catalogModels: models,
         bundled: bundled.models.length ? bundled.models : null,
         contextWindow: opts.contextWindow, autoCompactLimit: opts.autoCompactLimit,
@@ -1821,7 +1911,7 @@ function setupIpc() {
   handle("codex:deregister", async (_e, linkId) => {
     if (!CX.linkOf(linkId)) return { ok: false, error: `未知链路 ${linkId}` };
     try {
-      const r = CX.deregister(codexCfgPath(), { linkId, statePath: CODEX_STATE });
+      const r = CX.deregister(codexCfgPath(), { linkId, statePath: codexStatePath() });
       return { ...r, report: CX.checkCodexConfig(codexCfgPath()) };
     } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
   });
@@ -2375,7 +2465,11 @@ app.whenReady().then(() => {
       let cxCopied = false;
       try { if (fs.existsSync(cxRealCfg)) { fs.copyFileSync(cxRealCfg, path.join(cxHome, "config.toml")); cxCopied = true; } } catch {}
       process.env.CODEX_HOME = cxHome;
+      process.env.ASWITCH_CODEX_STATE = path.join(cxHome, "codex-state.json");   // 快照也隔离，别动用户真实的
       const cxNorm = () => { try { const s = fs.readFileSync(codexCfgPath(), "utf8"); return s.trim() ? s : null; } catch { return null; } };
+      // fixture 是用户真实配置的副本，可能本身就带着我们的托管区（用户已把某条链路注册进 Codex）。
+      // 先摘一次把 fixture 归零——否则「注册→摘除」之后不可能跟带托管区的起点逐字节相等。
+      try { await invoke("codex:deregister", "workbuddy"); } catch {}
       const cxBefore = cxNorm();
       prog(`codex selftest home=${cxHome}（用户真实配置${cxCopied ? "已复制当 fixture" : "不存在"}，全程不碰原文件）`);
       const cx0 = await invoke("codex:status");
@@ -2400,11 +2494,17 @@ app.whenReady().then(() => {
       prog(`codex:deregister changed=${cxd.changed} restored=${cxd.restored} 目录已清=${cxd.catalogRemoved} 文件逐字节还原=${cxBefore === cxNorm()}`);
       await t("codex:deregister", cxd.ok === true && cxd.changed === true && cxd.restored === true && cxBefore === cxNorm());
       delete process.env.CODEX_HOME;   // 临时 home 用完就还回去，后面的 env:check 报真实路径
+      delete process.env.ASWITCH_CODEX_STATE;
       try { fs.rmSync(cxHome, { recursive: true, force: true }); } catch {}
       // 一键启动（此时各家都已在跑，应全部报“已在运行”）
       const all = await invoke("all:start");
       prog(`all:start ${(all.steps || []).map((s) => `${s.name}:${s.ok ? s.detail : s.detail}`).join(" | ")}`);
       await t("all:start", all.ok === true);
+      // 余额总览：七条链路一次拉齐（有额度接口的给真实读数，没有的标 noApi 并只给登录态）。
+      // 断言只看结构（7 行都在），数值本身随账号状态变，不作为通过条件。
+      const bal = await invoke("balance:all");
+      prog(`balance:all ${(bal.links || []).map((l) => `${l.label}:${l.available ? l.value + (l.unit || "") : (l.noApi ? "无接口" : "未取到")}`).join(" | ")}`);
+      await t("balance:all", bal.ok === true && Array.isArray(bal.links) && bal.links.length === 7);
       const rg = await invoke("zcode:register");
       prog(`zcode:register detail trae=${JSON.stringify(rg.trae).slice(0, 200)} workbuddy=${JSON.stringify(rg.workbuddy).slice(0, 120)} comate=${JSON.stringify(rg.comate).slice(0, 120)} qoder=${JSON.stringify(rg.qoder).slice(0, 120)} qwenwork=${JSON.stringify(rg.qwenwork).slice(0, 120)}`);
       await t("zcode:register", rg.ok === true && Array.isArray(rg.models) && rg.models.length >= 4);

@@ -182,6 +182,42 @@ async function refreshLog() {
   try { $("logview").textContent = await window.api.tailLog(currentLog); } catch {}
 }
 
+// --- 余额 / 额度总览：一次拉齐七条链路的「还能用多少」 ---
+// 有额度接口的（AutoClaw / WorkBuddy / Qoder / 千问办公）给真实数字并标绿；
+// 上游确实没有接口的（Comate / Trae / 豆包）如实标注为「无接口」并把登录态摆出来。
+async function refreshBalance() {
+  const btn = $("btn-balance-refresh"); btn.disabled = true;
+  setPill("balance-pill", "unknown", "查询中…");
+  $("balance-note").textContent = "正在向各链路查询余额（Qoder/千问办公要刷账号池额度，可能 10-30 秒）…";
+  try {
+    const r = await window.api.balanceAll();
+    const rows = r.links || [];
+    $("balance-list").innerHTML = rows.map((l) => {
+      const known = l.available === true;
+      // 三种状态分清：有真实读数 / 上游根本没有额度接口 / 有接口但这次没拿到数
+      const valueHtml = known
+        ? `<span class="bavalue">${l.value}</span><span class="baunit">${l.unit || ""}</span>`
+        : l.noApi ? `<span class="bavalue">无接口</span>`
+        : `<span class="bavalue">—</span>`;
+      const errHtml = l.error ? `<div class="baerr" title="${String(l.error).replace(/"/g, "&quot;")}">⚠️ ${l.error}</div>` : "";
+      return `<div class="barow ${known ? "known" : "unknown"}">`
+        + `<div class="batop"><span class="balabel">${l.label}</span>${valueHtml}</div>`
+        + (l.detail ? `<div class="badetail">${l.detail}</div>` : "") + errHtml + `</div>`;
+    }).join("");
+    const known = rows.filter((l) => l.available === true).length;
+    const noApi = rows.filter((l) => l.noApi === true).length;
+    const failed = rows.filter((l) => l.available !== true && l.noApi !== true).length;
+    setPill("balance-pill", failed ? "warn" : "ok", `${known}/${rows.length} 条有读数`);
+    $("balance-note").textContent = `${known} 条链路能拿到真实读数，${noApi} 条上游没有额度接口（如实标注，不编数字）`
+      + (failed ? `，${failed} 条有接口但这次没拿到数（见各行黄字）` : "")
+      + `｜查询于 ${new Date(r.at).toLocaleTimeString("zh-CN")}`;
+  } catch (e) {
+    setPill("balance-pill", "err", "查询失败");
+    $("balance-note").textContent = "❌ 查询异常：" + e.message;
+  }
+  btn.disabled = false;
+}
+
 // 绑定按钮
 $("btn-relay-start").onclick = async () => { $("btn-relay-start").disabled = true; await window.api.relayStart(); $("btn-relay-start").disabled = false; refreshStatus(); };
 $("btn-relay-stop").onclick = async () => { $("btn-relay-stop").disabled = true; await window.api.relayStop(); $("btn-relay-stop").disabled = false; refreshStatus(); };
@@ -194,6 +230,7 @@ $("btn-smoke").onclick = async () => {
   } catch (e) { $("smoke-result").textContent = "❌ 异常：" + e.message; }
   btn.disabled = false; refreshStatus();
 };
+$("btn-balance-refresh").onclick = refreshBalance;
 $("btn-points").onclick = refreshPoints;
 $("btn-sync").onclick = async () => {
   const btn = $("btn-sync"); btn.disabled = true;

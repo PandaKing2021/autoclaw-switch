@@ -91,8 +91,9 @@ npm start
 
 ## 桌面控制台（`app/`）
 
-Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + Codex CLI 接入卡片 + 日志 + 顶栏**：
+Electron 管理面板，**余额总览卡片 + 七张平台卡片 + ZCode 注册卡片 + Codex CLI 接入卡片 + 日志 + 顶栏**：
 
+- **余额 / 额度总览卡片**：七条链路的「还能用多少」集中一屏，点「刷新余额」现查一次（每条链路各自的上游接口，无出站定时轮询）。有额度接口的给真实读数——AutoClaw 积分（A-SWITCH 接口）、WorkBuddy 积分（wb2api `/status`）、Qoder CN 与千问办公（网关账号池额度，要面板会话；实时刷新失败时显示上次成功缓存）；Comate / Trae / 豆包工作上游确实没有额度接口（Comate 只回 license 有效性、Trae 的 183 个远程端点无计费、豆包是网页接口），卡片如实标「无接口」并只给能拿到的登录态事实，不编造数字
 - **AutoClaw 平台卡片**：运行状态 / 上游通道 / 运行时长 / 模型别名；启动、停止、连通性测试（真实推理）
 - **账号卡片**（同一行的第二块）：积分余额与即将过期（CN 网关按需查询）、token 剩余有效期、凭证同步器状态与启停
 - **WorkBuddy 网关卡片**：网关状态 / 积分 / 账号 / 模型目录；启动、停止、连通性测试
@@ -112,14 +113,14 @@ Electron 管理面板，**七张平台卡片 + ZCode 注册卡片 + Codex CLI �
 
 ```
 cd app && npm start                     # 启动（等价于 npx electron .）
-ASWITCH_SELFTEST=1 npx electron .       # 38 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + Codex 链路七项 + 体检 + 闸门断言 + 生成钥 + 标准钥别名 + 七链路鉴权体检 + 日志 + relay 停复）
+ASWITCH_SELFTEST=1 npx electron .       # 39 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + Codex 链路七项 + 余额总览 + 体检 + 闸门断言 + 生成钥 + 标准钥别名 + 七链路鉴权体检 + 日志 + relay 停复）
 ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # 只跑指定处理器（带参数写 keys:generate=trae，`=` 后按 `=` 再拆，如 keys:alias=trae=sk-xxx=add）
 node app/test_zcode_config.js           # 配置写入闸门的沙箱回归测试（合成 fixture，19 条用例）
 node app/test_inbound_keys.js           # 「生成 api_key」钥存储/生成器 + 标准钥别名的纯净回归（34 条用例）
 node test_model_catalog.mjs             # 模型命名一致性检查（离线 11 条；--live 连同在跑的网关一起验）
 ```
 
-自测覆盖：`env:check` 体检、`status:query`、`points:refresh`、`credential:sync`、同步器启停、七家的 `*:smoke`（真实推理/真实响应，不是探活）、`comate:tool-loop`（读 `/health` 断言这版 relay 自报工具循环——不花额度就能认出"跑着旧代码的 relay"）、`all:start`、`zcode:register`（含逐家断言 `zcode:register:*`）、`zcode:realm-keys`（两把出口 Key 是否就位）、`zcode:register:未被闸门拦下`（写入真被接受）、`zcode:check`、`keys:generate`（生成新钥端到端：写档 → 重启 → 盘点换位）、`keys:alias`（加一把 sk- 标准钥 → 带它打 `/v1/messages` 越过闸门 → 撤销）、`keys:probe`、`logs:tail`、`relay:stop/start`（失联与恢复）。结果落盘在 `~/.autoclaw-relay/selftest-result.txt`（含逐项通过与否），同目录的 `selftest-progress.txt` 是过程日志。**从 exe 跑全量自测时看不到 stdout**——Electron 是 GUI 子系统进程，重定向到文件也是空的，直接读那个 JSON 结果文件即可。
+自测覆盖：`env:check` 体检、`status:query`、`points:refresh`、`credential:sync`、同步器启停、七家的 `*:smoke`（真实推理/真实响应，不是探活）、`comate:tool-loop`（读 `/health` 断言这版 relay 自报工具循环——不花额度就能认出"跑着旧代码的 relay"）、`all:start`、`balance:all`（余额总览：七行结构齐全，数值随账号状态变、不作断言）、`zcode:register`（含逐家断言 `zcode:register:*`）、`zcode:realm-keys`（两把出口 Key 是否就位）、`zcode:register:未被闸门拦下`（写入真被接受）、`zcode:check`、`keys:generate`（生成新钥端到端：写档 → 重启 → 盘点换位）、`keys:alias`（加一把 sk- 标准钥 → 带它打 `/v1/messages` 越过闸门 → 撤销）、`keys:probe`、`logs:tail`、`relay:stop/start`（失联与恢复）。结果落盘在 `~/.autoclaw-relay/selftest-result.txt`（含逐项通过与否），同目录的 `selftest-progress.txt` 是过程日志。**从 exe 跑全量自测时看不到 stdout**——Electron 是 GUI 子系统进程，重定向到文件也是空的，直接读那个 JSON 结果文件即可。
 
 两个注意点：① 全量自测会重启 relay（`relay:stop/start` 两项就是在验这个），改单个按钮时用定向自测；定向自测必须同时给 `ASWITCH_SELFTEST=1` 和 `ASWITCH_SELFTEST_ONLY=...`，只给后者不触发。② 改完 `app/main.js` 或 `preload.js` 必须重启 electron 进程——运行中的窗口不会热更新，打包版还要重新打包重装。
 
@@ -389,13 +390,13 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 
 **标准钥（sk- 形·别名映射，2026-10-11 起）**：只认 `sk-` 开头钥匙的标准工具（DeepSeek Harness、Codex、OpenAI SDK 系）用首位「生成」拿到的主钥会被它们"看着别扭"（有些客户端/网关会做形状校验），但主钥又不能随便改成 `sk-` 形（ZCode 注册值跟着变，且和平台前缀约定冲突）。所以卡片给每条 env 型链路加了一个「sk 钥」按钮：点开留空回车即现场生成一把 `sk-<平台前缀>-<36 位 hex>`（也可粘贴你自己的 `sk-xxx`），登记进 `inbound-keys.json` 的顶层保留键 `_aliases`（形状 `{ "<链路>": ["sk-…"] }`，与扁平主钥互不干扰、旧档案完全兼容），随后自动重启该链路把「主钥 ∪ 别名」一并吃进闸门集合。**别名只进闸门，不改 ZCode 注册值**（ZCode 侧仍是主钥）——所以加/删别名都不需要重注册，也不影响 ZCode；别名在盘点里单列一行（左侧绿边、标签「（sk）」），点「✕」即从档案移除并重启、立刻失效（撤销语义）。手动用法等价于往档案里加一条并重启 relay：`Authorization: Bearer sk-tr-…`（或 `x-api-key`）。目前只覆盖四条 env 型链路——WorkBuddy 是 Go 二进制单钥、Qoder/千问办公是网关侧出口 Key，都要 sk- 形就直接用「生成」/`keys:rotate` 把主钥设成 `sk-` 形值（`keys:rotate` 接受任意合法形状，包括 `sk-xxx`）。
 
-控制台「入站 api_key」卡片把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账：✓ 注册一致 / ✗ 注册不一致 / ◇ 注册为备用钥 / 未注册 四态），首行「生成」按钮一键换新钥（生成 → 重启该链路 → 切 ZCode 注册值，见上），「sk 钥」按钮加/撤标准钥别名（见上），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:generate` / `keys:probe` / `keys:rotate` / `keys:alias` 五个通道；`keys:generate`、`keys:alias`（含撤销）与 `keys:probe` 同时进了全量自测（第 32-35 项）。
+控制台「入站 api_key」卡片把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账：✓ 注册一致 / ✗ 注册不一致 / ◇ 注册为备用钥 / 未注册 四态），首行「生成」按钮一键换新钥（生成 → 重启该链路 → 切 ZCode 注册值，见上），「sk 钥」按钮加/撤标准钥别名（见上），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:generate` / `keys:probe` / `keys:rotate` / `keys:alias` 五个通道；`keys:generate`、`keys:alias`（含撤销）与 `keys:probe` 同时进了全量自测（第 33-36 项）。
 
 闸门回归：`node test_inbound_key.mjs`（零出站 67 条：401/放行判别式、双头形状、OPTIONS 204、`/health` 豁免、轮换钥、关闭开关、非环回监听下新旧两套鉴权并存、trae 三端点全拦、doubao 目录端点入闸 + `/admin` 豁免、四条 env 链路的「生成」存储钥越过闸门且与内置钥并存、标准钥别名越过闸门（双头形状）、别家链路的别名不串门、删掉别名重启后即失效、旧格式档案无 `_aliases` 照常工作）。生成器与存储模块另有 `node app/test_inbound_keys.js`（34 条：随机钥形状/平台前缀、非法值拒绝、存储读写与损坏兜底、别名的增删/去重/宽容读、主钥与别名两条写路径互不吞噬、以及"四家 relay 源码确实读这个文件与 `_aliases`"的漂移守门）。
 
 ### 控制台 / 自测
 
-`ASWITCH_SELFTEST=1 npx electron .` 顺序执行各 IPC 处理器（等同逐个点按钮），`ASWITCH_SELFTEST_ONLY="keys:probe"` 可单跑指定通道。38 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + **Codex 链路七项**（体检 / 起前门 / 目录预览 / 注册 / 复检 / 冒烟 / 摘除后逐字节还原，在临时 `CODEX_HOME` 上跑、不碰真实 `~/.codex`）+ 体检 + 入站闸门断言 + 日志 + relay 停复）——其中 `keys:generate`（生成新钥端到端：生成 → 重启 → 复测 → 盘点换位）是第 32 项，`keys:alias`（加一把 sk- 标准钥 → 带它打 `/v1/messages` 越过闸门且主钥不变）第 33 项，`keys:alias:remove`（撤销）第 34 项，`keys:probe`（七链路鉴权体检）第 35 项。
+`ASWITCH_SELFTEST=1 npx electron .` 顺序执行各 IPC 处理器（等同逐个点按钮），`ASWITCH_SELFTEST_ONLY="keys:probe"` 可单跑指定通道。39 项功能自检（七家连通性 + 七家注册 + Comate 工具循环能力 + **Codex 链路七项**（体检 / 起前门 / 目录预览 / 注册 / 复检 / 冒烟 / 摘除后逐字节还原，在临时 `CODEX_HOME` 上跑、不碰真实 `~/.codex`）+ 余额总览 + 体检 + 入站闸门断言 + 日志 + relay 停复）——其中 `keys:generate`（生成新钥端到端：生成 → 重启 → 复测 → 盘点换位）是第 33 项，`keys:alias`（加一把 sk- 标准钥 → 带它打 `/v1/messages` 越过闸门且主钥不变）第 34 项，`keys:alias:remove`（撤销）第 35 项，`keys:probe`（七链路鉴权体检）第 36 项。
 
 回归测试：`node trae/test_relay.mjs`（openai/anthropic × 流式/非流式 + 多轮，全部走"每请求新建会话 + 全量历史"路径）、`node trae/test_robust.mjs`（system/tools 兼容、不同会话的上游会话互相独立、多轮记忆靠全量重发历史实现）、`node doubao/test-relay.mjs`（豆包 openai/anthropic × 流式/非流式）、`node doubao/test-zcode-shape.mjs`（带 `tools`/`stream_options` 的 ZCode 形状请求 + 多轮）、`node comate/test_relay.mjs`（Comate 工具循环契约，34 条：帧→工具调用拼装、参数逐段累加、续跑路由表、两种协议的消息归一化、工具名映射与 schema 过滤，全部离线）、`node comate/test_stream.mjs`（**假上游集成测试，6 条**：本地冒充 comate.baidu.com 推真 SSE，验证"内容分片数 == 上游帧数"（真流式而非切片回放）、思维链在两种协议下成型、续跑回到同一 conversation+task、内部工具不下发、上游不支持流式时降级 —— 不联网不耗额度）、`node app/test_zcode_config.js`（配置写入闸门，19 条）、`node app/test_inbound_keys.js`（生成钥存储与生成器 + 标准钥别名，34 条）、`node test_inbound_key.mjs`（入站 api_key 闸门，零出站 67 条）、`node test_model_catalog.mjs`（模型命名一致性：离线 11 条，`--live` 连网关一起验）、`python qoder/_test_qoder.py` / `python qoder/_test_leak_guard.py`（vendored 网关自带）、`python bridge/test_extract_persona.py`（persona 提取的沙箱回归：合成 bundle 上的依赖排序、自检拦截、过期三分支，不依赖真实客户端）。**Codex 接入的离线回归**：`node app/test_codex_config.js`（config.toml 托管区四道闸门 + 目录合并，21 条）、`node bridge/test_responses_transform.mjs`（Responses⇄Chat 变换层穷举：工具/推理/用量/压缩回合，88 条）、`node bridge/test_codex_front.mjs`（前门路由与透传，6 条）、`node comate/test_responses.mjs`（Comate 原生 `/v1/responses` 与工具续跑，10 条）、`node comate/test_codex_shell.mjs`（上游工具词汇→Codex shell 词汇翻译，14 条）、`node comate/test_codex_shell_win.mjs`（Windows 落盘动作的沙箱真跑，5 条），全部离线；真机闭环则 `node bridge/test_codex_e2e.mjs [链路]`（注册 → `codex exec` 真跑工具循环 → 摘除还原，`CODEX_HOME` 沙箱隔离；2026-10-11 实测：comate / workbuddy / trae / 豆包 / 千问办公通过，qoder 因上游当日额度、autoclaw 因桌面端未启动受阻）。Comate 的真机多跳工具循环另有 `COMATE_E2E=1 node comate/e2e_tool_loop.mjs`（真跑工具、消耗额度，默认跳过），单条链路的流式打点见 `node comate/probe_stream.mjs`（同样耗额度、手动跑，输出每帧到达时间）；Qoder/千问的端到端验证走控制台的「连通性测试」按钮（真实推理，不是探活），也就是自测里的 `qoder:smoke` / `qwenwork:smoke`。
 

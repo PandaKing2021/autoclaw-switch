@@ -9,6 +9,8 @@ contextBridge.exposeInMainWorld("api", {
   watcherStart: () => ipcRenderer.invoke("watcher:start"),
   watcherStop: () => ipcRenderer.invoke("watcher:stop"),
   refreshPoints: () => ipcRenderer.invoke("points:refresh"),
+  // 余额总览：七条链路的「还能用多少」一次拉齐（有额度接口的给数字，没有的如实标注）
+  balanceAll: () => ipcRenderer.invoke("balance:all"),
   registerZcode: () => ipcRenderer.invoke("zcode:register"),
   zcodeCheck: () => ipcRenderer.invoke("zcode:check"),
   // Codex CLI 接入：config.toml 的托管区读写（app/codex-config.js）+ 前门翻译层（bridge/codex_front.mjs）

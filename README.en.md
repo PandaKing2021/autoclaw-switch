@@ -93,8 +93,9 @@ Cold-start is handled: the relay's runtime files are prepared automatically — 
 
 ## Desktop console (`app/`)
 
-An Electron panel: **seven platform cards + a ZCode registration card + a Codex CLI card + a log viewer + top bar**.
+An Electron panel: **balance overview card + seven platform cards + a ZCode registration card + a Codex CLI card + a log viewer + top bar**.
 
+- **Balance / quota overview card** — the "how much is left" of all seven links on one screen; click **Refresh balance** to query on demand (each link's own upstream API, no outbound polling). Links with a quota API give a real reading: AutoClaw points (A-SWITCH API), WorkBuddy credits (wb2api `/status`), Qoder CN and QwenWork CN (gateway account-pool quota, needs a panel session; when the live refresh fails it shows the last successful cache). Comate / Trae / Doubao Work genuinely have no upstream quota API (Comate only returns license validity, Trae's 183 remote endpoints carry no billing, Doubao is a web API), so the card honestly labels them "no API" and shows only the login-state facts it can get — it never invents numbers.
 - **AutoClaw card** — status / upstream route / uptime / model aliases; start, stop, connectivity test (a real inference).
 - **Account card** (same row) — points balance and expiring amount (queried on demand), token expiry, credential-watcher state and start/stop.
 - **WorkBuddy card** — gateway status / credits / account / model catalog; start, stop, connectivity test.
@@ -114,7 +115,7 @@ Closing the window does not stop the background services (relays, gateways and t
 
 ```
 cd app && npm start                     # equal to: npx electron .
-ASWITCH_SELFTEST=1 npx electron .       # 38-case functional self-test (7 connectivity + 7 registrations + Comate tool-loop capability + 7 Codex cases + env check + gate assertions + key generation/aliases + auth probe + logs + relay stop/start)
+ASWITCH_SELFTEST=1 npx electron .       # 39-case functional self-test (7 connectivity + 7 registrations + Comate tool-loop capability + 7 Codex cases + balance overview + env check + gate assertions + key generation/aliases + auth probe + logs + relay stop/start)
 ASWITCH_SELFTEST=1 ASWITCH_SELFTEST_ONLY="zcode:register" npx electron .   # run a single handler
 node app/test_zcode_config.js           # sandbox regression test for the config-write gate (synthetic fixtures, 19 cases)
 node app/test_codex_config.js           # Codex config.toml managed-section gate (synthetic fixtures, 21 cases)
@@ -122,7 +123,7 @@ node bridge/test_responses_transform.mjs # Responses<->Chat transform, exhaustiv
 node test_model_catalog.mjs             # model-naming consistency check (11 offline cases; --live also verifies running gateways)
 ```
 
-The self-test covers `env:check`, `status:query`, `points:refresh`, `credential:sync`, watcher stop/start, all seven `*:smoke` handlers (real inference, not liveness pings), the seven Codex cases (status / front door / catalog / register / re-check / smoke / deregister with byte-exact restore, run against a temporary `CODEX_HOME`), `comate:tool-loop` (reads `/health` to assert this relay build reports its tool loop — it recognizes a relay still running old code without spending credits), `all:start`, `zcode:register` (with per-provider assertions), `zcode:realm-keys`, `zcode:register:未被闸门拦下`, `zcode:check`, `logs:tail` and `relay:stop/start`. Results are written to `~/.autoclaw-relay/selftest-result.txt` (per-case pass/fail); `selftest-progress.txt` next to it is the running log. **Running the full self-test from the exe produces no stdout** — Electron is a GUI-subsystem process there, so read that JSON file instead. Two caveats: the full run restarts the relay (that is what the two relay cases assert), and editing `app/main.js` or `preload.js` requires restarting the Electron process — a running window never hot-reloads.
+The self-test covers `env:check`, `status:query`, `points:refresh`, `credential:sync`, watcher stop/start, all seven `*:smoke` handlers (real inference, not liveness pings), the seven Codex cases (status / front door / catalog / register / re-check / smoke / deregister with byte-exact restore, run against a temporary `CODEX_HOME`), `comate:tool-loop` (reads `/health` to assert this relay build reports its tool loop — it recognizes a relay still running old code without spending credits), `all:start`, `balance:all` (balance overview: seven rows structurally complete, values track account state and are not asserted), `zcode:register` (with per-provider assertions), `zcode:realm-keys`, `zcode:register:未被闸门拦下`, `zcode:check`, `logs:tail` and `relay:stop/start`. Results are written to `~/.autoclaw-relay/selftest-result.txt` (per-case pass/fail); `selftest-progress.txt` next to it is the running log. **Running the full self-test from the exe produces no stdout** — Electron is a GUI-subsystem process there, so read that JSON file instead. Two caveats: the full run restarts the relay (that is what the two relay cases assert), and editing `app/main.js` or `preload.js` requires restarting the Electron process — a running window never hot-reloads.
 
 ## Per-link notes
 

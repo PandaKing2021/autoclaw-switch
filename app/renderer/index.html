@@ -20,6 +20,22 @@
 
   <main>
     <section class="grid">
+      <!-- 余额 / 额度总览：七条链路的「还能用多少」集中一屏。有额度接口的给真实数字，
+           上游确实没有接口的（Comate / Trae / 豆包）如实标注并把登录态摆出来，不编数字。 -->
+      <div class="card">
+        <div class="card-head"><h2>余额 / 额度总览</h2><span id="balance-pill" class="pill unknown">-</span></div>
+        <div class="kv">
+          <div><label>统计口径</label><span>点「刷新余额」现查一次（每条链路各自的上游接口，无出站定时轮询）；Qoder/千问办公实时刷新失败时显示的是上次成功缓存</span></div>
+        </div>
+        <div id="balance-list" class="ballist">点「刷新余额」加载</div>
+        <div class="btns">
+          <button id="btn-balance-refresh" class="btn ok">刷新余额</button>
+        </div>
+        <div id="balance-note" class="note"></div>
+      </div>
+    </section>
+
+    <section class="grid">
       <!-- AutoClaw -->
       <div class="card" id="card-relay">
         <div class="card-head"><h2>AutoClaw 平台</h2><span id="relay-pill" class="pill unknown">-</span></div>
