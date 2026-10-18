@@ -17,6 +17,19 @@ function fmtExp(ts) {
   return `${d.toLocaleDateString()}（余 ${Math.floor(ms / 3600000)} 小时）`;
 }
 function setPill(id, cls, text) { const el = $(id); el.className = "pill " + cls; el.textContent = text; }
+/** 同一份平台状态在三个地方露出：页面药丸、侧栏状态点、总览磁贴状态字 */
+function setDot(key, cls) {
+  for (const p of ["nav-dot-", "ov-dot-"]) {
+    const el = $(p + key);
+    if (el) el.className = "dot " + cls;
+  }
+}
+function mark(key, cls, text) {
+  setPill(key + "-pill", cls, text);
+  setDot(key, cls);
+  const ov = $("ov-state-" + key);
+  if (ov) { ov.className = "ovstate " + cls; ov.textContent = text; }
+}
 /** HTML 转义：余额卡片用 innerHTML 渲染，上游文案（报错、昵称）里可能有 <>&"，不转义会被当标签吞掉 */
 function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
 /** 模型目录 chips：超过 12 个折叠成 +N；网关没起来时清单为空，计数显示 "-" */
@@ -28,13 +41,16 @@ function renderModels(key, models) {
     (list.length > 12 ? `<span>+${list.length - 12}</span>` : "");
 }
 
+let statusBusy = false;
 async function refreshStatus() {
+  if (statusBusy) return;   // 状态查询可能超过 3 秒轮询间隔：上一发没回来就跳过这一拍，避免请求堆积
+  statusBusy = true;
   try {
     const s = await window.api.queryStatus();
     // relay
     const relayOk = s.relay.running && s.relay.ok;
     const msLeftPill = s.token.exp * 1000 - Date.now();
-    setPill("relay-pill", relayOk && msLeftPill > 0 ? "ok" : relayOk ? "warn" : "err",
+    mark("relay", relayOk && msLeftPill > 0 ? "ok" : relayOk ? "warn" : "err",
       relayOk ? (msLeftPill > 0 ? "运行中" : "Token过期") : s.relay.running ? "异常" : "已停止");
     $("relay-status").textContent = relayOk ? `ok（${s.relay.status}）` : s.relay.running ? "无上游" : "未运行";
     $("relay-upstream").textContent = s.relay.upstream || "-";
@@ -43,7 +59,7 @@ async function refreshStatus() {
 
     // workbuddy
     const wbOk = s.workbuddy.running && s.workbuddy.ok;
-    setPill("wb-pill", wbOk ? "ok" : s.workbuddy.running ? "warn" : "err",
+    mark("wb", wbOk ? "ok" : s.workbuddy.running ? "warn" : "err",
       wbOk ? "运行中" : s.workbuddy.running ? "异常" : "已停止");
     $("wb-status").textContent = wbOk ? "ok" : s.workbuddy.running ? "无上游" : "未运行";
     $("wb-credits").textContent = s.workbuddy.account ? `${s.workbuddy.account.credits} 分` : "-";
@@ -54,7 +70,7 @@ async function refreshStatus() {
 
     // trae（网关自带凭证解密与会话池，控制台只做展示）
     const tr = s.trae || { running: false, ok: false };
-    setPill("trae-pill", tr.running && tr.ok ? "ok" : tr.running ? "warn" : "err",
+    mark("trae", tr.running && tr.ok ? "ok" : tr.running ? "warn" : "err",
       tr.running && tr.ok ? "运行中" : tr.running ? "凭证异常" : "已停止");
     $("trae-status").textContent = tr.ok ? "ok" : tr.running ? "无上游/凭证失效" : "未运行";
     $("trae-account").textContent = tr.credential?.account || (tr.credential?.userId ? String(tr.credential.userId) : "-");
@@ -69,7 +85,7 @@ async function refreshStatus() {
     // 豆包工作（登录态是客户端 cookie 快照，relay 不依赖客户端常驻）
     const db = s.doubao || { running: false, ok: false };
     const dbCookieOk = !!db.cookies?.ok;
-    setPill("doubao-pill", db.running && db.ok ? "ok" : db.running ? "warn" : "err",
+    mark("doubao", db.running && db.ok ? "ok" : db.running ? "warn" : "err",
       db.running && db.ok ? "运行中" : db.running ? "登录态异常" : "已停止");
     $("doubao-status").textContent = db.ok ? "ok" : db.running ? "cookie 失效/缺失" : "未运行";
     $("doubao-cookies").textContent = db.cookies
@@ -83,7 +99,7 @@ async function refreshStatus() {
 
     // Comate（登录态 = IDE settings.json 的 license，relay 运行时自读）
     const cm = s.comate || { running: false, ok: false };
-    setPill("comate-pill", cm.running && cm.ok ? "ok" : cm.running ? "warn" : "err",
+    mark("comate", cm.running && cm.ok ? "ok" : cm.running ? "warn" : "err",
       cm.running && cm.ok ? "运行中" : cm.running ? "登录态缺失" : "已停止");
     $("comate-status").textContent = cm.ok ? "ok" : cm.running ? "未登录 Comate IDE" : "未运行";
     $("comate-cred").textContent = cm.credential || "-";
@@ -98,7 +114,7 @@ async function refreshStatus() {
 
     // Qoder CN（账号池来自桌面凭证导入）
     const qd = s.qoder || { running: false, ok: false };
-    setPill("qoder-pill", qd.running && qd.ok ? "ok" : qd.running ? "warn" : "err",
+    mark("qoder", qd.running && qd.ok ? "ok" : qd.running ? "warn" : "err",
       qd.running && qd.ok ? "运行中" : qd.running ? "账号池为空" : "已停止");
     $("qoder-status").textContent = qd.ok ? "ok" : qd.running ? "待同步账号" : "未运行";
     $("qoder-accounts").textContent = qd.running ? `${qd.accounts ?? "-"} 个（可用 ${qd.ready ?? "-"}）` : "-";
@@ -106,7 +122,7 @@ async function refreshStatus() {
 
     // 千问办公（与 Qoder 同一网关进程，qworkcn 出口）
     const qw = s.qwenwork || { running: false, ok: false };
-    setPill("qwenwork-pill", qw.running && qw.ok ? "ok" : qw.running ? "warn" : "err",
+    mark("qwenwork", qw.running && qw.ok ? "ok" : qw.running ? "warn" : "err",
       qw.running && qw.ok ? "运行中" : qw.running ? "账号池为空" : "未运行");
     $("qwenwork-status").textContent = qw.ok ? "ok" : qw.running ? "待同步账号" : "未运行";
     $("qwenwork-accounts").textContent = qw.running ? String(qw.accounts ?? "-") : "-";
@@ -121,6 +137,7 @@ async function refreshStatus() {
     const zc = s.zcode;
     const zcOk = zc.registered && zc.enabled && zc.inOrder;
     setPill("zcode-pill", zcOk ? "ok" : "err", zcOk ? "已注册" : "未注册");
+    setDot("zcode", zcOk ? "ok" : "err");
     // 动态增删的最近一次同步结果（链路开→注册 / 链路关→注销）一并露出
     const zs = zc.zcodeSync;
     let zsTxt = "";
@@ -147,9 +164,11 @@ async function refreshStatus() {
     const cx = s.codex || {};
     const cxRegs = (cx.providers || []).length;
     const cxCur = (cx.providers || []).find((p) => p.providerId === cx.current);
-    setPill("codex-pill", cx.current ? "ok" : cxRegs ? "warn" : "unknown",
+    const cxCls = cx.current ? "ok" : cxRegs ? "warn" : "unknown";
+    setPill("codex-pill", cxCls,
       cx.current ? `当前：${String(cxCur?.name || cx.current).replace("A-SWITCH ", "")}`
         : cxRegs ? `已注册 ${cxRegs} 条·未指向` : cx.frontRunning ? "前门在跑·未接入" : "未接入");
+    setDot("codex", cxCls);
 
 
     // overall
@@ -157,8 +176,12 @@ async function refreshStatus() {
     const msLeft2 = s.token.exp * 1000 - Date.now();
     const all = relayOk && zcOk && msLeft2 > 6 * 3600000;
     setPill("overall", all ? "ok" : "warn", all ? "链路正常" : "部分异常");
+    setDot("overview", all ? "ok" : "warn");
   } catch (e) {
     setPill("overall", "err", "状态获取失败");
+    setDot("overview", "err");
+  } finally {
+    statusBusy = false;
   }
 }
 
@@ -188,7 +211,8 @@ async function refreshLog() {
 // 有额度接口的（AutoClaw / WorkBuddy / Qoder / 千问办公）给真实数字并标绿；
 // 上游确实没有接口的（Comate / Trae / 豆包）如实标注为「无接口」并把登录态摆出来。
 async function refreshBalance() {
-  const btn = $("btn-balance-refresh"); btn.disabled = true;
+  const btns = document.querySelectorAll(".btn-bal-refresh");
+  btns.forEach((b) => { b.disabled = true; });
   setPill("balance-pill", "unknown", "查询中…");
   $("balance-note").textContent = "正在向各链路查询余额（Qoder/千问办公要刷账号池额度，可能 10-30 秒）…";
   try {
@@ -206,6 +230,18 @@ async function refreshBalance() {
         + `<div class="batop"><span class="balabel">${esc(l.label)}</span>${valueHtml}</div>`
         + (l.detail ? `<div class="badetail">${esc(l.detail)}</div>` : "") + errHtml + `</div>`;
     }).join("");
+    // Qoder / 千问办公页面上的紧凑额度条：同一次查询的数据，不再单独发请求
+    for (const l of rows) {
+      const v = $("bal-" + l.id), d = $("bal-detail-" + l.id);
+      if (v) {
+        v.classList.toggle("unknown", l.available !== true);
+        v.textContent = l.available === true
+          ? `${l.value}${l.unit ? " " + l.unit : ""}`
+          : l.noApi ? "无接口" : "—";
+        v.title = l.error || "";
+      }
+      if (d) { d.textContent = l.detail || (l.error ? "⚠️ " + l.error : ""); d.title = l.error || l.detail || ""; }
+    }
     const known = rows.filter((l) => l.available === true).length;
     const noApi = rows.filter((l) => l.noApi === true).length;
     const failed = rows.filter((l) => l.available !== true && l.noApi !== true).length;
@@ -217,7 +253,7 @@ async function refreshBalance() {
     setPill("balance-pill", "err", "查询失败");
     $("balance-note").textContent = "❌ 查询异常：" + e.message;
   }
-  btn.disabled = false;
+  btns.forEach((b) => { b.disabled = false; });
 }
 
 // 绑定按钮
@@ -232,7 +268,7 @@ $("btn-smoke").onclick = async () => {
   } catch (e) { $("smoke-result").textContent = "❌ 异常：" + e.message; }
   btn.disabled = false; refreshStatus();
 };
-$("btn-balance-refresh").onclick = refreshBalance;
+document.querySelectorAll(".btn-bal-refresh").forEach((b) => { b.onclick = refreshBalance; });
 $("btn-points").onclick = refreshPoints;
 $("btn-sync").onclick = async () => {
   const btn = $("btn-sync"); btn.disabled = true;
@@ -555,7 +591,7 @@ $("btn-codex-front-stop").onclick = () => codexAct("btn-codex-front-stop", "停�
 async function refreshKeys() {
   try {
     const r = await window.api.keysQuery();
-    if (!r.ok) { $("keys-list").textContent = "盘点失败：" + (r.error || "?"); return; }
+    if (!r.ok) { $("keys-list").textContent = "盘点失败：" + (r.error || "?"); setDot("keys", "err"); return; }
     $("keys-list").innerHTML = r.links.map((l) => l.keys.map((k, i) => {
       const z = l.zcode || {};
       const zc = z.registered == null ? '<span class="kzcode none" title="未注册进 ZCode 或配置不可读">未注册</span>'
@@ -651,8 +687,11 @@ async function refreshKeys() {
         setPill("keys-pill", code, pill);
       };
     });
+    const mismatch = r.links.some((l) => l.zcode && l.zcode.matches === false);
+    const allKnown = r.links.every((l) => l.zcode && l.zcode.registered != null);
+    setDot("keys", mismatch ? "warn" : allKnown ? "ok" : "unknown");
     setPill("keys-pill", "unknown", "已盘点");
-  } catch (e) { $("keys-list").textContent = "盘点异常：" + e.message; }
+  } catch (e) { $("keys-list").textContent = "盘点异常：" + e.message; setDot("keys", "err"); }
 }
 $("btn-keys-reload").onclick = async () => {
   const btn = $("btn-keys-reload"); btn.disabled = true;
@@ -722,14 +761,33 @@ $("btn-startall").onclick = async () => {
   btn.disabled = false; refreshStatus();
 };
 
-document.querySelectorAll(".tab").forEach((t) => {
-  t.onclick = () => {
-    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
-    t.classList.add("active");
-    currentLog = t.dataset.log;
-    refreshLog();
-  };
+// --- 按平台分页：侧栏 / 总览磁贴 / 各平台页里的日志快捷入口 ---
+const VIEW_KEY = "aswitch.console.view";
+function showView(name) {
+  const view = $("view-" + name) || $("view-overview");
+  const id = view.id.slice(5);
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v === view));
+  document.querySelectorAll(".navitem").forEach((n) => n.classList.toggle("active", n.dataset.view === id));
+  try { localStorage.setItem(VIEW_KEY, id); } catch {}
+  $("views").scrollTop = 0;
+}
+function activateLogTab(name) {
+  const tab = document.querySelector(`.tab[data-log="${name}"]`);
+  if (!tab) return;
+  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x === tab));
+  currentLog = name;
+  refreshLog();
+}
+document.querySelectorAll(".navitem, .ovtile").forEach((n) => {
+  n.onclick = () => showView(n.dataset.view);
 });
+document.querySelectorAll(".tab").forEach((t) => { t.onclick = () => activateLogTab(t.dataset.log); });
+document.querySelectorAll("[data-logview]").forEach((b) => {
+  b.onclick = () => { showView("logs"); activateLogTab(b.dataset.logview); };
+});
+let savedView = "overview";
+try { savedView = localStorage.getItem(VIEW_KEY) || "overview"; } catch {}
+showView(savedView);
 
 setInterval(refreshStatus, 3000);
 setInterval(() => { if ($("autorefresh").checked) refreshLog(); }, 3000);

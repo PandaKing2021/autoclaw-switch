@@ -22,7 +22,7 @@
 
 Qoder CN 与千问办公共用 `8791` 这**一个**网关进程（同一份账号池、同一套 COSY 签名），ZCode 侧靠**绑定出口的 API Key** 分成两个并列供应商（ZCode 的供应商配置没有自定义请求头字段，绑 Key 是官方设计的出口选择方式）：控制台注册时会自己生成两把 Key 写进网关并**保持入站鉴权开启**（`/v1` 全部路径要带 Key，`/health` 等探针豁免），Key 兼具"出口选择 + 入站钥匙"双重身份。
 
-除 ZCode 之外，**七条链路现在也都能接 Codex CLI**——Codex 0.100+ 的 `wire_api` 只认 Responses API，能原生讲 `/v1/responses` 的链路（AutoClaw / Comate / Qoder CN / 千问办公）直连，只讲 chat completions 的（WorkBuddy / Trae / 豆包）走控制台监管的前门 `bridge/codex_front.mjs`（:18776）翻译；控制台新增的 Codex 卡片负责起停前门、注册 `~/.codex/config.toml` 的托管区与目录合并，详见 [Codex CLI 接入](#codex-cli-接入responses-api)。
+除 ZCode 之外，**七条链路现在也都能接 Codex CLI**——Codex 0.100+ 的 `wire_api` 只认 Responses API，能原生讲 `/v1/responses` 的链路（AutoClaw / Comate / Qoder CN / 千问办公）直连，只讲 chat completions 的（WorkBuddy / Trae / 豆包）走控制台监管的前门 `bridge/codex_front.mjs`（:18776）翻译；控制台新增的 Codex CLI 页负责起停前门、注册 `~/.codex/config.toml` 的托管区与目录合并，详见 [Codex CLI 接入](#codex-cli-接入responses-api)。
 
 ## 这是什么 / 不是什么
 
@@ -79,32 +79,32 @@ npm start
 |------|---|---|
 | Node.js 18+ | 启动 AutoClaw 反代、Trae 网关、豆包网关、Comate 网关 | 对应「启动」按钮报「relay 需要 Node.js 在 PATH 中」；exe 版自带兜底运行时（PATH → AutoClaw 自带 node → 控制台自身） |
 | Python 3.10+ 且 `pip install cryptography` | 一键注册 / 余额查询 / 凭证同步（加载 `a_switch.py`，仓库根或 `autoclaw-switch/` 下均可） | 按钮报「未找到可执行文件：python」；缺 cryptography 时同步器 spawn 成功但立刻崩，症状是「点了没反应」 |
-| Python 3.9+（纯标准库，无需 cryptography） | 启动 Qoder CN / 千问办公网关（`qoder/qoder_proxy.py`） | Qoder 卡片报「未找到 qoder/qoder_proxy.py」或启动即崩；与上一行用的是同一个 `python` |
+| Python 3.9+（纯标准库，无需 cryptography） | 启动 Qoder CN / 千问办公网关（`qoder/qoder_proxy.py`） | Qoder 页报「未找到 qoder/qoder_proxy.py」或启动即崩；与上一行用的是同一个 `python` |
 | AutoClaw 桌面端已登录 | 反代的凭证来源（2.x 走 `%APPDATA%\AutoClaw-official\`） | 反代能起但没有上游可用 |
 | ZCode 已安装并运行过一次 | 「一键注册」的落点 `~/.zcode/v2/provider_config.json` | 提示先装 ZCode 再来注册 |
-| Trae SOLO CN 已登录 | Trae 网关凭证（离线解密其登录态） | Trae 卡片显示未启动 |
-| 豆包工作已登录 | 豆包网关凭证（CDP 取 cookie。首次需点一次「重启客户端并同步」，之后可只点「同步登录态」） | 卡片显示 cookie 缺失，启动后请求 401 |
-| Comate（文心快码）IDE 已登录 | Comate 网关凭证（读 `%APPDATA%\Comate\User\settings.json` 里的 `baidu.comate.license`，重新登录后无需重启 relay） | Comate 卡片显示未启动 / 请求 401 |
+| Trae SOLO CN 已登录 | Trae 网关凭证（离线解密其登录态） | Trae 页显示未启动 |
+| 豆包工作已登录 | 豆包网关凭证（CDP 取 cookie。首次需点一次「重启客户端并同步」，之后可只点「同步登录态」） | 页面显示 cookie 缺失，启动后请求 401 |
+| Comate（文心快码）IDE 已登录 | Comate 网关凭证（读 `%APPDATA%\Comate\User\settings.json` 里的 `baidu.comate.license`，重新登录后无需重启 relay） | Comate 页显示未启动 / 请求 401 |
 | Qoder CN 桌面端已登录 | Qoder CN 出口的凭证来源（`%APPDATA%\com.qodercn.app.stable\auth.v1.dat`），控制台「同步账号」入池 | 该出口报 `no usable account for realm` |
 | 千问办公（QwenWorkCN）已登录 | 千问办公出口的凭证来源（`%APPDATA%\QwenWorkCN\auth-v2.dat`），同一次「同步账号」一并导入 | 千问办公出口取不到模型、请求 503 `Model catalog unavailable` |
-| `wb2api.exe` | WorkBuddy 网关本体 | 卡片报缺文件；exe 与源码都不入库，随本项目 **Release** 分发（解压到 `workbuddy/workbuddy-manager-v1.0.79/upstream/`，见目录结构一节） |
+| `wb2api.exe` | WorkBuddy 网关本体 | 页面报缺文件；exe 与源码都不入库，随本项目 **Release** 分发（解压到 `workbuddy/workbuddy-manager-v1.0.79/upstream/`，见目录结构一节） |
 
 ## 桌面控制台（`app/`）
 
-Electron 管理面板，**余额总览卡片 + 七张平台卡片 + ZCode 注册卡片 + Codex CLI 接入卡片 + 日志 + 顶栏**：
+Electron 管理面板，**左侧按平台分类的导航 + 12 个分页视图 + 顶栏**：侧栏分「平台」（总览 + 七个平台各一页）、「接入」（ZCode / Codex CLI / 入站 api_key）、「诊断」（日志）三组，每个平台导航项都带实时状态点；所有页面常驻 DOM、只切换显隐，顶栏与 3 秒状态轮询对全部页面持续生效，当前页记在 `localStorage`，重开仍停在上次的位置。
 
-- **余额 / 额度总览卡片**：七条链路的「还能用多少」集中一屏，点「刷新余额」现查一次（每条链路各自的上游接口，无出站定时轮询）。有额度接口的给真实读数——AutoClaw 积分（A-SWITCH 接口）、WorkBuddy 积分（wb2api `/status`）、Qoder CN 与千问办公（网关账号池额度，要面板会话；实时刷新失败时显示上次成功缓存）；Comate / Trae / 豆包工作上游确实没有额度接口（Comate 只回 license 有效性、Trae 的 183 个远程端点无计费、豆包是网页接口），卡片如实标「无接口」并只给能拿到的登录态事实，不编造数字
-- **AutoClaw 平台卡片**：运行状态 / 上游通道 / 运行时长 / 模型别名；启动、停止、连通性测试（真实推理）
-- **账号卡片**（同一行的第二块）：积分余额与即将过期（CN 网关按需查询）、token 剩余有效期、凭证同步器状态与启停
-- **WorkBuddy 网关卡片**：网关状态 / 积分 / 账号 / 模型目录；启动、停止、连通性测试
-- **Trae 平台卡片**：网关状态 / 账号 / 凭证到期 / 运行模式（无状态）/ 模型目录；启动、停止、连通性测试
-- **豆包工作卡片**：网关状态 / cookie 健康度 / 固定会话（仅作传输通道）/ 运行模式（无状态）/ 模型目录；启动、停止、连通性测试、**同步登录态**、**重启客户端并同步**
-- **Comate 文心快码卡片**：网关状态 / 登录态（license）/ 运行模式（无状态 + 工具循环：会话续跑，含路由表条数）/ 模型目录；启动、停止、连通性测试
-- **Qoder CN 卡片**：网关状态 / 账号池（可用数）/ 出口（`cn`）/ 监听 / 模型目录（只列账号可用的）；启动、停止、连通性测试、**同步账号**
-- **千问办公卡片**：与 Qoder CN **同一个网关进程的另一个出口**（卡片上标 `出口 qworkcn (qwenwork.cn)` 与共用端口）；模型目录只显示 `qwork` 场景里那三个；同样的四个按钮（启停/连通性测试/同步账号）
-- **Codex CLI 接入卡片**：Codex CLI 版本 / 配置文件 / 当前指向 / 已注册链路 / 前门（:18776）/ Codex 自带目录条目数六项状态，加链路一览（七条各自的接法与档位）；注册（写托管区 + 合并模型目录）、摘除（只删托管区、顶层键还原）、目录预览、冒烟（发一发真实 Responses 请求，不是探活）、前门启停、体检
-- **ZCode 供应商注册卡片**：注册状态（含最近一次动态同步的增删结果）/ 七家接入地址与模型数 / 模型清单 / 一键注册（全量刷新模型目录）/ **配置体检**（只读检查 `provider_config.json` 的枚举与必需字段）
-- **日志查看器**：`relay` / 同步器 / WorkBuddy / Trae / 豆包工作 / Comate / Qoder / Codex / 控制台**九个页签**，自动刷新
+- **总览页**：七块平台状态方块（状态随轮询实时更新，点击直达对应平台页）+ 余额 / 额度总览卡片：七条链路的「还能用多少」集中一屏，点「刷新余额」现查一次（每条链路各自的上游接口，无出站定时轮询）。有额度接口的给真实读数——AutoClaw 积分（A-SWITCH 接口）、WorkBuddy 积分（wb2api `/status`）、Qoder CN 与千问办公（网关账号池额度，要面板会话；实时刷新失败时显示上次成功缓存）；Comate / Trae / 豆包工作上游确实没有额度接口（Comate 只回 license 有效性、Trae 的 183 个远程端点无计费、豆包是网页接口），卡片如实标「无接口」并只给能拿到的登录态事实，不编造数字
+- **AutoClaw 页**：运行状态 / 上游通道 / 运行时长 / 模型别名；账号、积分余额与即将过期（CN 网关按需查询）、token 剩余有效期、凭证同步器状态与启停都在同页；启动、停止、连通性测试（真实推理）
+- **WorkBuddy 页**：网关状态 / 积分 / 账号 / 模型目录；启动、停止、连通性测试
+- **Trae 页**：网关状态 / 账号 / 凭证到期 / 运行模式（无状态）/ 模型目录；启动、停止、连通性测试
+- **豆包工作页**：网关状态 / cookie 健康度 / 固定会话（仅作传输通道）/ 运行模式（无状态）/ 模型目录；启动、停止、连通性测试、**同步登录态**、**重启客户端并同步**
+- **Comate 文心快码页**：网关状态 / 登录态（license）/ 运行模式（无状态 + 工具循环：会话续跑，含路由表条数）/ 模型目录；启动、停止、连通性测试
+- **Qoder CN 页**：网关状态 / 账号池（可用数）/ 出口（`cn`）/ 监听 / 模型目录（只列账号可用的）+ 页内额度条；启动、停止、连通性测试、**同步账号**
+- **千问办公页**：与 Qoder CN **同一个网关进程的另一个出口**（页内标 `出口 qworkcn (qwenwork.cn)` 与共用端口）；模型目录只显示 `qwork` 场景里那三个；同样的四个按钮（启停/连通性测试/同步账号）与页内额度条
+- **ZCode 页**：注册状态（含最近一次动态同步的增删结果）/ 七家接入地址与模型数 / 模型清单 / 一键注册（全量刷新模型目录）/ **配置体检**（只读检查 `provider_config.json` 的枚举与必需字段）
+- **Codex CLI 页**：Codex CLI 版本 / 配置文件 / 当前指向 / 已注册链路 / 前门（:18776）/ Codex 自带目录条目数六项状态，加链路一览（七条各自的接法与档位）；注册（写托管区 + 合并模型目录）、摘除（只删托管区、顶层键还原）、目录预览、冒烟（发一发真实 Responses 请求，不是探活）、前门启停、体检
+- **入站 api_key 页**：七条链路钥匙盘点（点击复制、与 ZCode 注册值对账）、逐行「生成」、标准钥别名、鉴权体检
+- **日志页**：`relay` / 同步器 / WorkBuddy / Trae / 豆包工作 / Comate / Qoder / Codex / 控制台**九个页签**，自动刷新；各平台页的「日志」按钮直接跳到对应页签
 - **顶栏**：**一键启动全部**（按依赖顺序拉起各家网关与同步器，某项缺前置只影响它自己，失败时自动把体检结果摆出来）与**环境体检**
 
 环境体检逐项探测：Node 运行时、Python、`cryptography`、七家的网关源码与运行时文件、A-SWITCH 后端（`a_switch.py`，一键注册/余额/凭证同步的加载对象）、七家的登录态（AutoClaw 凭证 / Trae storage.json / 豆包 cookie / Comate settings.json / Qoder `auth.v1.dat` / 千问 `auth-v2.dat`）、ZCode 配置，每项都带"缺了会怎样 + 怎么补"。
@@ -247,7 +247,7 @@ Qoder CN（`D:\Qoder CN`，`com.qodercn.app.stable`）与千问办公（QwenWork
 
 ## Codex CLI 接入（Responses API）
 
-Codex CLI 0.100+ 的 `wire_api` **只认 `"responses"`**（`chat` 已从二进制里删掉），而七条链路里只有四条原生讲 `/v1/responses`。接入分两档，全部由控制台新增的「Codex CLI 接入」卡片托管：
+Codex CLI 0.100+ 的 `wire_api` **只认 `"responses"`**（`chat` 已从二进制里删掉），而七条链路里只有四条原生讲 `/v1/responses`。接入分两档，全部由控制台新增的「Codex CLI 接入」页托管：
 
 | 链路 | Codex base_url | 接法 | 档位 |
 |---|---|---|---|
@@ -276,7 +276,7 @@ ZCode 里能看到哪个供应商 = 对应平台链路此刻开启。这是控�
 - **停止**某个平台 → 该供应商自动从 ZCode 摘除（Qoder CN 与千问办公共用一个网关进程，同开同关）；
 - **控制台启动时对账**：活着的链路补注册、已停的链路摘除（后台串行执行，不阻塞窗口；自测模式下跳过）。
 
-实现与安全边界：同步逻辑与「一键注册」共用同一套注册素材构建器与写入路径（`app/main.js` 的 `platformCatalogs()` / `applyPlatformReg()`），永远走 `writeZcodeConfig` 的四道闸门；「删」的半边由 `zcode-config.js` 的 `removeProviders()` 完成——只摘除自己注册的供应商在 `providerRules` / `providerModelRules` / `providerOrder` 三处的条目，别的供应商一根毫毛不动；有意删除的结构路径必须用 `removedProviderAllowPaths()` 生成白名单放行，否则会被自己的"结构不得丢失"闸门整单拒绝（这条行为有 H2/H4 用例盯着）。同步是串行队列（一条 promise 链），任意时刻只有一个同步在跑；结果记录在 `lastZcodeSync`，ZCode 卡片上直接显示「同步 10-07 23:55（+comate -trae）」这样的增删摘要。
+实现与安全边界：同步逻辑与「一键注册」共用同一套注册素材构建器与写入路径（`app/main.js` 的 `platformCatalogs()` / `applyPlatformReg()`），永远走 `writeZcodeConfig` 的四道闸门；「删」的半边由 `zcode-config.js` 的 `removeProviders()` 完成——只摘除自己注册的供应商在 `providerRules` / `providerModelRules` / `providerOrder` 三处的条目，别的供应商一根毫毛不动；有意删除的结构路径必须用 `removedProviderAllowPaths()` 生成白名单放行，否则会被自己的"结构不得丢失"闸门整单拒绝（这条行为有 H2/H4 用例盯着）。同步是串行队列（一条 promise 链），任意时刻只有一个同步在跑；结果记录在 `lastZcodeSync`，ZCode 页上直接显示「同步 10-07 23:55（+comate -trae）」这样的增删摘要。
 
 注意语义边界：**这里同步的是"开关"**，不是"健康"。你点了启动（哪怕该平台登录态过期、请求会 401），供应商就会出现在 ZCode 里；你点了停止，它就消失。网关崩溃不会自动摘除——那是故障，不是你的选择。
 
@@ -386,11 +386,11 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 | WorkBuddy `:7863` | wb2api 原生 `api_key`（config.json，`wb-local-key`） | —（Go 二进制单钥，改 config 后重启） | config.json 置空 |
 | Qoder/千问 `:8791` | 两把出口 Key（`~/.autoclaw-relay/qoder-realm-keys.json`，绑 Key 即选出口） | 面板 API Keys 页 | 面板 `auth_disabled` |
 
-**生成 api_key（控制台「入站 api_key」卡片，2026-10-11 起）**：每行首位的「生成」按钮为本链路造一把随机新钥（形如 `tr-<36 位 hex>`，前缀区分平台），走的是**加钥**而不是换锁：新钥落盘 `~/.autoclaw-relay/inbound-keys.json`（0600，运行时数据不入库），随即自动重启该链路让它读到新钥，再把 ZCode 注册值切到新钥——**内置兜底钥不会被撤销**（它是 relay 源码里的常量，控制台无权删），只是从"主"降为"备"，闸门对「存储钥 ∪ 内置钥 ∪ env 轮换钥」一并放行。四条 env 型链路（AutoClaw/Trae/豆包/Comate）启动时读上述存储文件；WorkBuddy 是 Go 二进制单钥，生成即改写 wb2api 的 `config.json` 并重启网关；Qoder/千问办公按「出口 Key」分流，生成会重导一把出口 Key（写本地明文 → 写网关 → 重注册）——这两家不能多钥并存。生成后立即生效的前提是链路由控制台托管，`node xxx/relay.mjs` 手拉起的那份不吃即时重启，重启一次即跟随；随后点「一键注册」（或重启 ZCode）让客户端读新注册值。「重新盘点」即会看到新钥升到首位、内置钥标「备」。
+**生成 api_key（控制台「入站 api_key」页，2026-10-11 起）**：每行首位的「生成」按钮为本链路造一把随机新钥（形如 `tr-<36 位 hex>`，前缀区分平台），走的是**加钥**而不是换锁：新钥落盘 `~/.autoclaw-relay/inbound-keys.json`（0600，运行时数据不入库），随即自动重启该链路让它读到新钥，再把 ZCode 注册值切到新钥——**内置兜底钥不会被撤销**（它是 relay 源码里的常量，控制台无权删），只是从"主"降为"备"，闸门对「存储钥 ∪ 内置钥 ∪ env 轮换钥」一并放行。四条 env 型链路（AutoClaw/Trae/豆包/Comate）启动时读上述存储文件；WorkBuddy 是 Go 二进制单钥，生成即改写 wb2api 的 `config.json` 并重启网关；Qoder/千问办公按「出口 Key」分流，生成会重导一把出口 Key（写本地明文 → 写网关 → 重注册）——这两家不能多钥并存。生成后立即生效的前提是链路由控制台托管，`node xxx/relay.mjs` 手拉起的那份不吃即时重启，重启一次即跟随；随后点「一键注册」（或重启 ZCode）让客户端读新注册值。「重新盘点」即会看到新钥升到首位、内置钥标「备」。
 
-**标准钥（sk- 形·别名映射，2026-10-11 起）**：只认 `sk-` 开头钥匙的标准工具（DeepSeek Harness、Codex、OpenAI SDK 系）用首位「生成」拿到的主钥会被它们"看着别扭"（有些客户端/网关会做形状校验），但主钥又不能随便改成 `sk-` 形（ZCode 注册值跟着变，且和平台前缀约定冲突）。所以卡片给每条 env 型链路加了一个「sk 钥」按钮：点开留空回车即现场生成一把 `sk-<平台前缀>-<36 位 hex>`（也可粘贴你自己的 `sk-xxx`），登记进 `inbound-keys.json` 的顶层保留键 `_aliases`（形状 `{ "<链路>": ["sk-…"] }`，与扁平主钥互不干扰、旧档案完全兼容），随后自动重启该链路把「主钥 ∪ 别名」一并吃进闸门集合。**别名只进闸门，不改 ZCode 注册值**（ZCode 侧仍是主钥）——所以加/删别名都不需要重注册，也不影响 ZCode；别名在盘点里单列一行（左侧绿边、标签「（sk）」），点「✕」即从档案移除并重启、立刻失效（撤销语义）。手动用法等价于往档案里加一条并重启 relay：`Authorization: Bearer sk-tr-…`（或 `x-api-key`）。目前只覆盖四条 env 型链路——WorkBuddy 是 Go 二进制单钥、Qoder/千问办公是网关侧出口 Key，都要 sk- 形就直接用「生成」/`keys:rotate` 把主钥设成 `sk-` 形值（`keys:rotate` 接受任意合法形状，包括 `sk-xxx`）。
+**标准钥（sk- 形·别名映射，2026-10-11 起）**：只认 `sk-` 开头钥匙的标准工具（DeepSeek Harness、Codex、OpenAI SDK 系）用首位「生成」拿到的主钥会被它们"看着别扭"（有些客户端/网关会做形状校验），但主钥又不能随便改成 `sk-` 形（ZCode 注册值跟着变，且和平台前缀约定冲突）。所以页面给每条 env 型链路加了一个「sk 钥」按钮：点开留空回车即现场生成一把 `sk-<平台前缀>-<36 位 hex>`（也可粘贴你自己的 `sk-xxx`），登记进 `inbound-keys.json` 的顶层保留键 `_aliases`（形状 `{ "<链路>": ["sk-…"] }`，与扁平主钥互不干扰、旧档案完全兼容），随后自动重启该链路把「主钥 ∪ 别名」一并吃进闸门集合。**别名只进闸门，不改 ZCode 注册值**（ZCode 侧仍是主钥）——所以加/删别名都不需要重注册，也不影响 ZCode；别名在盘点里单列一行（左侧绿边、标签「（sk）」），点「✕」即从档案移除并重启、立刻失效（撤销语义）。手动用法等价于往档案里加一条并重启 relay：`Authorization: Bearer sk-tr-…`（或 `x-api-key`）。目前只覆盖四条 env 型链路——WorkBuddy 是 Go 二进制单钥、Qoder/千问办公是网关侧出口 Key，都要 sk- 形就直接用「生成」/`keys:rotate` 把主钥设成 `sk-` 形值（`keys:rotate` 接受任意合法形状，包括 `sk-xxx`）。
 
-控制台「入站 api_key」卡片把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账：✓ 注册一致 / ✗ 注册不一致 / ◇ 注册为备用钥 / 未注册 四态），首行「生成」按钮一键换新钥（生成 → 重启该链路 → 切 ZCode 注册值，见上），「sk 钥」按钮加/撤标准钥别名（见上），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:generate` / `keys:probe` / `keys:rotate` / `keys:alias` 五个通道；`keys:generate`、`keys:alias`（含撤销）与 `keys:probe` 同时进了全量自测（第 33-36 项）。
+控制台「入站 api_key」页把七条链路的钥匙盘点在一个视图里（点击复制、与 ZCode 注册值对账：✓ 注册一致 / ✗ 注册不一致 / ◇ 注册为备用钥 / 未注册 四态），首行「生成」按钮一键换新钥（生成 → 重启该链路 → 切 ZCode 注册值，见上），「sk 钥」按钮加/撤标准钥别名（见上），「鉴权体检」按钮对每条链路发两发探针：匿名打模型端点必须 401（闸门在岗）、带盘点钥匙必须越过闸门——带钥后的 401/502 若来自上游（欠费、未登录）不误判为钥匙失效。IPC 侧是 `keys:query` / `keys:generate` / `keys:probe` / `keys:rotate` / `keys:alias` 五个通道；`keys:generate`、`keys:alias`（含撤销）与 `keys:probe` 同时进了全量自测（第 33-36 项）。
 
 闸门回归：`node test_inbound_key.mjs`（零出站 67 条：401/放行判别式、双头形状、OPTIONS 204、`/health` 豁免、轮换钥、关闭开关、非环回监听下新旧两套鉴权并存、trae 三端点全拦、doubao 目录端点入闸 + `/admin` 豁免、四条 env 链路的「生成」存储钥越过闸门且与内置钥并存、标准钥别名越过闸门（双头形状）、别家链路的别名不串门、删掉别名重启后即失效、旧格式档案无 `_aliases` 照常工作）。生成器与存储模块另有 `node app/test_inbound_keys.js`（34 条：随机钥形状/平台前缀、非法值拒绝、存储读写与损坏兜底、别名的增删/去重/宽容读、主钥与别名两条写路径互不吞噬、以及"四家 relay 源码确实读这个文件与 `_aliases`"的漂移守门）。
 
@@ -406,7 +406,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 
 | 症状 | 原因与处置 |
 |---|---|
-| `unauthorized: missing or invalid api key`（401，任意网关） | 入站闸门在岗但请求没带/带错钥匙——ZCode 走注册值无需配置；手动 curl 用 `x-api-key` 或 `Authorization: Bearer`（wb2api 只认后者）。钥匙清单看控制台「入站 api_key」卡片或 `keys:query`；带钥仍被拦就是钥匙与网关不一致（改过 env 没重启 relay，或注册值过期；「生成」换过新钥的话，控制台托管的重启是自动的，手动拉起的 relay 要自己重启一次），「鉴权体检」会点名。**标准工具报「key 形状不对」时**：点该链路行内「sk 钥」加一把 `sk-…` 标准钥（别名）再重试；别名是逐链路生效的，拿 A 链路的 sk 钥去打 B 链路照样 401 |
+| `unauthorized: missing or invalid api key`（401，任意网关） | 入站闸门在岗但请求没带/带错钥匙——ZCode 走注册值无需配置；手动 curl 用 `x-api-key` 或 `Authorization: Bearer`（wb2api 只认后者）。钥匙清单看控制台「入站 api_key」页或 `keys:query`；带钥仍被拦就是钥匙与网关不一致（改过 env 没重启 relay，或注册值过期；「生成」换过新钥的话，控制台托管的重启是自动的，手动拉起的 relay 要自己重启一次），「鉴权体检」会点名。**标准工具报「key 形状不对」时**：点该链路行内「sk 钥」加一把 `sk-…` 标准钥（别名）再重试；别名是逐链路生效的，拿 A 链路的 sk 钥去打 B 链路照样 401 |
 | 401 Invalid token | 应用轮换了 access token。凭证同步器正常时会自动跟进；若没在跑，重新打开 AutoClaw 登录一次，或重跑 `bridge/make_compat_auth.py` |
 | 402 积分不足 | 终态错误，等每日赠送（每日登录 1000 分）或充值，反代不会重试 |
 | 406 空响应 | 2.x 闸门五要素缺一（见上文）；最常见是 persona.txt 没部署——控制台点「启动」会自动从已安装客户端提取（日志里搜 `persona:`） |
@@ -419,7 +419,7 @@ curl -X POST http://127.0.0.1:8791/v1/chat/completions \
 | Comate 401 / 启动即失败 | `settings.json` 里的 license 失效（重新登录 Comate IDE 一次即可，relay 每次读文件、不用重启） |
 | Comate 406 | 触发了百度的 WAF：请求指纹必须是 node:https + axios 头，python-urllib 会被直接拒 |
 | ZCode 里看不到新模型 | 配置每 60 秒轮询一次；先确认「一键注册」的结果里 `registerError` 为空（写 `ok` 只代表目录取到了），再重启一次 ZCode |
-| ZCode 里突然少了某个供应商 | 动态增删的"删"：该平台链路被停止（或控制台启动对账时它没在跑）。重新点「启动」即自动注册回来；若 `~/.zcode/v2/provider_config.json` 写入失败，ZCode 卡片与日志里有 `zcode sync failed` 详情 |
+| ZCode 里突然少了某个供应商 | 动态增删的"删"：该平台链路被停止（或控制台启动对账时它没在跑）。重新点「启动」即自动注册回来；若 `~/.zcode/v2/provider_config.json` 写入失败，ZCode 页与日志里有 `zcode sync failed` 详情 |
 | 模型名怎么都变成小写了 / 旧模型名还能用吗 | 这是[统一命名规范](#模型统一命名规范modelscatalogjson)：`/v1/models` 只吐规范名，但各网关的 chat 入口**同时接受旧名**（Comate 旧 hash 名、AutoClaw 旧 TitleCase 名、Qoder 显示名、千问办公「标准/高级」都保留别名解析），重注册前旧配置照常工作 |
 | 注册后模型数对不上 / 某个条目名字是空的 | 先比 `providerModelRules` 的条目数与 `personalModelIds` 长度；历史上这里出过"同名函数静默覆盖 → 15 条 Comate 目录 modelId 全 null"的回归，现已由 G1 用例守住 |
 | 豆包 401 / cookie 缺失 | 客户端登录态过期。控制台点「同步登录态」（需客户端已带调试端口运行）或「重启客户端并同步」重新抓 cookie |

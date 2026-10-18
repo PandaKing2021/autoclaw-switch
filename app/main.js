@@ -763,23 +763,24 @@ function handle(channel, fn) { handlers[channel] = fn; ipcMain.handle(channel, (
 
 function setupIpc() {
   handle("status:query", async () => {
-    const health = relayAlive() ? await healthOnce() : { ok: false, running: false };
+    // 六条链路的健康探测 + WorkBuddy 账号查询彼此独立：并行跑，状态页的等待从「累加」变成「最慢的一条」
+    const [health, wbH, traeH, doubaoH, comateH, qoderH, qwH, wbStatus] = await Promise.all([
+      relayAlive() ? healthOnce().catch(() => ({ ok: false, running: false })) : Promise.resolve({ ok: false, running: false }),
+      wbHealth().catch(() => ({ running: false, ok: false })),
+      traeHealth().catch(() => ({ running: false, ok: false })),
+      doubaoHealth().catch(() => ({ running: false, ok: false })),
+      comateHealth().catch(() => ({ running: false, ok: false })),
+      qoderHealth().catch(() => ({ running: false, ok: false })),
+      qwenworkHealth().catch(() => ({ running: false, ok: false })),
+      wbHttp("GET", "/status").catch(() => null),
+    ]);
     const zcode = readZcodeRegistration();
     const token = readTokenExp();
     let credential = "缺失";
     try { credential = JSON.parse(fs.readFileSync(REQ_HEADERS, "utf8")).headers["X-Authorization"].slice(0, 16) + "…"; } catch {}
-    const wbH = await wbHealth();
     let wbAccount = null;
-    try {
-      const st = await wbHttp("GET", "/status");
-      const accs = st.j?.accounts || [];
-      if (accs.length) wbAccount = { uid: accs[0].uid, nickname: accs[0].nickname, credits: accs[0].credits };
-    } catch {}
-    const traeH = await traeHealth();
-    const doubaoH = await doubaoHealth();
-    const comateH = await comateHealth();
-    const qoderH = await qoderHealth();
-    const qwH = await qwenworkHealth();
+    const wbAccs = (wbStatus && wbStatus.j && wbStatus.j.accounts) || [];
+    if (wbAccs.length) wbAccount = { uid: wbAccs[0].uid, nickname: wbAccs[0].nickname, credits: wbAccs[0].credits };
     return {
       doubao: {
         running: doubaoH.running,
@@ -2340,7 +2341,7 @@ function setupIpc() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1080, height: 820,
+    width: 1180, height: 860, minWidth: 980, minHeight: 640,
     backgroundColor: "#0f1115",
     title: "AutoClaw → ZCode 控制台",
     autoHideMenuBar: true,
