@@ -4,7 +4,7 @@
 
 **把七个 AI 客户端/平台的内置额度，变成 ZCode、Codex CLI 或任何 OpenAI / Anthropic 客户端里可直接选用的模型。**
 
-所有组件都只监听 `127.0.0.1`，凭证不离开你的电脑。七条链路共用一套控制台、一套模型命名规范、一套入站鉴权；在 ZCode 里它们是七个并列供应商，模型名不冲突，同一个会话里可以自由切换。
+除 AutoClaw 网关默认监听 `0.0.0.0`（设 `AUTOCLAW_BIND_HOST=127.0.0.1` 可收回）外，其余组件默认只监听 `127.0.0.1`；凭证不离开你的电脑。七条链路共用一套控制台、一套模型命名规范、一套入站鉴权；在 ZCode 里它们是七个并列供应商，模型名不冲突，同一个会话里可以自由切换。
 
 | 平台 | 额度来源 | 网关对外 | 上游真实协议 † | 端口 | 模型数 * | 工具调用 |
 |---|---|---|---|---|---|---|
@@ -30,6 +30,7 @@ Qoder CN 与千问办公共用 `8791` 这**一个**网关进程（同一份账�
 | 日期 | 变化 |
 |---|---|
 | **2026-10-18** | **Trae 双通道**：新增 `llm_utils_chat`（原生 SSE + 原生工具），Free 号 `2001` 自动回退 `chat_sessions`；`chat_sessions` 增加提示词模拟工具层、流式闸门、工具解析容错、大小写拼写别名重试、`4001` 模型健康表与显式报错；实时目录 33 个模型。离线双通道回归 `trae/test_dual.mjs` 47 条全过 |
+| **2026-10-18** | 文档补充：**Codex 手动配置**与**把反代当普通 API 用**（OpenAI / Anthropic / Responses 入口速查、SDK 与 curl 示例、流式/模型名/安全边界） |
 | **2026-10-17** | 控制台按平台重构为**左侧 12 页**；新增**余额 / 额度总览**卡片（七条链路“还能用多少”一屏） |
 | **2026-10-11** | **Codex CLI 接入**（前门 + 托管 `config.toml` + 目录合并）；控制台「生成 api_key」与 `sk-` 标准钥别名；C 档 Trae/豆包补齐入站闸门 |
 | **2026-10-07** | 七条链路统一**无状态**；模型统一命名 `models-catalog.json`；ZCode 供应商动态增删；A/B 档入站 api_key 闸门 |
@@ -311,6 +312,103 @@ Codex CLI 0.100+ 的 `wire_api` **只认 `"responses"`**（`chat` 已从二进�
 - **目录是整体替换语义（`model_catalog_json`）**：0.160.1 实测自定义目录会**替换** Codex 自带目录（只写 1 条模型，`codex debug models` 就只剩那 1 条）——所以生成目录时把自带条目整份克隆进来再追加 A-SWITCH 条目；我方条目用最小模板（不写 `apply_patch_tool_type` / `supports_search_tool`，落到"未知模型回退元数据"的工具面——只有 shell 一族），因为桥只翻译 shell 词汇。
 - **两条上游工具形状的坑（Qoder / 千问办公）**：① 上游只认 `type:"function"` 工具，Codex 每轮还会带 `web_search` 与 `namespace multi_agent_v1`，网关必须过滤（日志里记 `dropped_tools=`）；② 上游只认 **Chat Completions 的嵌套工具形状**（`{type:"function",function:{…}}`）——扁平 Responses 形状（顶层 `name`/`description`/`parameters`）会回 400 `Error in upstream response`。`/v1/chat/completions` 入口靠 `normalize_tools()` 现包，`/v1/responses` 入口曾漏掉这一步（**2026-10-11 修复**：`responses_to_chat()` 出口补齐；症状是 Codex 报 `stream disconnected before completion`——上游 400 藏在 HTTP 200 的流里，看状态码看不出来）。排障钩子：`QODER_DUMP_BODY=<file>` 让网关把发往上游的明文请求体逐行追加进文件（当日就是靠它对比两条入口的上游体定位的）。
 - **验证**：`node bridge/test_codex_e2e.mjs [链路]` 真机跑完整闭环（注册 → **真的 `codex exec`** 跑一次工具循环 → 摘除并断言 `config.toml` 逐字节还原；`CODEX_HOME` 指向 `.research/codex-probe/e2e-home` 沙箱，不碰真实 `~/.codex`）。2026-10-11 实测：Comate ✓、WorkBuddy ✓、Trae ✓（文本档）、豆包 ✓（文本档）、千问办公 ✓（工具循环）；Qoder CN 因上游当日额度（`code-110`）受阻、AutoClaw 因桌面端未启动受阻——都是环境层，链路代码未动。
+
+### 手动配置 Codex（不经控制台）
+
+控制台「Codex CLI 接入」页是推荐路径：它会合并模型目录、走四道写入闸门、摘除时把 `config.toml` 逐字节还原。只想手写时，等价的最小配置是：
+
+```toml
+# ~/.codex/config.toml
+model = "glm-5.3"
+model_provider = "aswitch-autoclaw"
+
+[model_providers.aswitch-autoclaw]
+name = "A-SWITCH AutoClaw"
+base_url = "http://127.0.0.1:18766/v1"
+wire_api = "responses"
+experimental_bearer_token = "autoclaw-local"
+```
+
+- 前门链路把 `base_url` 换成 `http://127.0.0.1:18776/wb/v1`（WorkBuddy）、`/trae/v1`（Trae）或 `/doubao/v1`（豆包），token 换成对应链路的入站钥匙。
+- `wire_api` 只能是 `"responses"`；`experimental_bearer_token` 让这个 provider 不依赖 `~/.codex/auth.json`（官方登录的地盘不要动）。
+- 多条链路并存：给每条链路一个 `[model_providers.aswitch-<link>]` 表，切换时只改顶层 `model_provider` / `model`。
+- `model_catalog_json` 是**整体替换**语义（0.160.1 实测）：手写时要么不写（用 Codex 自带目录），要么指向一份已经把自带条目克隆进来的完整目录；控制台注册会自动做这个合并。
+- 验证：`codex exec "reply OK"`；查看目录：`codex debug models`。
+
+## 把反代当普通 API 用（OpenAI / Anthropic / Responses）
+
+不经过 ZCode / Codex 的自动注册，也可以把任意标准客户端直接指到本机网关。模型端点默认要带入站钥匙（生成/轮换见[入站 api_key 闸门](#入站-api_key-闸门)；下表是内置兜底钥）。
+
+| 链路 | 端口 | OpenAI chat | Anthropic messages | Responses | 内置钥匙 / 出口选择 |
+|---|---|---|---|---|---|
+| AutoClaw | 18766 | `/v1/chat/completions` | `/v1/messages` | `/v1/responses` 原生 | `autoclaw-local`（或 `autoclaw-dsh`） |
+| WorkBuddy | 7863 | `/v1/chat/completions` | — | 经前门 `:18776/wb/v1/responses` | `wb-local-key`（**只认 Bearer**） |
+| Trae SOLO CN | 18768 | `/v1/chat/completions` | `/v1/messages` | 经前门 `:18776/trae/v1/responses` | `trae-local-key` |
+| 豆包工作 | 18770 | `/v1/chat/completions` | `/v1/messages` | 经前门 `:18776/doubao/v1/responses` | `doubao-local-key` |
+| Comate | 18774 | `/v1/chat/completions` | `/v1/messages` | `/v1/responses` 原生 | `comate-local` |
+| Qoder CN | 8791 | `/v1/chat/completions` | — | `/v1/responses` 原生 | `~/.autoclaw-relay/qoder-realm-keys.json` 的 `cn` |
+| 千问办公 | 8791 | `/v1/chat/completions` | — | `/v1/responses` 原生 | 同一文件的 `qworkcn` |
+
+前门 `bridge/codex_front.mjs`（默认只绑 `127.0.0.1:18776`）只做 Responses→Chat 翻译，路径前缀 `/wb` `/trae` `/doubao`；`Authorization` / `x-api-key` 原样透传给上游，错误状态码也原样回传。
+
+**OpenAI SDK**（`base_url` 要带 `/v1`）：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:18766/v1", api_key="autoclaw-local")
+resp = client.chat.completions.create(
+    model="glm-5.3-flash",
+    messages=[{"role": "user", "content": "reply OK"}],
+)
+print(resp.choices[0].message.content)
+```
+
+**Anthropic SDK**（`base_url` 不带 `/v1`，SDK 自己拼 `/v1/messages`）：
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:18768", api_key="trae-local-key")
+msg = client.messages.create(
+    model="glm-5.1", max_tokens=64,
+    messages=[{"role": "user", "content": "reply OK"}],
+)
+print(msg.content[0].text)
+```
+
+**curl 三种形状**（中文正文请用 `--data-binary @utf8.json`，Git Bash 的 `-d '中文'` 会按 GBK 发出乱码）：
+
+```bash
+# OpenAI chat
+curl -X POST http://127.0.0.1:18766/v1/chat/completions \
+  -H "Authorization: Bearer autoclaw-local" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"reply OK"}]}'
+
+# Anthropic messages
+curl -X POST http://127.0.0.1:18768/v1/messages \
+  -H "x-api-key: trae-local-key" -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.1","max_tokens":64,"messages":[{"role":"user","content":"reply OK"}]}'
+
+# Responses（原生入口）
+curl -X POST http://127.0.0.1:18766/v1/responses \
+  -H "Authorization: Bearer autoclaw-local" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3-flash","input":"reply OK"}'
+
+# Responses（前门翻译）
+curl -X POST http://127.0.0.1:18776/wb/v1/responses \
+  -H "Authorization: Bearer wb-local-key" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3","input":"reply OK"}'
+```
+
+**流式**：OpenAI 入口传 `"stream":true`，返回 `data: {...}` 分片并以 `data: [DONE]` 结束（要用量再加 `"stream_options":{"include_usage":true}`）；Anthropic 入口返回 `message_start` / `content_block_delta` / `message_stop` 事件；Responses 入口返回语义事件。原生入口与前门翻译后的流式形状一致，客户端不需要区分。
+
+**模型名**：先 `GET /v1/models`（带同一把钥匙）拿规范名；chat 入口同时接受旧名/原名。Trae 对大小写和后缀敏感——`deepseek-v4-flash-official` 与 `deepseek-v4-flash` 不是同一条（后者可能静默返回空 200）；豆包只有 `doubao` / `doubao-think` 两个合成名；Qoder 的 `enabled:false` 条目是付费墙模型，Free 账号调用会 403。
+
+**能力边界**：工具调用取决于上游协议（见[上游协议保真度](#上游协议保真度谁是真的-chat-completions)）——WorkBuddy / AutoClaw 原生结构化；Comate / Qoder / 千问办公可闭环；Trae 要用工具得选服从模拟契约的模型（`glm-5.1` 等）；豆包只能聊天。`401` 是入站钥匙不对；`402`（额度）、`406`（AutoClaw 风控闸门）、`4001`/`2001`（Trae 模型/账号 app config）都是上游状态，不是钥匙问题。
+
+**安全边界**：其余网关默认只绑 `127.0.0.1`，但 **AutoClaw 默认监听 `0.0.0.0`**——在不可信网络里请设 `AUTOCLAW_BIND_HOST=127.0.0.1` 后重启。钥匙与出口 Key 明文落在 `~/.autoclaw-relay/`（`inbound-keys.json` / `qoder-realm-keys.json`，0600），不要提交、不要外传。
 
 ## ZCode 供应商的动态增删
 

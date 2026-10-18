@@ -4,7 +4,7 @@
 
 **Turn the built-in credits of seven Chinese AI clients/platforms into models you can select directly in ZCode, Codex CLI, or any OpenAI / Anthropic client.**
 
-Every component listens on `127.0.0.1` only; credentials never leave your machine. The seven links share one console, one model-naming convention and one inbound-auth layer. In ZCode they are sibling providers with no model-name collisions, so you can switch between them freely inside one session.
+Every component listens on `127.0.0.1` by default, with one exception: the AutoClaw gateway binds `0.0.0.0` unless you set `AUTOCLAW_BIND_HOST=127.0.0.1`. Credentials never leave your machine. The seven links share one console, one model-naming convention and one inbound-auth layer. In ZCode they are sibling providers with no model-name collisions, so you can switch between them freely inside one session.
 
 | Platform | Credits | Gateway exposes | Real upstream protocol † | Port | Models * | Tools |
 |---|---|---|---|---|---|---|
@@ -30,6 +30,7 @@ Qoder CN and QwenWork CN share **one** gateway process on `8791` (same account p
 | Date | Change |
 |---|---|
 | **2026-10-18** | **Trae dual channel**: added `llm_utils_chat` (native SSE + native tools); Free accounts' `2001` automatically falls back to `chat_sessions`; the session channel gained a prompt-emulated tool layer, a streaming gate, tolerant tool parsing, case-spelling alias retries, a `4001` model-health table and explicit errors; 33 live models. Offline dual-channel regression `trae/test_dual.mjs`: 47/47 |
+| **2026-10-18** | Documentation: **manual Codex configuration** and **using the relay as a plain API** (OpenAI / Anthropic / Responses endpoint matrix, SDK and curl examples, streaming, model names, security boundaries) |
 | **2026-10-17** | Console rebuilt into a **12-page platform sidebar**; new **balance / quota overview** card (all seven links on one screen) |
 | **2026-10-11** | **Codex CLI integration** (front door + managed `config.toml` + catalog merge); console "generate api_key" and `sk-` standard-key aliases; inbound gates for the C-tier Trae/Doubao links |
 | **2026-10-07** | Seven links unified as **stateless** gateways; unified naming (`models-catalog.json`); dynamic ZCode provider add/remove; inbound api_key gates for the A/B tiers |
@@ -170,6 +171,103 @@ Registration (`app/codex-config.js`) touches only a managed section of `~/.codex
 Qoder upstream tool quirks (hard-won 2026-10-11): only `type:"function"` tools are accepted (Codex also sends `web_search` and a `namespace`, which the gateway must filter), and the tools must be in **nested Chat Completions shape** — flat Responses-shaped tools get an HTTP 400 `Error in upstream response` hidden inside an HTTP 200 stream, which surfaces in Codex as `stream disconnected before completion`. `responses_to_chat()` now normalizes tools on the Responses path too (the chat path always did); `QODER_DUMP_BODY=<file>` dumps the outbound upstream body for this kind of bisect.
 
 Verified end-to-end with `node bridge/test_codex_e2e.mjs [link]` (register → a real `codex exec` tool loop → deregister and byte-exact restore; `CODEX_HOME` points into a sandbox, your real `~/.codex` is never touched). 2026-10-11: Comate ✓, WorkBuddy ✓, Trae ✓ (text), Doubao ✓ (text), QwenWork CN ✓ (tool loop); Qoder CN was blocked by the vendor's daily quota cap and AutoClaw's desktop app was not running — both environmental, no code change needed.
+
+### Manual Codex configuration (bypassing the console)
+
+The console's Codex CLI page is the recommended path: it merges the catalog, applies the four write gates, and restores `config.toml` byte-for-byte on removal. The equivalent minimal hand-written config is:
+
+```toml
+# ~/.codex/config.toml
+model = "glm-5.3"
+model_provider = "aswitch-autoclaw"
+
+[model_providers.aswitch-autoclaw]
+name = "A-SWITCH AutoClaw"
+base_url = "http://127.0.0.1:18766/v1"
+wire_api = "responses"
+experimental_bearer_token = "autoclaw-local"
+```
+
+- Front-door links: replace `base_url` with `http://127.0.0.1:18776/wb/v1` (WorkBuddy), `/trae/v1` (Trae) or `/doubao/v1` (Doubao), and the token with that link's inbound key.
+- `wire_api` must be `"responses"`; `experimental_bearer_token` keeps this provider independent of `~/.codex/auth.json` (leave the official login alone).
+- Multiple links: give each one a `[model_providers.aswitch-<link>]` table and switch only the top-level `model_provider` / `model`.
+- `model_catalog_json` **replaces** Codex's bundled catalog (measured on 0.160.1): hand-writing it means either omitting it (use the bundled catalog) or pointing it at a complete catalog that already clones the bundled entries; console registration performs that merge for you.
+- Verify with `codex exec "reply OK"`; inspect the catalog with `codex debug models`.
+
+## Using the relay as a plain API (OpenAI / Anthropic / Responses)
+
+You do not need ZCode or Codex registration: point any standard client at the local gateway. Model endpoints require an inbound key (generation/rotation is on the Inbound api_key page — see the next section); the table lists the built-in fallback keys.
+
+| Link | Port | OpenAI chat | Anthropic messages | Responses | Built-in key / exit selection |
+|---|---|---|---|---|---|
+| AutoClaw | 18766 | `/v1/chat/completions` | `/v1/messages` | `/v1/responses` native | `autoclaw-local` (or `autoclaw-dsh`) |
+| WorkBuddy | 7863 | `/v1/chat/completions` | — | via front door `:18776/wb/v1/responses` | `wb-local-key` (**Bearer only**) |
+| Trae SOLO CN | 18768 | `/v1/chat/completions` | `/v1/messages` | via front door `:18776/trae/v1/responses` | `trae-local-key` |
+| Doubao Work | 18770 | `/v1/chat/completions` | `/v1/messages` | via front door `:18776/doubao/v1/responses` | `doubao-local-key` |
+| Comate | 18774 | `/v1/chat/completions` | `/v1/messages` | `/v1/responses` native | `comate-local` |
+| Qoder CN | 8791 | `/v1/chat/completions` | — | `/v1/responses` native | `cn` in `~/.autoclaw-relay/qoder-realm-keys.json` |
+| QwenWork CN | 8791 | `/v1/chat/completions` | — | `/v1/responses` native | `qworkcn` in the same file |
+
+The front door `bridge/codex_front.mjs` (loopback `127.0.0.1:18776` by default) only translates Responses→Chat under `/wb`, `/trae` and `/doubao`; `Authorization` / `x-api-key` pass through to the upstream untouched, and so do upstream status codes.
+
+**OpenAI SDK** (`base_url` includes `/v1`):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:18766/v1", api_key="autoclaw-local")
+resp = client.chat.completions.create(
+    model="glm-5.3-flash",
+    messages=[{"role": "user", "content": "reply OK"}],
+)
+print(resp.choices[0].message.content)
+```
+
+**Anthropic SDK** (`base_url` has no `/v1`; the SDK appends `/v1/messages`):
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:18768", api_key="trae-local-key")
+msg = client.messages.create(
+    model="glm-5.1", max_tokens=64,
+    messages=[{"role": "user", "content": "reply OK"}],
+)
+print(msg.content[0].text)
+```
+
+**curl, three shapes** (for non-ASCII bodies use `--data-binary @utf8.json`; Git Bash turns `-d '中文'` into GBK garbage):
+
+```bash
+# OpenAI chat
+curl -X POST http://127.0.0.1:18766/v1/chat/completions \
+  -H "Authorization: Bearer autoclaw-local" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"reply OK"}]}'
+
+# Anthropic messages
+curl -X POST http://127.0.0.1:18768/v1/messages \
+  -H "x-api-key: trae-local-key" -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.1","max_tokens":64,"messages":[{"role":"user","content":"reply OK"}]}'
+
+# Responses (native)
+curl -X POST http://127.0.0.1:18766/v1/responses \
+  -H "Authorization: Bearer autoclaw-local" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3-flash","input":"reply OK"}'
+
+# Responses (front-door translation)
+curl -X POST http://127.0.0.1:18776/wb/v1/responses \
+  -H "Authorization: Bearer wb-local-key" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3","input":"reply OK"}'
+```
+
+**Streaming**: OpenAI endpoints take `"stream":true` and emit `data: {...}` chunks ending in `data: [DONE]` (add `"stream_options":{"include_usage":true}` for usage); Anthropic endpoints emit `message_start` / `content_block_delta` / `message_stop`; Responses endpoints emit semantic events. Native and front-door streams have the same shape, so clients need no special case.
+
+**Model names**: call `GET /v1/models` with the same key to get canonical ids; chat endpoints also accept old/raw names. Trae is case- and suffix-sensitive — `deepseek-v4-flash-official` and `deepseek-v4-flash` are not the same entry (the latter can silently return an empty 200); Doubao exposes only the synthetic `doubao` / `doubao-think`; Qoder entries with `enabled:false` are paywalled and return 403 on Free accounts.
+
+**Capability boundaries**: tool calling depends on the upstream protocol (see [protocol fidelity](#protocol-fidelity-which-links-are-really-chat-completions)) — WorkBuddy / AutoClaw are natively structured; Comate / Qoder / QwenWork close the loop; Trae needs a model that obeys the emulated contract (`glm-5.1` and friends); Doubao is chat-only. `401` means a bad inbound key; `402` (credits), `406` (AutoClaw risk gate) and `4001`/`2001` (Trae model / account app config) are upstream states, not key problems.
+
+**Security boundaries**: the other gateways bind `127.0.0.1` by default, but **AutoClaw listens on `0.0.0.0`** — on an untrusted network set `AUTOCLAW_BIND_HOST=127.0.0.1` and restart it. Keys and exit keys are plaintext under `~/.autoclaw-relay/` (`inbound-keys.json` / `qoder-realm-keys.json`, mode 0600); never commit or share them.
 
 ## Dynamic add/remove of ZCode providers
 
