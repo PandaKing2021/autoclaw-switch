@@ -1352,6 +1352,8 @@ async function callCloudPool(route, payload, opts) {
     // 真实到达上游：提交日预算 + 模型多样性时间戳（限速配额已在发出前占过，不重复记）
     commitDaily(acc.uid, Date.now(), route);
     resp._poolUid = acc.uid; resp._poolName = acc.name;
+    // 200 但 body 是业务错误（810001 付费墙等）→ 翻成真状态再判定，别当成功
+    resp = await unpackUpstreamError(resp);
     if (resp.ok) { poolClear(acc.uid, route); log(`pool pick: ${acc.name}(${acc.lane || "oversea"}) ← ${route}`); return resp; }
     const detail = await readDetail(resp);
     poolLastReject = { detail, at: Date.now() };
@@ -1511,6 +1513,34 @@ async function readDetail(resp, max = 500) {
   try { s = await resp.text(); } catch { s = ""; }
   resp._detail = s;
   return s.slice(0, max);
+}
+
+/** HTTP 200 但 body 是网关的业务错误体（既不是 SSE 也不是正常 chat.completion）。
+ *
+ *  实测：账号被降级到 pay-view 时 chat 端点回 **200** +
+ *  `{"action":{"kind":"pay-view"},"code":810001,"message":"...upgrade..."}`。
+ *  旧代码只看 resp.ok 就当成功，把它交给 SSE 解析器，用户看到的是毫无信息量的
+ *  "parse response failed"，真实原因（付费墙/高峰限流）被完全掩盖。
+ *  这里翻成带真实状态码的合成响应，走后面的正常错误分类（换号 / 冷却）。
+ */
+async function unpackUpstreamError(resp) {
+  if (!resp || !resp.ok) return resp;
+  let text;
+  try { text = await resp.text(); } catch { return resp; }
+  if (!text.trimStart().startsWith("{")) return resp;          // SSE：data: {...}
+  let j;
+  try { j = JSON.parse(text); } catch { return resp; }
+  if (Array.isArray(j.choices) || j.object === "chat.completion") return resp;  // 正常非流式
+  const code = Number(j.code ?? j.error?.code ?? 0);
+  if (!code) return resp;
+  // 810000/810002 = 额度类（429 可重试）；810001 = pay-view 付费墙（同样换号重试）
+  const synth = (code === 810000 || code === 810001 || code === 810002) ? 429 : 400;
+  const msg = j.message || j.msg || `upstream business error ${code}`;
+  log(`unpack: HTTP 200 里藏业务错误 code=${code} → 合成 ${synth}（${String(msg).slice(0, 80)}）`);
+  return new Response(JSON.stringify({ error: { message: msg, code } }), {
+    status: synth,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 /** 这一轮请求走哪个上游。
