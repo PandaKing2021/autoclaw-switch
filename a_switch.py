@@ -50,6 +50,7 @@ APP_ID = "100003"
 RELAY_PORT = int(os.environ.get("AUTOCLAW_RELAY_PORT") or 18766)  # 本地反代（一键反代部署）
 APP_KEY = "38d2391985e2369a5fb8227d8e6cd5e5"
 BASE = "https://autoglm-api.autoglm.ai"
+BASE_CN = "https://autoglm-api.zhipuai.cn"    # 国内线身份域：CN lane 凭证只在 zhipuai.cn 有效（实测）
 TASK_LIST = "/autoclaw-proxy/proxy/autoclaw-task-list"
 TASK_COMPLETE = "/autoclaw-proxy/proxy/autoclaw-task-complete"
 NEWBIE_GRANT_POINTS = 10000                     # 新人注册奖励的目标额度
@@ -307,6 +308,7 @@ class Account:
         self.auth_expired = False       # 刷新也救不回来 → 需要重新登录
         self.device_id = device_id or auth_json.get("deviceId", "")
         self.channel = channel
+        self.lane = _read_lane(appdata_dir)   # 决定身份接口打哪个域名（cn/oversea）
         ui = auth_json.get("userInfo") or {}
         self.user_id = ui.get("user_id") or ui.get("id")
         self.nickname = ui.get("user_name") or ui.get("nickname") or name
@@ -331,8 +333,12 @@ class Account:
         headers = self.headers()
         if extra_headers:
             headers.update(extra_headers)
+        # 实锤：CN lane 凭证打国际域 /userapi/v1/refresh 回 400000「用户未登录」，
+        # 同一枚 token 打国内域 code=0。身份接口必须按 lane 分流，否则国内号
+        # 永远被判「需要重新登录」（实际凭证完好）。
+        base = BASE_CN if getattr(self, "lane", "oversea") == "cn" else BASE
         req = urllib.request.Request(
-            BASE + path,
+            base + path,
             data=json.dumps(body).encode() if body is not None else None,
             method=method, headers=headers)
         try:
@@ -345,17 +351,17 @@ class Account:
             # node undici 重试能过）。直连失败（st=0 连接层错误）自动改走本地反代的业务桥
             # /fwd（loopback 明文进、node TLS 出，桥内自带 4 次重试）——这是 GUI 存活的保命路。
             # 桥也不通才返回原直连错误。
-            st2, d2 = self._http_via_bridge(method, path, headers, body, max(timeout, 90))
+            st2, d2 = self._http_via_bridge(method, path, headers, body, max(timeout, 90), base)
             if st2 is not None:
                 return st2, d2
             return 0, f"{type(e).__name__}: {e}"
 
     @staticmethod
-    def _http_via_bridge(method: str, path: str, headers: dict, body, timeout: float):
+    def _http_via_bridge(method: str, path: str, headers: dict, body, timeout: float, base: str = ""):
         """经本地反代 /fwd 转发业务请求。桥不可用返回 (None, None)。"""
         try:
             payload = {"method": method, "path": path, "headers": headers,
-                       "body": body if isinstance(body, str) else body}
+                       "body": body if isinstance(body, str) else body, "base": base}
             req = urllib.request.Request(
                 "http://127.0.0.1:18766/fwd",
                 data=json.dumps(payload).encode("utf-8"), method="POST",
@@ -892,6 +898,15 @@ def _read_channel(appdata_dir: Path) -> str:
         return json.loads(p.read_text(encoding="utf-8")).get("channel", "zai")
     except Exception:
         return "zai"
+
+
+def _read_lane(appdata_dir: Path) -> str:
+    """账号线路：cn=国内域(zhipuai.cn)，oversea=国际域(autoglm.ai)。缺省 oversea。"""
+    p = Path(appdata_dir) / "a_switch_lane.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")).get("lane", "oversea") or "oversea"
+    except Exception:
+        return "oversea"
 
 
 def load_account(appdata_dir: Path, name: str | None = None) -> Account | None:
@@ -1492,16 +1507,16 @@ def _api_request(method: str, path: str, body=None, token: str = "",
             return e.code, {"code": -1, "msg": f"HTTP {e.code}", "data": None}
     except Exception as e:
         st2, d2 = _api_via_bridge(method, path, auth_headers(token, channel), body,
-                                  max(timeout, 90))
+                                  max(timeout, 90), base)
         if st2 is not None:
             return st2, d2
         return 0, {"code": -1, "msg": f"{type(e).__name__}: {e}", "data": None}
 
 
-def _api_via_bridge(method: str, path: str, headers: dict, body, timeout: float):
+def _api_via_bridge(method: str, path: str, headers: dict, body, timeout: float, base: str = ""):
     """经本地反代 /fwd 转发（loopback HTTP -> node TLS 出站）。桥不可用返回 (None, None)。"""
     try:
-        payload = {"method": method, "path": path, "headers": headers, "body": body}
+        payload = {"method": method, "path": path, "headers": headers, "body": body, "base": base}
         req = urllib.request.Request(
             f"http://127.0.0.1:{RELAY_PORT}/fwd",
             data=json.dumps(payload).encode("utf-8"), method="POST",

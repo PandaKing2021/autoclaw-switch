@@ -2891,13 +2891,17 @@ const server = http.createServer(async (req, res) => {
       if (!fp || typeof fp !== "string" || !fp.startsWith("/")) {
         return sendJson(res, 400, { error: { message: "fwd.path must start with /" } });
       }
+      // CN lane 身份接口必须打 zhipuai.cn（autoglm.ai 对 CN 凭证回「用户未登录」）：
+      // 允许调用方按账号 lane 传 base，但只在两个已知上游域的白名单里，不透传任意目标。
+      const FWD_BASES = ["https://autoglm-api.autoglm.ai", "https://autoglm-api.zhipuai.cn"];
+      const fwdBase = FWD_BASES.includes(fwd.base) ? fwd.base : FWD_BASES[0];
       try {
         // 连接层间歇失败（2026-09-25 实测：node 对业务路径约 1/3 成功率）必须重试，
         // 否则 GUI 后端（python→桥）拿不到数据。指数退避 0.8s/1.6s/3.2s。
         let lastErr = "";
         for (let attempt = 0; attempt < 4; attempt++) {
           try {
-            const r2 = await fetch(`https://autoglm-api.autoglm.ai${fp}`, {
+            const r2 = await fetch(`${fwdBase}${fp}`, {
               method: fm || "GET",
               headers: fh || {},
               body: fb === undefined || fb === null ? undefined : (typeof fb === "string" ? fb : JSON.stringify(fb)),
