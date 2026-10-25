@@ -4008,6 +4008,23 @@ ZCODE_MODELS = [
     ("Auto-Fast",           "zai_auto-fast",                  True,  500000),
 ]
 
+# WorkBuddy 网关（本地 OpenAI 兼容反代，腾讯 copilot 权益）：与 AutoClaw 同源"网关 + token"
+# 模式——DSH/ZCode 只认本地地址与占位 token，真实 WorkBuddy 信封密钥仅在代理侧
+# （wb-key-payload.json，由 workbuddy-proxy 从进程内存提取）读取，绝不进本仓库或客户端配置。
+WB_PORT = int(os.environ.get("WORKBUDDY_PROXY_PORT") or 8787)
+WB_TOKEN = os.environ.get("WORKBUDDY_LOCAL_TOKEN") or "wb-local"  # 本地占位值，非真实凭据
+WB_PROVIDER_ID = "workbuddy-provider"
+WB_PROVIDER_NAME = "WorkBuddy"
+WB_BASE_URL = f"http://127.0.0.1:{WB_PORT}/v1"
+# (ZCode 显示名, 真实模型 id, 上下文窗口) —— 取自 workbuddy-proxy /v1/models 实测
+WB_MODELS = [
+    ("Hy3",                  "hy3-b",            192000),
+    ("Hy3-X",                "hy3-x",            192000),
+    ("Hy4",                  "hy4-preview-f",    1000000),
+    ("DeepSeek-V4.1-Flash",  "deepseek-v4.1-flash", 1000000),
+    ("GLM-5.3-Flash",        "glm-5.3-flash",    1000000),
+]
+
 
 def find_node_exe():
     """AutoClaw 自带的 node 优先（版本可控），退回系统 PATH。"""
@@ -4135,6 +4152,48 @@ def zcode_register_provider() -> dict:
     return {"ok": True, "models": [m[0] for m in ZCODE_MODELS]}
 
 
+def zcode_register_workbuddy() -> dict:
+    """向 ZCode 注册 WorkBuddy 网关注册商（OpenAI 兼容，端口见 WB_PORT）。
+
+    与 AutoClaw 共用同一套"三处同写"逻辑，仅 api 类型改为 openai-completions，
+    baseUrl 指向本地代理的 /v1。token 用本地占位值 WB_TOKEN，真实 WorkBuddy 信封密钥
+    仅在代理侧读取，不进入本仓库。幂等。
+    """
+    cfg_path = Path.home() / ".zcode" / "v2" / "provider_config.json"
+    if not cfg_path.is_file():
+        return {"ok": False, "error": f"未找到 ZCode 配置：{cfg_path}（确认已安装并运行过 ZCode）"}
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    conf = cfg.setdefault("config", {})
+    backup = cfg_path.with_suffix(".json.bak-workbuddy")
+    if not backup.exists():
+        backup.write_text(cfg_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    rule = {"providerId": WB_PROVIDER_ID, "providerName": WB_PROVIDER_NAME, "enabled": True,
+            "config": {"group": "standard-personal",
+                       "access": {"type": "api-key", "apiKey": WB_TOKEN},
+                       "api": {"type": "openai-completions", "baseUrl": WB_BASE_URL},
+                       "personalModelIds": [m[0] for m in WB_MODELS],
+                       "modelOrder": [m[0] for m in WB_MODELS]}}
+    rules = conf.setdefault("providerConfigRules", {}).setdefault("providerRules", [])
+    rules[:] = [r for r in rules if r.get("providerId") != WB_PROVIDER_ID]
+    rules.append(rule)
+    order = conf.setdefault("providerOrder", [])
+    if WB_PROVIDER_ID not in order:
+        order.append(WB_PROVIDER_ID)
+    mcr = conf.setdefault("modelConfigRules", {}).setdefault("providerModelRules", [])
+    mcr[:] = [r for r in mcr if r.get("providerId") != WB_PROVIDER_ID]
+    for display, _mid, ctx in WB_MODELS:
+        mcr.append({"providerId": WB_PROVIDER_ID, "modelId": display,
+                    "config": {"enabled": True,
+                               "properties": {"contextWindow": ctx,
+                                              "inputFormat": {"supportsText": True, "supportsImage": True,
+                                                              "supportsVideo": False, "supportsAudio": False,
+                                                              "supportsPdf": False},
+                                              "outputFormat": {"supportsText": True}}}})
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "models": [m[0] for m in WB_MODELS]}
+
+
 def relay_smoke_test() -> dict:
     """一发真实推理：确认"积分真的进了 ZCode 可用状态"。"""
     body = {"model": "GLM-5.3-Flash", "max_tokens": 16, "stream": False,
@@ -4155,6 +4214,24 @@ def relay_smoke_test() -> dict:
     return {"ok": r.status == 200 and bool(blocks), "reply": text[:60]}
 
 
+def workbuddy_smoke_test() -> dict:
+    """一发真实推理：确认 WorkBuddy 网关（OpenAI 协议）真的可用。"""
+    body = {"model": "glm-5.3-flash", "max_tokens": 16, "stream": False,
+            "messages": [{"role": "user", "content": "reply READY"}]}
+    req = urllib.request.Request(f"http://127.0.0.1:{WB_PORT}/v1/chat/completions",
+                                 data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {WB_TOKEN}"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        d = json.loads(r.read().decode("utf-8", "replace"))
+    choices = d.get("choices") or []
+    text = "".join(c.get("message", {}).get("content", "") for c in choices)
+    if not text:
+        u = d.get("usage") or {}
+        text = f"model={d.get('model')} out={u.get('completion_tokens')}t"
+    return {"ok": r.status == 200 and bool(choices), "reply": text[:60]}
+
+
 def relay_oneclick_setup() -> dict:
     """一键反代总入口：凭证 → relay → ZCode 注册 → 验证。幂等，可重复点。"""
     steps = []
@@ -4168,6 +4245,14 @@ def relay_oneclick_setup() -> dict:
     if not zc.get("ok"):
         return {"ok": False, "error": zc.get("error"), "steps": steps}
     steps.append("ZCode 供应商已注册（重启 ZCode 生效）")
+    try:
+        wb = zcode_register_workbuddy()
+        if wb.get("ok"):
+            steps.append("WorkBuddy 网关注册商已注册（重启 ZCode 生效）")
+        else:
+            steps.append(f"WorkBuddy 注册跳过（{wb.get('error')}）")
+    except Exception as e:
+        steps.append(f"WorkBuddy 注册异常（{type(e).__name__}），继续")
     try:
         entries = []
         for acc in discover_accounts():
@@ -4188,6 +4273,14 @@ def relay_oneclick_setup() -> dict:
             return {"ok": False, "error": "反代已起但推理验证失败（看 relay 日志）", "steps": steps}
     except Exception as e:
         return {"ok": False, "error": f"验证推理异常：{e}", "steps": steps}
+    try:
+        wb_smoke = workbuddy_smoke_test()
+        if wb_smoke.get("ok"):
+            steps.append(f"WorkBuddy 网关验证通过（{wb_smoke.get('reply', '')}）")
+        else:
+            steps.append(f"WorkBuddy 网关验证未通过（{wb_smoke.get('reply', '')}），但 AutoClaw 反代已就绪")
+    except Exception as e:
+        steps.append(f"WorkBuddy 网关验证异常（{type(e).__name__}），但 AutoClaw 反代已就绪")
     return {"ok": True, "steps": steps}
 
 
