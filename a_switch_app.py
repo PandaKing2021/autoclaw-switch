@@ -1020,6 +1020,7 @@ class Api:
 
     def relay_setup(self):
         """一键反代：部署 relay + 注册 ZCode 供应商 + 验证推理。后台线程，JS 轮询日志。"""
+        global _busy
         def work():
             global _busy
             try:
@@ -1045,6 +1046,7 @@ class Api:
 
     def relay_warm(self):
         """对未暖号跑暖号（新号建议点一次，8 轮真实对话建立用量基线）。"""
+        global _busy
         def work():
             global _busy
             try:
@@ -1926,7 +1928,41 @@ window.addEventListener("pywebviewready", ()=>App.boot());
 """
 
 
+# ---------------- 单实例保护 ----------------
+# 无互斥时多个实例并存：_auto_claim_loop 并发轮换同一份 refreshToken 致续期失败循环，
+# 多实例抢写同一个 aswitch_cloud_pool.json（PermissionError）。Windows 用命名互斥体最稳。
+_MUTEX_NAME = "Local\A-SWITCH-SingleInstance"
+
+
+def _acquire_single_instance_lock() -> bool:
+    """拿到互斥体返回 True；已有实例在跑返回 False。非 Windows 或创建失败不拦截。"""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        ERROR_ALREADY_EXISTS = 183
+        handle = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+        if not handle:
+            return True
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        globals()["_single_instance_mutex"] = handle
+        return True
+    except Exception:
+        return True
+
+
 def main():
+    if not _acquire_single_instance_lock():
+        log(f"{APP_TITLE} 已有实例在运行，本次启动直接退出")
+        return
     import webview
     api = Api()
     log(f"{APP_TITLE} 启动")
