@@ -632,7 +632,9 @@ async function callCloud(route, payload, { stream }, acc, externalSignal) {
     let body = payload;
     if (lane === "cn") body = applyCnGate(payload);
     // 现刷票只用于海外线（PR#3）；国内票由 watch_auth 跟随 2.x 客户端轮换，保持新鲜
-    const freshAuth = lane === "cn" ? null : (acc ? await freshAccessToken(acc) : null);
+    // 2026-10-22 修正：CN 线也必须现刷。网关校验 access token 的铸造时间（分钟级），
+    // 静态票放几小时就 401 "Invalid token"（全池冷却）。refresh 对 CN 号 code=0（zhipuai.cn）。
+    const freshAuth = acc ? await freshAccessToken(acc) : null;
     const send = lane === "cn" ? httpsFetch : fetch;
     const base = lane === "cn" ? CN_CLOUD_BASE : CLOUD_BASE;
     return await send(`${base}/chat/completions`, {
@@ -670,7 +672,8 @@ async function freshAccessToken(acc) {
     try {
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 15_000);
-      const u = new URL(CLOUD_BASE);
+      // CN 号的 refresh 必须打 zhipuai.cn（autoglm.ai 对 CN 凭证回 400000）
+      const u = new URL(acc.lane === "cn" ? CN_CLOUD_BASE : CLOUD_BASE);
       const ts2 = String(Math.floor(Date.now() / 1e3));
       const r = await fetch(`${u.origin}/userapi/v1/refresh`, {
         method: "POST",
